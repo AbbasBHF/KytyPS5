@@ -10566,6 +10566,34 @@ public:
       auto &cache = context.GetBufferCache();
       auto &shaders = processor.GetShCtx();
       context.MapMemory(base, allocation_size);
+      // Empty CPU-owned arguments must not inspect the shader, even on a GPU-dirty page.
+      constexpr auto empty_args = base + allocation_size - case_size;
+      constexpr auto neighbor = empty_args + 0x100u;
+      constexpr std::array<std::array<u32, 3>, 3> empty_dimensions{{
+          {0, 1, 1}, {1, 0, 1}, {1, 1, 0}}};
+      Require(name, "empty arguments",
+              LibKernel::Memory::TryWriteBacking(empty_args, empty_dimensions.data(),
+                                                 sizeof(empty_dimensions)),
+              "empty indirect arguments could not be written");
+      shaders.SetCsShader({.data_addr = 1});
+      for (const bool dirty_neighbor : {false, true}) {
+        if (dirty_neighbor) {
+          auto [buffer, offset] = cache.ObtainBuffer(neighbor, sizeof(sentinel), true);
+          buffer->Fill(offset, sizeof(sentinel), sentinel + 1u);
+        }
+        Require(name, "exact argument ownership",
+                !cache.HasGpuDirtyBytes(empty_args, sizeof(empty_dimensions)) &&
+                    cache.IsRegionGpuModified(empty_args, sizeof(empty_dimensions)) == dirty_neighbor,
+                "empty arguments did not retain independent byte ownership");
+        const auto tick = scheduler.CurrentTick();
+        for (size_t i = 0; i < empty_dimensions.size(); ++i) {
+          processor.DispatchIndirect(empty_args + i * sizeof(empty_dimensions[0]), 0x41u);
+        }
+        Require(name, "empty dispatch avoids readback",
+                scheduler.CurrentTick() == tick &&
+                    cache.HasGpuDirtyBytes(neighbor, sizeof(sentinel)) == dirty_neighbor,
+                "empty dispatch submitted work or read back neighboring GPU data");
+      }
       const auto set_buffer = [&](u32 sgpr, uint64_t address, u32 records, u32 stride = 0) {
         ShaderBufferResource descriptor{};
         descriptor.UpdateAddress48(address);
