@@ -768,7 +768,7 @@ void DefineModule(EmitterState& state) {
 	}
 	if (state.lane_count == 2 || state.program.info.subgroup_barrier ||
 	    state.program.info.subgroup_ballot || state.program.info.subgroup_shuffle ||
-	    state.program.info.subgroup_local_invocation_id) {
+	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
 	if (state.lane_count == 2 || state.program.info.subgroup_ballot) {
@@ -776,6 +776,9 @@ void DefineModule(EmitterState& state) {
 	}
 	if (state.program.info.subgroup_shuffle) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
+	}
+	if (state.program.info.subgroup_arithmetic) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
 		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);

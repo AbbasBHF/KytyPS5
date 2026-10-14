@@ -39536,6 +39536,63 @@ TestCase ImageAtomicGlc0DoesNotReturnOldValue() {
   return test;
 }
 
+void AppendWave64Minimum(std::vector<u32> &code) {
+  code.insert(code.end(), {EncodeSop1(0x04, 24, 126), // Save contributing lanes.
+                          EncodeSop1(0x28, 106, 126)});
+  AppendVop3(&code, 0x101, 13, 193, Vgpr(13), 24); // Inactive lanes contribute UINT_MAX.
+  for (u32 shift : {1u, 2u, 4u, 8u}) {
+    code.push_back(EncodeVop2(0x13, 13, 250, 13));
+    code.push_back(EncodeVop2Dpp(13, 0x110u + shift));
+  }
+  // Exact RDNA2 wave64 reduction from PS 964747887d898821, PCs 0x224..0x244.
+  code.insert(code.end(), {0xd778100cu, 0x0305830du,
+      EncodeVop2(0x13, 13, Vgpr(13), 12), EncodeSop1(0x04, 126, 106),
+      0xd7600006u, 0x00013f0du, 0xd7600007u, 0x00017f0du,
+      EncodeSop2(0x07, 8, 6, 7), EncodeVop1(0x01, 0, 8)});
+}
+
+GraphicsCase GraphicsSparseWaveMinimum() {
+  GraphicsCase test;
+  test.name = "GraphicsSparseWaveMinimum";
+  auto &code = test.fragment_code;
+  code = {EncodeVintrp(0x02, 13, 0, 0, 2)};
+  AppendWave64Minimum(code);
+  code.insert(code.end(), {EncodeExp0(0x00, 0xf), EncodeExp1(0, 0, 0, 0)});
+  AppendEnd(&code);
+  test.pixel_interpolator_settings = {0x00000400u};
+  test.expected_pixel = {0x3e800000u, 0x3e800000u, 0x3e800000u, 0x3e800000u};
+  test.opcodes = {ShaderOpcode::V_MIN_U32, ShaderOpcode::V_PERMLANEX16_B32,
+                  ShaderOpcode::V_READLANE_B32, ShaderOpcode::S_MIN_U32};
+  return test;
+}
+
+TestCase ComputeWave64Minimum(bool masked) {
+  TestCase test;
+  test.name = masked ? "ComputeWave64MinimumMasked" : "ComputeWave64Minimum";
+  auto &code = test.code;
+  code = {EncodeVop2(0x1a, 20, InlineU32(2), 0)};
+  AppendVMovU32(&code, 13, 100);
+  code.push_back(EncodeVop2(0x26, 13, Vgpr(13), 0)); // 100 - lane: minimum is in the upper half.
+  if (masked) {
+    AppendSMovLiteral(&code, 126, 0xfffffffeu);
+    AppendSMovLiteral(&code, 127, 0x7fffffffu);
+  }
+  AppendWave64Minimum(code);
+  AppendBufferStoreDword(&code, 0, 20);
+  AppendEnd(&code);
+  test.initial.assign(64, 0xa5a5a5a5u);
+  test.expected.assign(64, masked ? 38u : 37u);
+  if (masked) test.expected.front() = test.expected.back() = 0xa5a5a5a5u;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.has_compute_info = true;
+  test.opcodes = {ShaderOpcode::V_MIN_U32, ShaderOpcode::V_PERMLANEX16_B32,
+                  ShaderOpcode::V_READLANE_B32, ShaderOpcode::S_MIN_U32};
+  return test;
+}
+
 GraphicsCase GraphicsInterpolationExport() {
   using O = ShaderOpcode;
 
@@ -40193,6 +40250,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorDppRowXmask);
   cases.push_back(VectorDppRowShare(32));
   cases.push_back(VectorDppRowShare(64));
+  cases.push_back(ComputeWave64Minimum(false));
+  cases.push_back(ComputeWave64Minimum(true));
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
@@ -40586,6 +40645,7 @@ std::vector<TestCase> MakeCases() {
 
 std::vector<GraphicsCase> MakeGraphicsCases() {
   return {
+      GraphicsSparseWaveMinimum(),
       GraphicsInterpolationExport(),
       GraphicsPositionWExport(),
       GraphicsPackedHalfCentroid(),
@@ -45974,6 +46034,9 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--dpp-only") == 0) {
     VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, GraphicsSparseWaveMinimum());
+    RunCase(&vulkan, ComputeWave64Minimum(false));
+    RunCase(&vulkan, ComputeWave64Minimum(true));
     RunCase(&vulkan, VectorDpp8Captured(false));
     for (const u32 wave_size : {32u, 64u})
       for (const bool fi : {false, true})

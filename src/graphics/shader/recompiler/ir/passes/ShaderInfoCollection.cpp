@@ -521,6 +521,7 @@ void Visit(Program& program, bool fsb, ShaderStageInputInfo input_info, InputUsa
 			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
 			break;
 		case ValueOpcode::Ballot: info.subgroup_ballot = true; break;
+		case ValueOpcode::SubgroupUMinU32: info.subgroup_arithmetic = true; break;
 		case ValueOpcode::DppMoveU32:
 		case ValueOpcode::ReadFirstLane:
 		case ValueOpcode::ReadLane: {
@@ -581,7 +582,7 @@ void CollectShaderInfo(Program& program, bool fsb, ShaderStageInputInfo input_in
 	info.live_buffers = 0;
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
 	    info.uses_dispatch_threads = info.uses_swizzle = false;
-	info.bvh = info.subgroup_ballot = info.subgroup_barrier = info.subgroup_shuffle =
+	info.bvh = info.subgroup_ballot = info.subgroup_barrier = info.subgroup_shuffle = info.subgroup_arithmetic =
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =
 	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 = false;
