@@ -391,7 +391,7 @@ struct TextureCacheTestAccess {
     std::lock_guard lock(cache.m_lock);
     auto &metadata = cache.m_surface_metas[address];
     metadata.type = TextureCache::MetaDataInfo::Type::HTile;
-    metadata.clear_mask = 0;
+    metadata.clear_mask.reset();
   }
 
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
@@ -5747,14 +5747,23 @@ public:
               "non-exact lookup did not retain the last compatible "
               "registration");
 
-      auto null_desc = sampled;
-      null_desc.info.data = {};
-      auto null_repeat_desc = null_desc;
-      const auto null_image = texture_cache.FindImage(null_desc);
-      const auto null_repeat = texture_cache.FindImage(null_repeat_desc);
-      Require(name, "null image",
-              null_image && null_repeat == null_image && null_image != exact,
-              "typed null-image lookup was not stable");
+      ShaderRecompiler::IR::ImageResource null_resource{};
+      null_resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      null_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      null_resource.read = true;
+      ShaderRecompiler::IR::DescriptorValue null_descriptor{};
+      null_descriptor.dword_count = 8;
+      for (u32 attempt = 0; attempt < 2; ++attempt) {
+        const auto binding = RenderExecutorTestAccess::ResolveTexture(
+            context.GetRenderExecutor(), null_resource, null_descriptor);
+        const auto native = MakeImageInfo(binding);
+        Require(name, "null image binding",
+                !binding.image_id && binding.image_view == nullptr &&
+                    native.imageView == nullptr &&
+                    native.imageLayout == vk::ImageLayout::eGeneral &&
+                    TextureCacheTestAccess::Contains(texture_cache, exact),
+                "a null descriptor acquired a cache image or disturbed a real image");
+      }
 
       constexpr uint64_t extent_alias_offset = 0x2400000;
       auto narrow_target = sampled;
@@ -6750,8 +6759,7 @@ public:
               texture_cache.GetImage(ms_depth_image).backing.state.layout ==
                   vk::ImageLayout::eDepthStencilAttachmentOptimal &&
               texture_cache.GetImage(ms_depth_image).IsGpuModified() &&
-              texture_cache.GetImage(ms_depth_image).info.htile_clear_mask ==
-                  0 &&
+              !texture_cache.GetImage(ms_depth_image).info.htile_initial_clear &&
               texture_cache.GetImage(ms_depth_image).info.metadata.range ==
                   ms_depth_desc.info.metadata.range &&
               texture_cache.IsMeta(ms_htile_address) &&
@@ -7659,7 +7667,7 @@ public:
       };
       auto metadata_depth_a = MakeMetadataDepth(metadata_data_a, metadata_a);
       auto metadata_depth_b = MakeMetadataDepth(metadata_data_b, metadata_b);
-      metadata_depth_a.info.htile_clear_mask = 0;
+      metadata_depth_a.info.htile_initial_clear = false;
       const auto metadata_depth_a_id =
           texture_cache.FindImage(metadata_depth_a);
       const auto metadata_depth_b_id =
@@ -7677,6 +7685,8 @@ public:
               metadata_depth_a_view != nullptr &&
                   metadata_depth_b_view != nullptr &&
                   !texture_cache.IsMetaCleared(base + metadata_a, 0) &&
+                  !texture_cache.IsMetaCleared(base + metadata_a, 86) &&
+                  !texture_cache.IsMetaCleared(base + metadata_a, 8191) &&
                   texture_cache.ClearMeta(base + metadata_a) &&
                   texture_cache.ClearMeta(base + metadata_b),
               "shared-page metadata did not retain logical clear state");
@@ -7713,6 +7723,32 @@ public:
               texture_cache.TouchMeta(base + metadata_b, 0, false) &&
               !texture_cache.IsMetaCleared(base + metadata_b, 0),
           "per-slice metadata update incorrectly required prior GPU ownership");
+      constexpr std::array htile_slices{31u, 32u, 63u, 64u, 86u, 8191u};
+      Require(name, "HTile clear across slice words",
+              texture_cache.ClearMeta(base + metadata_b),
+              "registered metadata did not accept a full clear");
+      for (const auto slice : htile_slices) {
+        Require(name, "independent high HTile slice",
+                texture_cache.IsMetaCleared(base + metadata_b, slice) &&
+                    texture_cache.TouchMeta(base + metadata_b, slice, false) &&
+                    !texture_cache.IsMetaCleared(base + metadata_b, slice) &&
+                    texture_cache.IsMetaCleared(base + metadata_b, 0),
+                "high slice clear state was missing or aliased a lower slice");
+      }
+      (void)texture_cache.FindDepthTarget(metadata_depth_b_id, metadata_depth_b);
+      Require(name, "HTile registration retains consumed slices",
+              std::ranges::none_of(htile_slices, [&](uint32_t slice) {
+                return texture_cache.IsMetaCleared(base + metadata_b, slice);
+              }) && texture_cache.TouchMeta(base + metadata_b, 86, true) &&
+                  texture_cache.IsMetaCleared(base + metadata_b, 86) &&
+                  !texture_cache.IsMetaCleared(base + metadata_b, 64) &&
+                  !texture_cache.IsMetaCleared(base + metadata_b, 8192) &&
+                  !texture_cache.TouchMeta(base + metadata_b, 8192, true) &&
+                  texture_cache.ClearMeta(base + metadata_b) &&
+                  std::ranges::all_of(htile_slices, [&](uint32_t slice) {
+                    return texture_cache.IsMetaCleared(base + metadata_b, slice);
+                  }),
+              "registration reset consumed slices or full clear failed to rearm them");
       resources.GetBufferCache().FillBuffer(base + metadata_b, sizeof(uint32_t),
                                             0, false);
       Require(
@@ -7725,7 +7761,7 @@ public:
       auto reused_depth = MakeMetadataDepth(0x12300, 0x28000);
       reused_depth.info.pixel_format = vk::Format::eD32SfloatS8Uint;
       reused_depth.info.stencil = {base + 0x12200, 0x80};
-      reused_depth.info.htile_clear_mask = 0;
+      reused_depth.info.htile_initial_clear = false;
       reused_depth.view_info.format = vk::Format::eD32SfloatS8Uint;
       reused_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth |
                                       vk::ImageAspectFlagBits::eStencil;
@@ -11818,7 +11854,7 @@ public:
         previous_depth.info.UpdateSize();
         previous_depth.info.metadata.kind = ImageMetadataKind::Htile;
         previous_depth.info.metadata.range = {dcc_address, metadata_size};
-        previous_depth.info.htile_clear_mask = 0;
+        previous_depth.info.htile_initial_clear = false;
         previous_depth.view_info.format = vk::Format::eD32Sfloat;
         previous_depth.view_info.type = vk::ImageViewType::e2D;
         previous_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
@@ -14772,6 +14808,66 @@ public:
                   [](uint32_t value) { return value == std::bit_cast<uint32_t>(0.625f); }),
               "pending clear did not use DB_DEPTH_CLEAR or cleared the next acquisition again");
       DestroyBuffer(&bounds_readback);
+
+      // Captured DB_DEPTH_VIEW selects one layer of an 87-layer HTile target.
+      auto high_slice_target = depth_only_target;
+      high_slice_target.z_read_base_addr = base + 0x800000;
+      high_slice_target.z_write_base_addr = high_slice_target.z_read_base_addr;
+      high_slice_target.htile_data_base_addr = base + 0x500000;
+      high_slice_target.depth_view.slice_start = 86;
+      high_slice_target.depth_view.slice_max = 86;
+      high_slice_target.size = {127, 127, true};
+      registers.SetDepthRenderTarget(high_slice_target);
+      registers.SetDepthControl(HW::DepthControl{.depth_bounds_enable = true});
+      registers.SetRenderControl({});
+      RenderDepthInfo high_slice{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, scheduler.Current(), high_slice);
+      (void)texture_cache.FindDepthTarget(high_slice.image_id, high_slice.desc);
+      Require(name, "captured high HTile slice layout",
+              high_slice.desc.info.resources.layers == 87 &&
+                  high_slice.desc.view_info.base_layer == 86 &&
+                  high_slice.desc.view_info.layer_count == 1 &&
+                  high_slice.desc.info.data.End() <= base + 0xe00000 &&
+                  high_slice.desc.info.metadata.range.End() <= base + 0x800000 &&
+                  texture_cache.ClearMeta(high_slice_target.htile_data_base_addr),
+              "single high slice was rejected or changed the backing layer layout");
+      auto high_slice_readback = CreateHostBuffer(
+          name, 4 * sizeof(uint32_t), vk::BufferUsageFlagBits::eTransferDst, {});
+      for (uint32_t pass = 0; pass < 2; ++pass) {
+        vk::ClearValue prior_depth{};
+        prior_depth.depthStencil.depth = 0.625f;
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(),
+            high_slice.image_id, {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 87},
+            prior_depth);
+        RenderDepthInfo acquired_high_slice{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(
+            executor, scheduler.Current(), acquired_high_slice);
+        const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, scheduler.Current(), &no_color, 0, acquired_high_slice);
+        Require(name, "high HTile slice clear consumption",
+                acquired_high_slice.image_id == high_slice.image_id &&
+                    acquired_high_slice.depth_load_clear_enable == (pass == 0) &&
+                    rendering.depth_stencil_attachment.depth_clear == (pass == 0) &&
+                    !texture_cache.IsMetaCleared(high_slice_target.htile_data_base_addr, 86) &&
+                    texture_cache.IsMetaCleared(high_slice_target.htile_data_base_addr, 85),
+                "high slice was cleared repeatedly or consumed its neighbor's state");
+        scheduler.BeginRendering(rendering);
+        scheduler.EndRendering();
+        RenderExecutorTestAccess::ResetBindings(executor);
+        const vk::BufferImageCopy copy{pass * 2 * sizeof(uint32_t), 0, 0,
+            {vk::ImageAspectFlagBits::eDepth, 0, 85, 2}, {}, {1, 1, 1}};
+        texture_cache.GetImage(high_slice.image_id).Download(
+            std::span{&copy, 1}, high_slice_readback.buffer, 0, high_slice_readback.size);
+      }
+      scheduler.Current().Handle().pipelineBarrier2(bounds_dependency);
+      scheduler.Finish();
+      Require(name, "high HTile slice contents and neighbor",
+              ReadBuffer(name, high_slice_readback, 4) == std::vector<uint32_t>{
+                  std::bit_cast<uint32_t>(0.625f), std::bit_cast<uint32_t>(0.375f),
+                  std::bit_cast<uint32_t>(0.625f), std::bit_cast<uint32_t>(0.625f)},
+              "layer86 clear missed, repeated, or changed adjacent layer85");
+      DestroyBuffer(&high_slice_readback);
       registers.SetDepthClearValue(0.0f);
 
       // DB override copies run with depth and stencil tests disabled.
