@@ -18673,6 +18673,36 @@ public:
       check_round_trip("odd multi-mip", total.size, layout);
     }
 
+    {
+      constexpr auto format = Prospero::BufferFormat::k16_16_16_16Float;
+      constexpr auto tile = Prospero::TileMode::kStandard4KB;
+      auto view = MakeTilingImage(format, 16, 16, 1, 1, tile, 0, false);
+      view.data.address = 0x5032b23800;
+      view.UpdateSize();
+      Require(name, "rebased mip footprint",
+              view.data.size == 0x800 && view.DataAlignment() == 0x800 &&
+                  view.mip_layout[0].pitch == 32 &&
+                  view.mip_layout[0].height == 16 &&
+                  view.tiled_slice_stride == 0x1000,
+              "a compact view changed its allocation geometry");
+      check_round_trip("rebased mip exact range", view.data.size, view);
+      check_round_trip("rebased mip adjacent canary", 0x1000, view);
+
+      std::vector<uint8_t> linear(view.LinearSize());
+      fill(&linear, ++case_index);
+      std::vector<uint8_t> expected(0x1000, 0xab), observed;
+      convert_reference(true, &expected, linear, view);
+      gpu_tile(linear, &observed, 0x1000, linear.size(), view, nullptr, 0,
+               0x100, 0x800);
+      compare("rebased mip prefix and neighboring mip", expected, observed);
+      std::vector<uint8_t> round_trip;
+      gpu_detile(observed, &round_trip, observed.size(), linear.size(), view,
+                 nullptr, 0x800);
+      std::vector<uint8_t> expected_linear(linear.size(), 0);
+      convert_reference(false, &expected_linear, expected, view);
+      compare("rebased mip nonzero source", expected_linear, round_trip);
+    }
+
     struct TailMode {
       Prospero::TileMode tile;
       TileBlockFamily family;

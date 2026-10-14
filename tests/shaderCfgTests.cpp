@@ -1296,6 +1296,100 @@ void TestNormalizedImageContracts() {
         "Vulkan image-view compatibility classes diverged from production");
 }
 
+void TestRebasedTextureMipViews() {
+  constexpr auto format = Prospero::BufferFormat::k16_16_16_16Float;
+  constexpr auto tile = Prospero::TileMode::kStandard4KB;
+  TileSizeAlign allocation{};
+  TileGetTextureSize(format, 16, 16, 1, tile, &allocation, nullptr, nullptr);
+  Check(allocation.size == 0x1000 && allocation.align == 0x1000,
+        "rebased texture views changed guest allocation size/alignment");
+
+  ImageInfo chain{};
+  chain.data.address = 0x5032b23000;
+  chain.pixel_format = vk::Format::eR16G16B16A16Sfloat;
+  chain.guest_format = format;
+  chain.extent = {256, 256, 1};
+  chain.resources = {9, 2};
+  chain.tile_mode = tile;
+  chain.UpdateSize();
+  Check(chain.tiled_slice_stride == 0xab000 && chain.data.size == 0x156000 &&
+            chain.first_tail_level == 4 && chain.DataAlignment() == 0x1000,
+        "full texture chain lost its guest allocation layout");
+  const std::array<uint64_t, 9> offsets{
+      0x2b000, 0xb000, 0x3000, 0x1000, 0x800, 0x600, 0x500, 0x400, 0x300};
+  const auto make_view = [&](uint32_t level, uint32_t layer) {
+    auto view = chain;
+    view.data = {chain.data.address + layer * chain.tiled_slice_stride +
+                     offsets[level], 0};
+    view.extent = {256u >> level, 256u >> level, 1};
+    view.resources = {1, 1};
+    view.pitch = 0;
+    view.UpdateSize();
+    return view;
+  };
+  for (uint32_t layer = 0; layer < 2; ++layer) {
+    for (uint32_t level = 0; level < offsets.size(); ++level) {
+      auto view = make_view(level, layer);
+      const uint64_t bytes = uint64_t{view.extent.width} * view.extent.height * 8;
+      Check(view.data.size == bytes && view.mip_layout[0].size == bytes &&
+                view.tiled_slice_stride == std::max<uint64_t>(0x1000, bytes) &&
+                view.DataAlignment() == std::min<uint64_t>(0x1000,
+                                               std::max<uint64_t>(0x100, bytes)) &&
+                view.MipOf(chain) == static_cast<int32_t>(level) &&
+                view.SliceOf(chain, static_cast<int32_t>(level)) ==
+                    static_cast<int32_t>(layer),
+            "rebased mip footprint/origin or parent layer stride was incorrect");
+      view.UpdateSize();
+      Check(view.data.size == bytes && view.mip_layout[0].size == bytes &&
+                view.MipOf(chain) == static_cast<int32_t>(level),
+            "resizing a normalized view lost its compact footprint");
+    }
+  }
+  auto view = make_view(4, 0);
+  Check(view.data.address == 0x5032b23800 && view.mip_layout[0].pitch == 32 &&
+            view.mip_layout[0].height == 16 &&
+            view.mip_layout[0].linear_pitch == 32 && view.LinearSize() == 0x1000,
+        "captured 16x16 view changed its padded tiling or linear transfer size");
+  view.data.address += 0x800;
+  Check(view.MipOf(chain) == -1, "tail view accepted the following mip's address");
+  view = make_view(4, 0);
+  view.mip_layout[0].pitch /= 2;
+  Check(view.MipOf(chain) == -1, "tail view accepted a different padded pitch");
+  view = make_view(4, 0);
+  view.resources.layers = 2;
+  view.data.size *= 2;
+  view.mip_layout[0].size *= 2;
+  Check(view.MipOf(chain) == -1, "tail array view ignored the parent chain stride");
+  view = make_view(4, 0);
+  view.data = {chain.data.address, 0x1000};
+  view.UpdateSize();
+  Check(view.MipOf(chain) == -1,
+        "full-block child ignored the parent mip's nonzero tail origin");
+
+  for (uint32_t variant = 0; variant < 7; ++variant) {
+    view = make_view(4, 0);
+    view.data = {chain.data.address, 0};
+    view.pitch = 0;
+    switch (variant) {
+    case 0: view.extent = {8, 16, 1}; break; // Holes in the Standard4KB span.
+    case 1: view.resources.levels = 2; break;
+    case 2: view.resources.layers = 2; break;
+    case 3: view.type = Prospero::ImageType::kColor3D; break;
+    case 4: view.tile_mode = Prospero::TileMode::kStandard64KB; break;
+    case 5: view.metadata.kind = ImageMetadataKind::Dcc; break;
+    case 6: view.data = {0x5032b23800, 0x1000}; break;
+    }
+    view.UpdateSize();
+    Check(view.data.size >= 0x1000 && view.DataAlignment() >= 0x1000,
+          "unsupported or explicitly sized texture became a compact tail view");
+  }
+  view = make_view(4, 0);
+  view.data = {0x5032b23900, 0};
+  view.UpdateSize();
+  Check(view.data.size == 0x1000 && view.DataAlignment() == 0x1000,
+        "misaligned descriptor received compact tail alignment");
+}
+
 void TestShaderFeatureCollection() {
   using namespace ShaderRecompiler::IR;
 
@@ -15757,6 +15851,7 @@ int main() {
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
+  TestRebasedTextureMipViews();
   TestShaderFeatureCollection();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
