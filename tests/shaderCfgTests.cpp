@@ -15743,6 +15743,46 @@ void TestRepeatedExportsHaveOneInterface() {
         "repeated exports duplicated Position or its clipping-error plane");
 }
 
+void CheckSpirvBlockSourceMapping(TestCompileResult &result) {
+  using namespace ShaderRecompiler;
+  const auto options = MakeCompileOptions(ShaderType::Compute);
+  Check(SpirvInstructionOpcodeCount(result.spirv, spv::OpString) == 0 &&
+            SpirvInstructionOpcodeCount(result.spirv, spv::OpLine) == 0,
+        "default emission unexpectedly contains source mapping");
+  const auto mapped = Spirv::EmitProgram(result.program, options.input_info, 0,
+                                         false, true);
+  CheckSpirvBinaryValidates(mapped);
+  uint32_t source = 0;
+  uint32_t label = 0;
+  size_t lines = 0;
+  uint32_t previous = spv::OpNop;
+  for (size_t at = 5; at < mapped.size();) {
+    const auto op = mapped[at] & spv::OpCodeMask;
+    if (op == spv::OpLabel) label = mapped[at + 1];
+    if (op == spv::OpString) {
+      source = mapped[at + 1];
+      Check(std::string(reinterpret_cast<const char *>(&mapped[at + 2]))
+                .find("-block-byte-pc-plus-one") != std::string::npos,
+            "debug source filename does not identify block offset encoding");
+    } else if (op == spv::OpLine) {
+      Check(previous == spv::OpLabel && mapped[at + 1] == source &&
+                mapped[at + 3] == 0 &&
+                std::ranges::any_of(result.program.blocks, [&](const auto *block) {
+                  return block->Definition() == label &&
+                         mapped[at + 2] == block->start_pc + 1u;
+                }),
+            "debug source line does not identify a native block after its label");
+      ++lines;
+    }
+    previous = op;
+    at += mapped[at] >> spv::WordCountShift;
+  }
+  Check(source != 0 && lines >= result.program.blocks.size(),
+        "debug emission omitted native block source mapping");
+  Check(Spirv::EmitProgram(result.program, options.input_info) == result.spirv,
+        "debug re-emission changed the default binary");
+}
+
 void TestNewShaderRecompilerSpirvSizeBaselines() {
   const auto compile = [](const char *name, std::span<const uint32_t> shader,
                           const SpirvMetrics &budget,
@@ -15787,7 +15827,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x02, 0xfffcu),   // continue/backedge
       EncodeSopp(0x01),
   };
-  const auto structured_result = compile("structured-phi", structured_phi,
+  auto structured_result = compile("structured-phi", structured_phi,
                                          {.words = 174,
                                           .instructions = 49,
                                           .phis = 1,
@@ -15804,6 +15844,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
             structured_metrics.loads == 0u && structured_metrics.stores == 0u,
         "structured Phi retained a spill variable or edge memory operation");
   CheckSpirvPhiParents(structured_result.spirv);
+  CheckSpirvBlockSourceMapping(structured_result);
   const auto structured_repeat =
       compile("structured-phi-repeat", structured_phi,
               {.words = 174,
@@ -15974,7 +16015,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x02, 0xfffeu), // B -> C
       EncodeSopp(0x01),
   };
-  const auto dispatcher_result = compile("dispatcher", dispatcher,
+  auto dispatcher_result = compile("dispatcher", dispatcher,
                                          {.words = 255,
                                           .instructions = 70,
                                           .variables = 3,
@@ -15995,6 +16036,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
             SpirvInstructionOpcodeCount(dispatcher_result.spirv, 251u) == 1u,
         "dispatcher size fixture lost its two control Phis or switch");
   CheckSpirvPhiParents(dispatcher_result.spirv);
+  CheckSpirvBlockSourceMapping(dispatcher_result);
 }
 
 #include "ShaderRayTracingTests.inc"

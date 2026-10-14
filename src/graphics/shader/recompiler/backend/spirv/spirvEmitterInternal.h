@@ -92,6 +92,7 @@ struct EmitterState {
 	ShaderStageInputInfo                             input_info;
 	bool                                            maintenance8_enabled;
 	bool                                            mesh_shader_fallback = false;
+	uint32_t                                        debug_source = 0;
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
 	uint32_t                                        u32_type = 0;
@@ -185,6 +186,11 @@ uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_cl
 inline void EmitLabel(EmitterState& state, uint32_t label) {
 	state.current_label = label;
 	state.builder.AddFunction(spv::OpLabel, label);
+	if (state.debug_source != 0 && state.current_block != nullptr) {
+		// Source lines encode the containing native block's byte offset plus one.
+		state.builder.AddFunction(spv::OpLine, state.debug_source,
+		                          state.current_block->start_pc + 1u, 0u);
+	}
 }
 
 uint32_t TypeId(EmitterState& state, IR::Type type);

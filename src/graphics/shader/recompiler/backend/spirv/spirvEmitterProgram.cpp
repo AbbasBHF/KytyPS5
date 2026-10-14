@@ -348,6 +348,7 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto initial_parent = state.current_label;
 	state.builder.AddFunction(spv::OpBranch, dispatcher.header_label);
 
+	state.current_block = nullptr;
 	EmitLabel(state, dispatcher.header_label);
 	const auto pc      = state.builder.AllocateId();
 	const auto next_pc = state.builder.AllocateId();
@@ -383,6 +384,7 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 		next_pc_words.push_back(state.current_label);
 		state.builder.AddFunction(spv::OpBranch, dispatcher.after_switch_label);
 	}
+	state.current_block = nullptr;
 	EmitLabel(state, dispatcher.after_switch_label);
 	state.builder.AddFunction(next_pc_words);
 	state.builder.AddFunction(spv::OpBranch, dispatcher.continue_label);
@@ -747,6 +749,7 @@ void EmitProgram(EmitterState& state) {
 		EmitStructuredFunction(ctx);
 	}
 	state.builder.AddFunction(spv::OpFunctionEnd);
+	state.current_block = nullptr;
 	if (state.program.stage == ShaderType::Mesh) {
 		EmitMeshEntryPoint(state);
 	}

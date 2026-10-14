@@ -21,6 +21,7 @@ struct CompileOptions {
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
+	bool                        emit_debug_info            = false;
 	bool                        maintenance8_enabled       = false;
 	// Lower guest mesh shaders to a workgroup compute shader when the Vulkan device lacks
 	// VK_EXT_mesh_shader. The renderer supplies the generated-output buffer in push data.

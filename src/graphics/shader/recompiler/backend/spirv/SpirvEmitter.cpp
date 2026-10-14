@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -204,7 +205,8 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t push_data_start_dword, bool maintenance8_enabled,
-                                  bool mesh_shader_fallback) {
+                                  bool mesh_shader_fallback,
+                                  bool emit_debug_info) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -223,6 +225,12 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	}
 	program.bindings = {.push_data_start_dword = push_data_start_dword};
 	EmitterState state(program, input_info, maintenance8_enabled, mesh_shader_fallback);
+	if (emit_debug_info) {
+		char name[64];
+		std::snprintf(name, sizeof(name), "rdna2-%016" PRIx64 "-block-byte-pc-plus-one",
+		              program.shader_hash);
+		state.debug_source = state.builder.AddString(name);
+	}
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u

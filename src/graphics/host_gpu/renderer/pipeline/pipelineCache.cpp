@@ -438,6 +438,7 @@ struct PipelineCache::ProgramCache {
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
+		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 		options.dump_label  = label;
 		options.input_info  = stage_input;
 
