@@ -30388,6 +30388,7 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   test.compute_info.wave_size = wave;
   test.has_compute_info = true;
   test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge", formatted ? "OpSwitch" : "Volatile"};
+  if (!formatted) test.forbidden_spirv = {"convert_indirect_buffer_format"};
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHLREV_B32,
                   O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_LSHL_B32,
                   O::S_BUFFER_LOAD_DWORDX8, load,
@@ -36591,16 +36592,31 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
       if (count == 8u) {
         std::set<u32> nonuniform;
         std::vector<u32> stores;
-        u32 bda_calls = 0;
+        u32 bda_function = 0, conversion_function = 0;
+        u32 bda_calls = 0, conversion_calls = 0, conversion_definitions = 0;
         for (size_t offset = 5; offset < compiled.spirv.size();) {
           const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
           const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+          if (opcode == spv::OpName) {
+            const std::string_view name(reinterpret_cast<const char *>(words.data() + 2));
+            if (name == "get_bda_pointer") bda_function = words[1];
+            if (name == "convert_indirect_buffer_format") conversion_function = words[1];
+          }
           if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
             nonuniform.insert(words[1]);
           if (opcode == spv::OpStore) stores.push_back(words[1]);
-          if (opcode == spv::OpFunctionCall) ++bda_calls;
+          if (opcode == spv::OpFunction && words[2] == conversion_function)
+            ++conversion_definitions;
+          if (opcode == spv::OpFunctionCall) {
+            if (words[3] == bda_function) ++bda_calls;
+            if (words[3] == conversion_function) ++conversion_calls;
+          }
           offset += words.size();
         }
+        Require(test.name, "one shared formatted conversion",
+                conversion_definitions == 1u &&
+                    conversion_calls == (wave > vulkan.SubgroupSize() ? 2u : 1u),
+                "formatted loads must call one conversion function across virtual halves");
         Require(test.name, "one shared indirect store per virtual half",
                 std::ranges::count_if(stores, [&](u32 pointer) { return nonuniform.contains(pointer); }) ==
                     (wave > vulkan.SubgroupSize() ? 2 : 1),
@@ -36715,7 +36731,7 @@ void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
       }
       if (count == 2u) {
         test.required_spirv = {"StorageBufferArrayNonUniformIndexing"};
-        test.forbidden_spirv = {"OpSwitch", "PhysicalStorageBuffer"};
+        test.forbidden_spirv = {"OpSwitch", "PhysicalStorageBuffer", "convert_indirect_buffer_format"};
       } else if (count == 6u) test.required_spirv = {"OpSwitch"};
       auto compiled = CompileCase(test, vulkan.SubgroupSize());
       Require(test.name, "mixed native aliases", count != 6u ||
