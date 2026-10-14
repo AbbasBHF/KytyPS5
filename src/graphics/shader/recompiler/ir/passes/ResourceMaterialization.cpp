@@ -306,6 +306,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	const auto children_begin = descriptors.size();
 	const auto root_resource = specializations[resource_index];
 	const auto evaluate_count = [&](uint32_t& count) {
+		if (indirect.workgroup_axis != UINT32_MAX) {
+			if (indirect.workgroup_axis >= runtime.workgroup_counts.size()) return false;
+			count = runtime.workgroup_counts[indirect.workgroup_axis];
+			return count != 0u;
+		}
 		if (!clean.Evaluate(indirect.key_count, count)) return false;
 		if (indirect.signed_count && std::bit_cast<int32_t>(count) < 0) count = 0;
 		return true;
@@ -431,14 +436,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		if (selector == nullptr) {
 			uint32_t key_count = 0;
 			uint32_t first_key = 0;
-			if (indirect.workgroup_axis != UINT32_MAX) {
-				if (indirect.workgroup_axis >= runtime.workgroup_counts.size()) return false;
-				key_count = runtime.workgroup_counts[indirect.workgroup_axis];
-				if (key_count == 0u) return false;
-			} else {
-				if (!evaluate_count(key_count))
-					return false;
-			}
+			if (!evaluate_count(key_count)) return false;
 			if (!indirect.selector_first.IsEmpty() && !clean.Evaluate(indirect.selector_first, first_key))
 				return false;
 			if (indirect.table_stride == 0u || key_count > MaxIndirectDescriptorProbes ||
