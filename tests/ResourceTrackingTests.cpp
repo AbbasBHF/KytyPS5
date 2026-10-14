@@ -222,7 +222,8 @@ MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t ta
       ValueOpcode::GetBuiltin,
       {Value(static_cast<uint32_t>(finite_key ? StageInputKind::WorkgroupId
                                               : StageInputKind::GlobalInvocationId)), Value(0u)});
-  const auto selector = finite_key ? invocation
+  const auto selector = finite_key
+      ? fixture->Emit(ValueOpcode::BitwiseXor32, {invocation, Value(1u)})
       : fixture->Emit(ValueOpcode::ReadFirstLane, {invocation, Value(true)});
   Value member;
   if (nested) {
@@ -2699,7 +2700,7 @@ void TestUniformizedMaterialImageKeys() {
   memory.fail_address = base + 16u * 16u + 8u;
   memory.reads = memory.descriptor_reads = 0u;
   Check(MaterializeResources(packed, runtime, snapshot, specialization) &&
-            memory.reads == 19u && memory.descriptor_reads == 3u && snapshot.images.size() == 3u &&
+            memory.reads == 4u && memory.descriptor_reads == 3u && snapshot.images.size() == 3u &&
             snapshot.images[0].dwords[0] == 0x200u && snapshot.images[1].dwords[0] == 0x400u &&
             snapshot.images[2].dwords[0] == 0x600u,
         "packed selector did not extract before clamping or read outside its sixteen records");
@@ -2719,7 +2720,7 @@ void TestUniformizedMaterialImageKeys() {
               snapshot.images.size() == 3u && snapshot.images[0].dwords[0] == 0x200u &&
               snapshot.images[1].dwords[0] == 0x400u && snapshot.images[2].dwords[0] == 0x600u &&
               std::ranges::find(snapshot.specialization_reads,
-                  std::pair<uint64_t, uint64_t>{base + base_offset + immediate, 4u}) !=
+                  std::pair<uint64_t, uint64_t>{base + base_offset + immediate, 244u}) !=
                   snapshot.specialization_reads.end(),
           "global selector did not preserve exact base-plus-offset while scalar descriptor reads aligned the base");
   }
@@ -2731,7 +2732,7 @@ void TestUniformizedMaterialImageKeys() {
   memory.fail_address = base + 16u * 16u + 8u;
   memory.reads = memory.descriptor_reads = 0u;
   Check(MaterializeResources(merged, runtime, snapshot, specialization) &&
-            memory.reads == 19u && memory.descriptor_reads == 3u && snapshot.images.size() == 3u &&
+            memory.reads == 4u && memory.descriptor_reads == 3u && snapshot.images.size() == 3u &&
             snapshot.images[0].dwords[0] == 0x200u && snapshot.images[1].dwords[0] == 0x400u &&
             snapshot.images[2].dwords[0] == 0x600u,
         "merged nibble selector did not preserve its sixteen-record domain and lower-half projection");
@@ -2978,12 +2979,14 @@ void TestScalarBufferSelectorDomain() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   memory.watched_address = 0x1000u + 144u;
-  memory.fail_address = 0x1000u + 160u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 3u && memory.watched_reads == 1u &&
-            memory.watched_dwords == 1u && snapshot.images[0].dwords[0] == 0x100u &&
+            memory.watched_dwords == 9u && snapshot.images[0].dwords[0] == 0x100u &&
             snapshot.images[2].dwords[0] == 0x102u,
-        "scalar selector read outside its wrapped domain or omitted the OOB zero key");
+        "scalar selector interpreted batched padding or omitted the OOB zero key");
+  Check(std::ranges::find(snapshot.specialization_reads,
+            std::pair<uint64_t, uint64_t>{0x1090u, 36u}) != snapshot.specialization_reads.end(),
+        "scalar selector batch escaped specialization overlap tracking");
   const auto scaled_lane = make_plan(true, false, true);
   memory.words[176u / 4u] = UINT32_MAX;
   Check(MaterializeResources(scaled_lane, runtime, snapshot, specialization) &&
@@ -3723,7 +3726,7 @@ void TestSharedAppendSelectorBounds() {
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 1u && memory.descriptor_reads == 0u && memory.watched_reads == 0u,
         "empty shared append lists probed material keys or image descriptors");
-  memory.fail_address = 0x10b0u;
+  memory.fail_address = UINT64_MAX;
   for (const auto counts : {std::array{1u, 2u}, std::array{3u, 1u}, std::array{1u, 1u}, std::array{0u, 0u}}) {
     memory.words[0x800u / 4u] = counts[0];
     memory.words[0x804u / 4u] = counts[1];
@@ -3778,10 +3781,13 @@ void TestSharedAppendSelectorBounds() {
       words[0] = memory.counts[(address - 0x40000000u) / 4u];
       return true;
     }
-    if (words.size() == 1u && address >= 0x1090u &&
-        (address - 0x1090u) % 160u == 0u && (address - 0x1090u) / 160u < 65536u) {
-      words[0] = 1u;
-      ++memory.keys_read;
+    if (address >= 0x1090u && (address - 0x1090u) % 160u == 0u &&
+        address - 0x1090u + words.size_bytes() <= 65535u * 160u + 4u) {
+      std::ranges::fill(words, 0xdeadbeefu);
+      for (size_t word = 0; word < words.size(); word += 40u) {
+        words[word] = 1u;
+        ++memory.keys_read;
+      }
       return true;
     }
     if (words.size() != 8u || address != 0x50000020u) return false;
@@ -4784,7 +4790,8 @@ void TestBoundedFormattedBufferStore() {
 
 std::unique_ptr<Fixture> MakeBufferRecordFixture(uint32_t step = 1u, bool bypass = false,
                                                   bool gpu_selected = false, uint32_t bias = 0u,
-                                                  bool split_offsets = false) {
+                                                  bool split_offsets = false,
+                                                  bool workgroup_selected = false) {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   auto fixture = std::make_unique<Fixture>();
   auto& f = *fixture;
@@ -4796,8 +4803,8 @@ std::unique_ptr<Fixture> MakeBufferRecordFixture(uint32_t step = 1u, bool bypass
   if (gpu_selected) {
     std::array<Value, 4> selector_words;
     for (uint32_t word = 0; word < 4u; ++word) selector_words[word] = f.UserData(4u + word);
-    const auto group = f.Emit(ValueOpcode::GetBuiltin,
-        {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)});
+    const auto group = workgroup_selected ? f.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)}) : lane;
     key = f.Emit(ValueOpcode::ReadConstBuffer,
         {f.Buffer(selector_words), f.Emit(ValueOpcode::IMul32, {group, Value(12u)})},
         f.AddMemory({.kind = ResourceKind::ScalarBuffer}, 0x1bcu));
@@ -5088,6 +5095,143 @@ void TestGpuSelectedBufferRecords() {
   }
   CheckFatal([] { MakeBufferRecordFixture(1u, false, true, 0u, true); },
              "not a valid runtime value", "split dynamic descriptor offsets lost independent U32 wrapping");
+}
+
+void TestWorkgroupSelectedBufferRecords() {
+  namespace Prospero = Libs::Graphics::Prospero;
+  auto fixture = MakeBufferRecordFixture(1u, false, true, 0u, false, true);
+  auto plan = ExtractResourcePlan(fixture->program);
+  std::vector<uint32_t> roots;
+  for (uint32_t root = 0; root < plan.info.buffers.size(); ++root) {
+    const auto& source = plan.descriptor_sources[plan.info.buffers[root].source];
+    if (!source.indirect_descriptor) continue;
+    const auto& indirect = *source.indirect_descriptor;
+    Check(indirect.workgroup_axis == 0u && indirect.selector_first == Value(0u) &&
+              indirect.selector && indirect.selector->stride == 12u &&
+              indirect.table_stride == 192u && !indirect.table_scalar,
+          "workgroup selector lost its exact prefix or descriptor geometry");
+    roots.push_back(root);
+  }
+  Check(roots.size() == 2u, "workgroup selector did not retain both buffer operations");
+  LinearTestMemory memory;
+  constexpr uint32_t table = 256u, selector = 0x1000u;
+  memory.words.resize((selector + MaxIndirectDescriptorProbes * 12u) / 4u);
+  std::fill_n(memory.words.begin() + table / 4u, 384u / 4u, 0xdeadbeefu);
+  for (uint32_t row = 0; row < 2u; ++row) {
+    for (uint32_t member = 0; member < 2u; ++member) {
+      const auto first = (table + row * 192u + 160u + member * 16u) / 4u;
+      memory.words[first] = 0x100000u + row * 0x1000u + member * 0x10000u;
+      memory.words[first + 1u] = (member == 0u ? 8u : 1u) << 16u;
+      memory.words[first + 2u] = 16u;
+      memory.words[first + 3u] = member == 0u
+          ? (uint32_t(Prospero::BufferFormat::k16_16_16_16Float) << 12u) | Libs::Graphics::DstSel(4, 5, 6, 7)
+          : 0x5204u;
+    }
+  }
+  const std::array<uint32_t, 4> numeric_descriptor{0x640u, 3u, 0x3ba3d70au, 0x3a23d70au};
+  std::copy(numeric_descriptor.begin(), numeric_descriptor.end(), memory.words.begin() + (table + 304u) / 4u);
+  std::array<uint32_t, 8> user_data{uint32_t(memory.base) + table, 192u << 16u, 2u, 0x5204u,
+      uint32_t(memory.base) + selector, 12u << 16u, MaxIndirectDescriptorProbes, 0x5204u};
+  memory.watched_address = memory.base;
+  SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+      .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory,
+      .indirect_args_address = memory.base};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto materialize = [&] {
+    memory.reads = memory.watched_reads = 0u;
+    return MaterializeResources(plan, runtime, snapshot, specialization);
+  };
+  for (const auto dimensions : {std::array{2u, 1u, 1u}, std::array{0u, 1u, 1u},
+                                std::array{2u, 0u, 1u}, std::array{2u, 1u, 0u},
+                                std::array{1u, 1u, 1u}, std::array{2u, 1u, 1u}}) {
+    std::copy(dimensions.begin(), dimensions.end(), memory.words.begin());
+    memory.words[selector / 4u] = dimensions[0] == 1u ? 0u : 1u;
+    memory.words[selector / 4u + 3u] = 0u;
+    memory.words[selector / 4u + 6u] = 22369622u; // Would select the numeric fields at +288/+304.
+    const bool empty = std::ranges::find(dimensions, 0u) != dimensions.end();
+    Check(materialize() && memory.watched_reads == 1u && memory.watched_dwords == 3u &&
+              snapshot.buffers.size() == plan.info.buffers.size() + (empty ? 0u : (dimensions[0] - 1u) * 2u) &&
+              memory.reads == (empty ? 1u : 3u + dimensions[0] * 2u),
+          "workgroup prefix reread arguments, visited an inactive key or retained stale candidates");
+    Check(std::ranges::find(snapshot.specialization_reads, std::pair{memory.base, uint64_t{12u}}) !=
+              snapshot.specialization_reads.end(),
+          "indirect dispatch arguments escaped writable-alias tracking");
+    if (!empty)
+      Check(std::ranges::find(snapshot.specialization_reads,
+                std::pair{memory.base + selector, uint64_t{(dimensions[0] - 1u) * 12u + 4u}}) !=
+                snapshot.specialization_reads.end(),
+            "batched selector prefix escaped writable-alias tracking");
+  }
+  const auto valid = specialization;
+  memory.words[selector / 4u] = 0x40000001u; // key*192 wraps to the valid second row.
+  Check(materialize() && specialization == valid,
+        "GPU descriptor key lost its native U32 multiplication wrap");
+  memory.words[selector / 4u] = 22369622u;
+  Check(!materialize(), "an actually selected numeric descriptor was silently filtered");
+  memory.words[selector / 4u] = 1u;
+  user_data[5] = 0u;
+  user_data[6] = 14u; // Second key has fewer than four in-bounds bytes: SMEM returns zero.
+  Check(materialize() && snapshot.buffers.size() == plan.info.buffers.size() + 2u,
+        "partial scalar selector did not zero-fill its OOB DWORD");
+  user_data[6] = 0u;
+  Check(materialize() && snapshot.buffers.size() == plan.info.buffers.size() &&
+            memory.reads == 3u,
+        "empty selector V# did not select key zero without reading payload");
+  // Existing vector selectors use the V# stride; each scalar snapshot read
+  // independently rounds its resulting byte offset down to a DWORD.
+  for (const uint32_t stride : {5u, 6u}) {
+    for (const auto root : roots) {
+      auto& indirect = *plan.descriptor_sources[plan.info.buffers[root].source].indirect_descriptor;
+      indirect.selector->stride = 0u;
+      indirect.selector_first = Value(1u);
+    }
+    user_data[5] = stride << 16u;
+    user_data[6] = 5u;
+    memory.words[0] = 4u;
+    std::fill_n(memory.words.begin() + selector / 4u, 8u, 0xdeadbeefu);
+    for (uint32_t index = 0; index < 4u; ++index)
+      memory.words[selector / 4u + ((index + 1u) * stride) / 4u] = index & 1u;
+    Check(materialize() && memory.reads == 7u &&
+              snapshot.buffers.size() == plan.info.buffers.size() + 2u,
+          "batched vector selector changed independent scalar DWORD alignment");
+  }
+  for (const auto root : roots) {
+    auto& indirect = *plan.descriptor_sources[plan.info.buffers[root].source].indirect_descriptor;
+    indirect.selector->stride = 12u;
+    indirect.selector_first = Value(0u);
+  }
+  user_data[5] = 12u << 16u;
+  user_data[6] = MaxIndirectDescriptorProbes;
+  std::fill(memory.words.begin() + selector / 4u, memory.words.end(), 0u);
+  memory.words[0] = MaxIndirectDescriptorProbes;
+  Check(materialize() && memory.reads == 9u,
+        "strided selector prefix was not read in bounded contiguous batches");
+  memory.words[0] = MaxIndirectDescriptorProbes + 1u;
+  Check(!materialize() && memory.reads == 1u,
+        "selector cap was checked after reading its GPU payload");
+  memory.words[0] = 2u;
+  for (const auto root : roots)
+    plan.descriptor_sources[plan.info.buffers[root].source].indirect_descriptor->selector->offset = UINT32_MAX - 3u;
+  Check(!materialize() && memory.reads == 1u,
+        "selector offset arithmetic accepted a wrapped prefix span");
+  for (const auto root : roots)
+    plan.descriptor_sources[plan.info.buffers[root].source].indirect_descriptor->selector->offset = 0u;
+  runtime.indirect_args_address = 0u;
+  const std::array direct_counts{1u, 1u, 1u};
+  runtime.workgroup_counts = std::span(direct_counts).first(1u);
+  Check(!materialize() && memory.reads == 0u,
+        "workgroup prefix accepted an incomplete dispatch extent");
+  runtime.workgroup_counts = direct_counts;
+  memory.fail_address = memory.base;
+  Check(materialize() && memory.watched_reads == 0u,
+        "direct workgroup counts unnecessarily read indirect arguments");
+  const auto ordinary = MakeBufferRecordFixture(1u, false, true);
+  const auto ordinary_plan = ExtractResourcePlan(ordinary->program);
+  runtime.indirect_args_address = memory.base;
+  user_data[2] = 0u;
+  Check(MaterializeResources(ordinary_plan, runtime, snapshot, specialization),
+        "a plan without workgroup counts read the indirect argument pointer");
 }
 
 void TestGpuSelectedFormattedRecordStore() {
@@ -7024,6 +7168,7 @@ int main() {
     Run("bounded formatted buffer store", TestBoundedFormattedBufferStore);
     Run("bounded buffer records", TestBoundedBufferRecords);
     Run("GPU-selected buffer records", TestGpuSelectedBufferRecords);
+    Run("workgroup-selected buffer records", TestWorkgroupSelectedBufferRecords);
     Run("GPU-selected formatted record store", TestGpuSelectedFormattedRecordStore);
     Run("finite buffer selection", TestFiniteBufferSelection);
     Run("packed scalar buffer selection", TestPackedScalarBufferSelection);
