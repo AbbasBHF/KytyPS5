@@ -216,7 +216,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		vk::PhysicalDeviceVulkan12Features features12 {};
 		vk::PhysicalDeviceVulkan11Features features11 {};
-		features11.pNext       = &depth_clip_control;
+		vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
+		robustness2.pNext      = &depth_clip_control;
+		features11.pNext       = &robustness2;
 		features12.pNext       = &features11;
 		features13.pNext       = &features12;
 		device_features2.pNext = &features13;
@@ -281,6 +283,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              "shaderStorageBufferArrayNonUniformIndexing",
 		              required_features12.shaderStorageBufferArrayNonUniformIndexing);
 		check_feature(features13.robustImageAccess, "robustImageAccess");
+		check_feature(robustness2.nullDescriptor, "nullDescriptor");
 		check_feature(features13.dynamicRendering, "dynamicRendering",
 		              required_features13.dynamicRendering);
 		check_feature(features13.synchronization2, "synchronization2",
@@ -444,14 +447,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};
 	supported_features13.pNext = &supported_features12;
 
-	const auto robustness2_ext_enabled =
-	    HasExtension(device_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
-
 	vk::PhysicalDeviceRobustness2FeaturesEXT supported_robustness2 {};
-	if (robustness2_ext_enabled) {
-		supported_robustness2.pNext = supported_features13.pNext;
-		supported_features13.pNext = &supported_robustness2;
-	}
+	supported_robustness2.pNext = supported_features13.pNext;
+	supported_features13.pNext = &supported_robustness2;
 
 	const bool mesh_extension = HasExtension(device_extensions, VK_EXT_MESH_SHADER_EXTENSION_NAME);
 	vk::PhysicalDeviceMeshShaderFeaturesEXT supported_mesh {};
@@ -618,22 +616,19 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 	robustness2.pNext = &features12;
-	if (robustness2_ext_enabled) {
-		robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
-		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
-		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
-	}
+	robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
+	robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
+	robustness2.nullDescriptor      = VK_TRUE;
 
 	auto features13 = WindowContext::RequiredVulkan13Features();
-	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
-	                                           : static_cast<void*>(&features12);
+	features13.pNext = &robustness2;
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl =
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
-	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
+	     robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
 
 	vk::DeviceCreateInfo create_info {};
 	vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features {};
@@ -979,7 +974,7 @@ void WindowContext::CreateVulkan() {
 	std::vector<const char*> device_extensions = {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
 	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-	    "VK_KHR_maintenance1"};
+	    VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, "VK_KHR_maintenance1"};
 
 #if defined(__APPLE__)
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
@@ -1044,8 +1039,7 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
 		}
-		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
-		                             VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
+		for (const auto* extension: {VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
