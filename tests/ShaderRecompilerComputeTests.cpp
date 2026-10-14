@@ -36575,6 +36575,135 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", "BoundedFormattedBufferCopy");
 }
 
+void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
+  using namespace ShaderRecompiler::IR;
+  using F = Prospero::BufferFormat;
+  const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
+                            .limits.minStorageBufferOffsetAlignment;
+  const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
+  for (const u32 wave : {32u, 64u}) {
+    for (const u32 count : {0u, 2u, 6u}) {
+      TestCase test;
+      test.name = wave == 32 ? "BoundedRecordBufferAccess32" : "BoundedRecordBufferAccess64";
+      constexpr u32 table = 256u;
+      test.initial.assign((slot * 13u + 6u * wave * 16u) / 4u, 0xdeadbeefu);
+      test.has_user_data = test.has_compute_info = true;
+      test.user_data[0] = table;
+      test.user_data[1] = 8u << 16u;
+      test.user_data[2] = 6u * 192u / 8u;
+      test.user_data[3] = 0x5204u;
+      test.user_data[4] = count;
+      const std::array<u32, 4> output{slot * 13u, 16u << 16u, 6u * wave, 0x5204u};
+      std::copy(output.begin(), output.end(), test.user_data.begin() + 16u);
+      test.compute_info.wave_size = wave;
+      test.compute_info.threads_num[0] = wave;
+      test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+      test.compute_info.thread_ids_num = 1;
+      test.compute_info.lds_size_dwords = 0;
+      auto &code = test.code;
+      code.insert(code.end(), {EncodeSMovB32(32, InlineU32(0)), EncodeSop1(0x04, 36, 126)});
+      AppendVMovLiteral(&code, 13, 0x80000000u);
+      code.insert(code.end(), {EncodeVopc(0xc2, InlineU32(6), 0),
+          EncodeVop2(0x01, 12, Vgpr(0), 13)});
+      AppendVMovLiteral(&code, 14, 0x55555556u);
+      code.insert(code.end(), {EncodeVopc(0xc2, InlineU32(6), 0),
+          EncodeVop2(0x01, 15, Vgpr(0), 14)});
+      AppendVMovLiteral(&code, 10, 0xa5c39b72u);
+      const auto header = code.size();
+      code.push_back(EncodeSopc(0x04, 32, 4));
+      const auto exit_branch = code.size();
+      code.push_back(0);
+      code.insert(code.end(), {EncodeSop2(0x26, 33, 32, 255), 192u,
+          EncodeSmem0(0x0a, 8, 0), EncodeSmem1(160u, 33),
+          EncodeSmem0(0x0a, 12, 0), EncodeSmem1(176u, 33), EncodeSopp(0x0c, 0),
+          EncodeMubuf0(0x83, 0, true, false), EncodeMubuf1(4, 2, 12),
+          EncodeMubuf0(0x83, 0, true, false, true), EncodeMubuf1(6, 2, 12),
+          EncodeSopp(0x0c, 0), EncodeSop2(0x1e, 34, 32, InlineU32(std::countr_zero(wave))),
+          EncodeVop2(0x25, 20, 34, 0),
+          EncodeMubuf0(0x1e, 0, true, false), EncodeMubuf1(4, 4, 20)});
+      AppendSMovLiteral(&code, 126, 0x55555555u);
+      AppendSMovLiteral(&code, 127, wave == 64 ? 0x55555555u : 0u);
+      code.insert(code.end(), {EncodeMubuf0(0x19, 0, true, false, true), EncodeMubuf1(10, 3, 15),
+          EncodeSop1(0x04, 126, 36), EncodeSop2(0x02, 32, 32, InlineU32(1))});
+      code.push_back(EncodeSopp(0x02, header - code.size() - 1u));
+      code[exit_branch] = EncodeSopp(0x04, code.size() - exit_branch - 1u);
+      AppendEnd(&code);
+      for (u32 row = 0; row < 6u; ++row) {
+        const u32 src = slot * (row + 1u) + (row + 1u) * 4u;
+        const u32 dst = slot * (row + 7u) + row + 1u;
+        const auto format = count == 6u && row == 0u ? F::k32_32_32_32Float :
+                            count == 6u && row == 1u ? F::k8_8_8_8UNorm : F::k16_16_16_16Float;
+        const u32 swizzle = row == 2u ? DstSel(1, 4, 1, 4) : DstSel(4, 5, 6, 7);
+        std::array<u32, 4> input{row == 2u ? 0u : src, 16u << 16u,
+                                row == 2u ? 0u : 2u, static_cast<u32>(format) << 12u | swizzle};
+        if (row == 3u) input.fill(0u);
+        const std::array<u32, 4> destination{dst, 3u << 16u, 16u, 0x5204u};
+        std::copy(input.begin(), input.end(), test.initial.begin() + table / 4u + row * 48u + 40u);
+        std::copy(destination.begin(), destination.end(), test.initial.begin() + table / 4u + row * 48u + 44u);
+        for (u32 record = 0; record < 2u; ++record) {
+          const auto word = src / 4u + record * 4u;
+          if (format == F::k32_32_32_32Float) {
+            const std::array<u32, 4> data{0x3f800000u, 0x3f000000u, 0u, 0xc0000000u};
+            std::copy(data.begin(), data.end(), test.initial.begin() + word);
+          } else if (format == F::k8_8_8_8UNorm) test.initial[word] = 0xffffffffu;
+          else {
+            test.initial[word] = 0x38003c00u;
+            test.initial[word + 1u] = 0xc0000000u;
+          }
+        }
+      }
+      test.expected = test.initial;
+      auto expected_bytes = std::as_writable_bytes(std::span(test.expected));
+      for (u32 row = 0; row < count; ++row) {
+        for (u32 lane = 0; lane < wave; ++lane) {
+          std::array<u32, 2> value{};
+          if (row == 2u) value = {0x3c00u, 0x3c00u};
+          else if (row != 3u && lane < 2u && !(row == 5u && lane == 1u))
+            value = count == 6u && row == 1u ? std::array<u32, 2>{0x3c003c00u, 0x3c003c00u}
+                                            : std::array<u32, 2>{0x38003c00u, 0xc0000000u};
+          const u32 out = slot * 13u / 4u + (row * wave + lane) * 4u;
+          for (u32 word = 0; word < 4u; ++word) test.expected[out + word] = value[word % 2u];
+          if (lane < 16u && lane != 6u && (lane & 1u) == 0u)
+            expected_bytes[slot * (row + 7u) + row + 1u + lane * 3u] = std::byte{0xc3};
+        }
+      }
+      if (count == 2u) {
+        test.required_spirv = {"StorageBufferArrayNonUniformIndexing"};
+        test.forbidden_spirv = {"OpSwitch", "PhysicalStorageBuffer"};
+      } else if (count == 6u) test.required_spirv = {"OpSwitch"};
+      auto compiled = CompileCase(test, vulkan.SubgroupSize());
+      Require(test.name, "mixed native aliases", count != 6u ||
+                  (compiled.program.info.buffer_u8 && compiled.program.info.buffer_u16),
+              "mixed candidates lost an 8-bit or 16-bit native binding");
+      u32 selections = 0;
+      for (auto *block : compiled.program.blocks)
+        for (const auto &inst : *block) selections += inst.GetOpcode() == ValueOpcode::GetBufferResourceIndex;
+      Require(test.name, "shared loop selection", count == 0u ? selections <= 2u : selections == 2u,
+              "repeated formatted loads repeated the descriptor lookup");
+      for (u32 resource = 0; resource < compiled.resources.buffers.size(); ++resource) {
+        ShaderBufferResource descriptor{};
+        std::copy_n(compiled.resources.buffers[resource].dwords.begin(), 4u, descriptor.fields);
+        const u32 address = descriptor.Base48();
+        const u32 prefix = address % alignment;
+        u32 bytes = std::max(4u, static_cast<u32>(descriptor.GetSize()));
+        if (address == slot * 5u + 20u) bytes = 24u;
+        if (address == slot * 6u + 24u) bytes = 23u;
+        test.storage_buffer_ranges.emplace_back(address - prefix, bytes + prefix);
+        const u32 binding = compiled.program.info.buffers[resource].descriptor_index;
+        if (binding != UINT32_MAX)
+          compiled.packed_user_data[compiled.program.bindings.memory_offset_dword + binding / 4u] |=
+              prefix << ((binding % 4u) * 8u);
+      }
+      auto output_buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+      vulkan.Dispatch(test, compiled, output_buffer);
+      CompareWords(test, "row keys, mixed formats, empty-One, partial payloads, prefixes and byte canaries",
+                   test.expected, vulkan.ReadBuffer(test.name, output_buffer, test.expected.size()));
+      vulkan.DestroyBuffer(&output_buffer);
+    }
+  }
+  std::printf("[compute] %-32s ok\n", "BoundedRecordBufferAccess");
+}
+
 void CheckFiniteBufferSelection(VulkanHarness &vulkan) {
   for (const u32 wave : {32u, 64u}) {
     TestCase test;
@@ -36663,9 +36792,11 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
                                       {Value(&lane), Value(7u)});
   auto &key = block->AppendNewInst(ValueOpcode::IAdd32,
                                  {Value(&selector), Value(8u)});
+  auto &selection = block->AppendNewInst(ValueOpcode::GetBufferResourceIndex, {Value(&key)});
+  selection.SetFlags<uint32_t>(0u);
   auto &handle = block->AppendNewInst(
       ValueOpcode::GetBufferResource,
-      {Value(&key), Value(0u), Value(0u), Value(0u)});
+      {Value(&selection), Value(0u), Value(0u), Value(0u)});
   handle.SetFlags<uint32_t>(0u);
   auto &lane_offset = block->AppendNewInst(ValueOpcode::IMul32,
                                          {Value(&lane), Value(4u)});
@@ -36715,7 +36846,7 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
     if (indexed) {
       for (auto &buffer : program.info.buffers) buffer.packed_stride = 4;
     }
-    program.descriptor_sources[0].indirect_descriptor->indexed_store = indexed;
+    program.descriptor_sources[0].indirect_descriptor->indexed = indexed;
     program.memory_info[0].idxen = indexed;
     program.memory_info[0].offen = !indexed;
     store.SetArg(1, indexed ? Value(&index) : Value(0u));
@@ -45378,6 +45509,7 @@ int main(int argc, char **argv) {
     CheckBoundedFormattedBufferCopy(vulkan);
     CheckFiniteBufferSelection(vulkan);
     CheckIndirectBufferStore(vulkan);
+    CheckBoundedRecordBufferAccess(vulkan);
     CheckRuntimeBufferRecords(vulkan);
     RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadDwordGpuSelectedDescriptors());
@@ -46079,6 +46211,7 @@ int main(int argc, char **argv) {
   CheckRectListShaders();
   CheckBoundedFormattedBufferCopy(vulkan);
   CheckIndirectBufferStore(vulkan);
+  CheckBoundedRecordBufferAccess(vulkan);
   CheckFiniteBufferSelection(vulkan);
   CheckRuntimeBufferRecords(vulkan);
   CheckComputeThreadDimensions(vulkan);

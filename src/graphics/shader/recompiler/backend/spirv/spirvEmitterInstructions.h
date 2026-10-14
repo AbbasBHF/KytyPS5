@@ -246,6 +246,7 @@ void                  EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& in
 uint32_t              EmitGetShaderBase(ValueEmitContext& ctx);
 inline constexpr auto EmitGetSrtResource     = EmitVoid;
 inline constexpr auto EmitGetBufferResource  = EmitGetSrtResource;
+uint32_t              EmitGetBufferResourceIndex(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitGetAddressResource = EmitGetSrtResource;
 inline constexpr auto EmitGetScratchResource = EmitGetSrtResource;
 inline constexpr auto EmitGetImageResource   = EmitGetSrtResource;

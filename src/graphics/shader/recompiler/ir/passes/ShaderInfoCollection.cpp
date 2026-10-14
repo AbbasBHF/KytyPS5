@@ -347,9 +347,16 @@ void Visit(Program& program, bool fsb, ShaderStageInputInfo input_info, InputUsa
 				if (memory.resource >= info.buffers.size()) {
 					return Fail("buffer operation has invalid resource metadata");
 				}
-				const auto bits = StorageBufferElementBits(program, memory);
-				info.buffer_u8 |= bits == 8u;
-				info.buffer_u16 |= bits == 16u;
+				const auto collect_element = [&](uint32_t resource) {
+					auto selected = memory;
+					selected.resource = resource;
+					const auto bits = StorageBufferElementBits(program, selected);
+					info.buffer_u8 |= bits == 8u;
+					info.buffer_u16 |= bits == 16u;
+				};
+				collect_element(memory.resource);
+				for (const auto child: info.buffers[memory.resource].indirect_resources)
+					collect_element(child);
 				if ((info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
 					if (program.stage != ShaderType::Compute) {
 						return Fail("buffer ADD_TID is only valid for compute shaders");

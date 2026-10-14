@@ -4293,7 +4293,7 @@ void TestBoundedFormattedBufferStore() {
   auto fixture = make();
   auto plan = ExtractResourcePlan(fixture->program);
   const auto& source = plan.descriptor_sources[plan.info.buffers[0].source];
-  Check(source.indirect_descriptor && source.indirect_descriptor->indexed_store &&
+  Check(source.indirect_descriptor && source.indirect_descriptor->indexed &&
             !source.indirect_descriptor->signed_count &&
             !source.indirect_descriptor->selector &&
             !source.indirect_descriptor->key_count.IsEmpty() &&
@@ -4391,6 +4391,175 @@ void TestBoundedFormattedBufferStore() {
        {std::tuple{2u, false, false}, std::tuple{1u, true, false}, std::tuple{1u, false, true}})
     CheckFatal([&] { make(step, bypass, offset); }, "not a valid runtime value",
                "finite store accepted an unproved induction or indexed byte offset");
+}
+
+void TestBoundedBufferRecords() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  namespace Prospero = Libs::Graphics::Prospero;
+  using Libs::Graphics::DstSel;
+  const auto make = [](uint32_t step = 1u, bool bypass = false) {
+    auto fixture = std::make_unique<Fixture>();
+    auto& f = *fixture;
+    auto* entry = f.block;
+    auto* header = f.AddBlock();
+    auto* body = f.AddBlock();
+    auto* latch = f.AddBlock();
+    auto* exit = f.AddBlock();
+    const auto branch = [](Block* from, Block* to) {
+      from->AddBranch(to);
+      from->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = to};
+    };
+    branch(entry, header);
+    branch(body, latch);
+    branch(latch, header);
+    header->AddBranch(body);
+    header->AddBranch(bypass ? latch : exit);
+    header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = body, .false_block = bypass ? latch : exit};
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    std::array<Value, 4> table_words;
+    for (uint32_t word = 0; word < 4u; ++word) table_words[word] = f.UserData(word);
+    const auto table = f.Buffer(table_words);
+    const auto count = f.Emit(ValueOpcode::LoadAddressU32,
+        {f.Address(f.UserData(4u), f.UserData(5u)), Value(0u), Value(0u), Value(true)},
+        f.AddMemory({.kind = ResourceKind::ScalarAddress}, 0x424u));
+    const auto lane = f.Emit(ValueOpcode::LaneId);
+    auto& phi = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    phi.AddPhiOperand(entry, Value(0u));
+    phi.AddPhiOperand(latch, f.Emit(ValueOpcode::IAdd32, {Value(&phi), Value(step)}, 0, latch));
+    header->condition = f.Emit(ValueOpcode::SLessThan32, {Value(&phi), count}, 0, header);
+    f.block = body;
+    const auto offset = f.Emit(ValueOpcode::IMul32, {Value(&phi), Value(192u)});
+    for (const bool formatted : {true, false}) {
+      std::array<Value, 4> words;
+      for (uint32_t word = 0; word < 4u; ++word)
+        words[word] = f.Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+            f.AddMemory({.kind = ResourceKind::ScalarBuffer,
+                         .offset = (formatted ? 160u : 176u) + word * 4u,
+                         .component_index = word, .component_count = 4u}, 0x1808u));
+      for (uint32_t use = 0; use < (formatted ? 112u : 16u); ++use) {
+        const auto handle = f.Buffer(words);
+        if (formatted) {
+          const auto loaded = f.Emit(ValueOpcode::LoadBufferU32x2,
+              {handle, lane, Value(0u), Value(0u), Value(true)},
+              f.AddMemory({.kind = ResourceKind::Buffer, .data_dwords = 2u, .data_bits = 16u,
+                           .component_count = 4u, .formatted = true, .idxen = true}, 0x1914u));
+          f.Emit(ValueOpcode::ReferenceU32,
+              {f.Emit(ValueOpcode::CompositeExtractU32x2, {loaded, Value(0u)})});
+        } else {
+          f.Emit(ValueOpcode::StoreBufferU8,
+              {handle, lane, Value(0u), Value(0u), Value(uint8_t{42u}), Value(true)},
+              f.AddMemory({.kind = ResourceKind::Buffer, .data_bits = 8u, .idxen = true}, 0x190cu));
+        }
+      }
+    }
+    f.PlanAndTrack();
+    return fixture;
+  };
+  auto fixture = make();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  Check(plan.info.buffers.size() == 2u, "record descriptors did not share their resource roots");
+  uint32_t selections = 0u;
+  std::array<const Inst*, 2> selected{};
+  for (const auto* block : fixture->program.blocks) {
+    for (const auto& inst : *block) {
+      if (inst.GetOpcode() == ValueOpcode::GetBufferResourceIndex) {
+        ++selections;
+        Check(block->id == 2u && inst.Flags<uint32_t>() < 2u,
+              "record selection moved outside its loop or lost its buffer root");
+        selected[inst.Flags<uint32_t>()] = &inst;
+      }
+      if (inst.GetOpcode() == ValueOpcode::LoadBufferU32x2 || inst.GetOpcode() == ValueOpcode::StoreBufferU8) {
+        const auto root = fixture->program.memory_info[inst.Flags<MemoryFlags>().index].resource;
+        Check(inst.Arg(0).Instruction()->Arg(0).Instruction() == selected[root],
+              "record operation did not use its dominating shared selection");
+      }
+    }
+  }
+  Check(selections == 2u, "repeated record operations duplicated candidate mapping searches");
+  for (uint32_t root = 0; root < 2u; ++root) {
+    const auto& source = plan.descriptor_sources[plan.info.buffers[root].source];
+    Check(source.indirect_descriptor && source.indirect_descriptor->indexed &&
+              source.indirect_descriptor->signed_count &&
+              source.indirect_descriptor->table_stride == 192u &&
+              source.indirect_descriptor->table_immediate == (root == 0u ? 160u : 176u) &&
+              !source.indirect_descriptor->key_count.IsEmpty(),
+          "record descriptor lost its bounded loop or member offset");
+  }
+  LinearTestMemory memory;
+  constexpr uint32_t table_offset = 256u;
+  const auto format = static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16Float);
+  for (uint32_t row = 0; row < 4u; ++row) {
+    const auto first = (table_offset + row * 192u) / 4u;
+    std::fill_n(memory.words.begin() + first, 48u, 0xdeadbeefu);
+    for (const bool formatted : {true, false}) {
+      const auto word = first + (formatted ? 40u : 44u);
+      memory.words[word] = 0x100000u + row * 0x1000u + (formatted ? 0u : 0x8000u);
+      memory.words[word + 1u] = (formatted ? 8u : 3u) << 16u;
+      memory.words[word + 2u] = 16u;
+      memory.words[word + 3u] = formatted ? (format << 12u) | DstSel(4, 5, 6, 1) : 0x5204u;
+    }
+  }
+  std::array<uint32_t, 6> user_data{uint32_t(memory.base) + table_offset, 8u << 16u,
+                                   4u * 192u / 8u, 0x5204u, uint32_t(memory.base), 0u};
+  SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+                     .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto materialize = [&] { return MaterializeResources(plan, runtime, snapshot, specialization); };
+  for (const uint32_t count : {0u, 1u, 4u, 2u, UINT32_MAX, 0u, 4u}) {
+    memory.words[0] = count;
+    const uint32_t rows = count == UINT32_MAX ? 0u : count;
+    user_data[2] = rows == 0u ? 0u : 4u * 192u / 8u;
+    memory.reads = 0u;
+    Check(materialize() && snapshot.buffers.size() == 2u * std::max(rows, 1u) &&
+              memory.reads == 1u + rows * 2u,
+          "bounded record enumeration read unrelated fields or retained stale candidates");
+    for (uint32_t row = 0; row < rows; ++row)
+      for (const auto member : {160u, 176u})
+        Check(std::ranges::find(snapshot.specialization_reads,
+                  std::pair{memory.base + table_offset + row * 192u + member, uint64_t{16u}}) !=
+                  snapshot.specialization_reads.end(),
+              "record descriptor escaped same-dispatch overlap capture");
+  }
+  const auto original = specialization;
+  memory.words[(table_offset + 160u) / 4u] += 0x100u;
+  Check(materialize() && specialization == original,
+        "record address refresh changed the shader specialization");
+  user_data[2] = 4u;
+  memory.reads = 0u;
+  Check(materialize() && snapshot.buffers.size() == 2u && memory.reads == 1u,
+        "record enumeration read beyond the scalar buffer table bounds");
+  user_data[2] = 4u * 192u / 8u;
+  const auto first = (table_offset + 160u) / 4u;
+  const auto first_address = memory.words[first];
+  memory.words[first] = 0u;
+  memory.words[first + 2u] = 0u;
+  Check(materialize() && specialization.buffers[0].zero_stride_oob &&
+            specialization.buffers[0].descriptor_swizzle == DstSel(4, 5, 6, 1) &&
+            specialization.buffers[0].indirect_root == 0u,
+        "empty formatted candidate lost its OOB constants or other candidates");
+  ApplyResourceSpecialization(fixture->program, specialization);
+  uint32_t loads = 0u;
+  for (const auto* block : fixture->program.blocks)
+    for (const auto& inst : *block) loads += inst.GetOpcode() == ValueOpcode::LoadBufferU32x2;
+  Check(loads == 112u, "empty root incorrectly folded nonempty formatted candidates");
+  memory.words[first] = first_address;
+  memory.words[first + 2u] = 16u;
+  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 5>{
+           {{first + 1u, 4u << 16u}, {first + 1u, 9u << 16u},
+            {first, memory.words[first] + 1u}, {first + 3u, memory.words[first + 3u] | (1u << 28u)},
+            {first + 1u, (8u << 16u) | (1u << 31u)}}}) {
+    const auto saved = memory.words[word];
+    memory.words[word] = replacement;
+    Check(!materialize(), "formatted record accepted unproved alignment or addressing");
+    memory.words[word] = saved;
+  }
+  memory.words[0] = MaxIndirectDescriptorProbes + 1u;
+  Check(!materialize(), "record table accepted an unbounded candidate count");
+  for (const auto [step, bypass] : {std::pair{2u, false}, std::pair{1u, true}})
+    CheckFatal([&] { make(step, bypass); }, "not a valid runtime value",
+               "record table accepted an unproved loop bound");
 }
 
 void TestFiniteBufferSelection() {
@@ -4516,7 +4685,7 @@ void TestPackedScalarBufferSelection() {
   fixture->PlanAndTrack();
   auto plan = ExtractResourcePlan(fixture->program);
   const auto& source = plan.descriptor_sources[plan.info.buffers[0].source];
-  Check(source.indirect_descriptor && source.indirect_descriptor->indexed_store &&
+  Check(source.indirect_descriptor && source.indirect_descriptor->indexed &&
             source.indirect_descriptor->selector->byte_ranges ==
                 std::vector<std::pair<uint32_t, uint32_t>>{{0x1c0u, 1024u}},
         "packed scalar lookup lost a Phi arm or independent DWORD alignment");
@@ -4571,8 +4740,8 @@ void TestPackedScalarBufferSelection() {
   mixed->PlanAndTrack();
   const auto& buffers = mixed->program.info.buffers;
   Check(buffers.size() == 2u && buffers[0].source != buffers[1].source &&
-            mixed->program.descriptor_sources[buffers[0].source].indirect_descriptor->indexed_store &&
-            !mixed->program.descriptor_sources[buffers[1].source].indirect_descriptor->indexed_store,
+            mixed->program.descriptor_sources[buffers[0].source].indirect_descriptor->indexed &&
+            !mixed->program.descriptor_sources[buffers[1].source].indirect_descriptor->indexed,
         "indexed and byte-addressed stores incorrectly shared their descriptor bounds contract");
 }
 
@@ -5888,6 +6057,7 @@ int main() {
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("writable descriptor phi", TestWritableDescriptorPhi);
     Run("bounded formatted buffer store", TestBoundedFormattedBufferStore);
+    Run("bounded buffer records", TestBoundedBufferRecords);
     Run("finite buffer selection", TestFiniteBufferSelection);
     Run("packed scalar buffer selection", TestPackedScalarBufferSelection);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
