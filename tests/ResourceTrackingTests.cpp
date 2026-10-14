@@ -4602,7 +4602,7 @@ void TestDynamicSrtReadRemainsExplicit() {
   ShaderComputeInputInfo compute{};
   CollectShaderInfo(fixture.program, {.compute = &compute});
   Check(!fixture.program.info.uses_flattened_srt && fixture.program.info.uses_dma &&
-            fixture.program.info.live_buffers == 1u,
+            fixture.program.info.buffers.size() == 1u && fixture.program.info.buffers[0].live,
         "dynamic scalar read received the wrong resource usage");
 }
 
@@ -6969,9 +6969,9 @@ void TestShaderInfoCollection() {
       {fixture.UserData(3), fixture.UserData(4), Value(64u), Value(0u)}, 4);
   MemoryInfo buffer;
   buffer.kind = ResourceKind::Buffer;
-  fixture.Emit(ValueOpcode::LoadBufferU32,
-               {handle, Value(0u), Value(0u), Value(0u), Value(true)},
-               fixture.AddMemory(buffer, 4));
+  const auto load = fixture.Emit(ValueOpcode::LoadBufferU32,
+                                {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+                                fixture.AddMemory(buffer, 4));
   const auto invocation = fixture.Emit(
       ValueOpcode::GetBuiltin,
       {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)),
@@ -6993,7 +6993,7 @@ void TestShaderInfoCollection() {
                 StageInputKind::GlobalInvocationId,
         "typed shader values were not reflected in shader info");
 
-  Check(fixture.program.info.live_buffers == 1u &&
+  Check(fixture.program.info.buffers.size() == 1u && fixture.program.info.buffers[0].live &&
             fixture.program.info.uses_gds && !fixture.program.info.uses_lds,
         "typed resources were not collected in shader info");
   Check(NativeBinding(ShaderType::Compute, DescriptorBindingKind::Buffers) ==
@@ -7006,6 +7006,11 @@ void TestShaderInfoCollection() {
         "fixed stage binding ranges are inconsistent");
   Check(fixture.program.info.user_data_registers == std::vector<uint32_t>({3u, 4u}),
         "shader info did not collect live typed user-data values");
+  load.ResolveInstruction()->Invalidate();
+  fixture.program.shader_info_complete = false;
+  CollectShaderInfo(fixture.program, {.compute = &compute});
+  Check(!fixture.program.info.buffers[0].live,
+        "shader info recollection retained a removed buffer use");
 }
 
 void TestImageBindingAbi() {
@@ -7172,7 +7177,8 @@ void TestResourceLimitIsTransactional() {
         "compute shader did not retain all 64 distinct buffers");
   ShaderComputeInputInfo compute{};
   CollectShaderInfo(accepted.program, {.compute = &compute});
-  Check(accepted.program.info.live_buffers == UINT64_MAX,
+  Check(std::ranges::all_of(accepted.program.info.buffers,
+                          [](const auto &buffer) { return buffer.live; }),
         "shader info truncated the 64 live buffers");
 
   Fixture fixture;

@@ -315,12 +315,12 @@ void Visit(Program& program, bool fsb, ShaderStageInputInfo input_info, InputUsa
 				if (memory.resource >= info.buffers.size() || memory.resource >= ShaderInfo::MaxBuffers) {
 					return Fail("buffer operation has invalid resource metadata");
 				}
-				info.live_buffers |= uint64_t{1} << memory.resource;
+				info.buffers[memory.resource].live = true;
 				for (const auto child: info.buffers[memory.resource].indirect_resources) {
 					if (child >= info.buffers.size()) {
 						return Fail("indirect buffer operation has invalid resource metadata");
 					}
-					info.live_buffers |= uint64_t{1} << child;
+					info.buffers[child].live = true;
 				}
 			}
 		}
@@ -579,7 +579,7 @@ void CollectShaderInfo(Program& program, bool fsb, ShaderStageInputInfo input_in
 	info.inputs.clear();
 	info.outputs.clear();
 	info.user_data_registers.clear();
-	info.live_buffers = 0;
+	for (auto& buffer: info.buffers) buffer.live = false;
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
 	    info.uses_dispatch_threads = info.uses_swizzle = false;
 	info.bvh = info.subgroup_ballot = info.subgroup_barrier = info.subgroup_shuffle = info.subgroup_arithmetic =
