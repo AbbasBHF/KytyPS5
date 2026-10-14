@@ -34986,6 +34986,36 @@ TestCase ImageLoadPackedUintUnpacksAndSwizzles() {
   return test;
 }
 
+template <bool d16, bool sparse> TestCase ImageLoadPackedUnorm() {
+  TestCase test;
+  test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_LOAD,
+                  ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  test.name = d16 ? (sparse ? "ImageLoadPackedUnormD16Sparse" : "ImageLoadPackedUnormD16")
+                  : (sparse ? "ImageLoadPackedUnormSparse" : "ImageLoadPackedUnorm");
+  AppendVMovU32(&test.code, 20, 2u);
+  AppendVMovU32(&test.code, 21, 1u);
+  test.code.push_back(EncodeMimg0(0x00u, sparse ? 0x5u : 0xfu));
+  test.code.push_back(EncodeMimg1(0, 20, 0, 0, false, d16));
+  constexpr u32 words = (sparse ? 2u : 4u) / (d16 ? 2u : 1u);
+  for (u32 word = 0; word < words; ++word) AppendStoreVgpr(&test.code, word, word);
+  AppendEnd(&test.code);
+  test.sampled_image_rgba.assign(16, 0u);
+  test.sampled_image_rgba[6] = (1024u << 11u) | (1023u << 22u);
+  test.sampled_image_format = vk::Format::eR32Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k11_11_10UNorm);
+  test.has_user_data = true;
+  test.image_descriptor_swizzle = sparse ? DstSel(1, 4, 5, 0) : DstSel(6, 5, 4, 7);
+  const u32 green = std::bit_cast<u32>(1024.0f * (1.0f / 2047.0f));
+  test.expected = d16 ? std::vector<u32>{0x38013c00u, 0u}
+                      : std::vector<u32>{0x3f800000u, green, 0u, 0u};
+  test.expected.resize(words);
+  test.required_spirv = {"OpImageFetch %v4uint", "OpBitFieldUExtract", "OpConvertUToF"};
+  if constexpr (d16) test.required_spirv.emplace_back("PackHalf2x16");
+  test.forbidden_spirv = {"OpTypeSampler", "OpImageGather"};
+  return test;
+}
+
 TestCase ImageSamplePackedUintConvertsSampleAndGather() {
   using O = ShaderOpcode;
 
@@ -39429,6 +39459,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadFmaskUsesNativeSampleMapping);
   AddCase(ImageLoadR32SintUsesSignedSampledImage);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
+  AddCase(ImageLoadPackedUnorm<false, false>);
+  AddCase(ImageLoadPackedUnorm<false, true>);
+  AddCase(ImageLoadPackedUnorm<true, false>);
+  AddCase(ImageLoadPackedUnorm<true, true>);
   AddCase(ImageSamplePackedUintConvertsSampleAndGather);
   AddCase(ImageSamplePackedUnormBilinear<false>);
   AddCase(ImageSamplePackedUnormBilinear<true>);
@@ -45078,6 +45112,10 @@ int main(int argc, char **argv) {
     vulkan.CheckPackedTextureComponents();
     vulkan.CheckBgra16Readback();
     RunCase(&vulkan, ImageLoadPackedUintUnpacksAndSwizzles());
+    RunCase(&vulkan, ImageLoadPackedUnorm<false, false>());
+    RunCase(&vulkan, ImageLoadPackedUnorm<false, true>());
+    RunCase(&vulkan, ImageLoadPackedUnorm<true, false>());
+    RunCase(&vulkan, ImageLoadPackedUnorm<true, true>());
     RunCase(&vulkan, ImageSamplePackedUintConvertsSampleAndGather());
     RunCase(&vulkan, ImageSamplePackedUnormBilinear<false>());
     RunCase(&vulkan, ImageSamplePackedUnormBilinear<true>());

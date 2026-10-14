@@ -716,7 +716,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			if (image.indirect_root != ImageResource::NoIndirectImage) {
 				return SpecializationFail("packed UNorm sampling requires a direct image");
 			}
-			if (!ValidatePackedUnormSampling(program, snapshot, i)) return false;
+			if (std::ranges::any_of(program.info.sampled_pairs,
+			                       [&](const auto& pair) { return pair.image == i; }) &&
+			    !ValidatePackedUnormSampling(program, snapshot, i)) return false;
 		}
 		if (storage) {
 			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
