@@ -37012,7 +37012,7 @@ void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
                             .limits.minStorageBufferOffsetAlignment;
   const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
   for (const u32 wave : {32u, 64u}) {
-    for (const u32 count : {0u, 2u, 6u}) {
+    for (const u32 count : {0u, 2u, 3u, 6u}) {
       TestCase test;
       test.name = wave == 32 ? "BoundedRecordBufferAccess32" : "BoundedRecordBufferAccess64";
       constexpr u32 table = 256u;
@@ -37063,9 +37063,10 @@ void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
         const u32 dst = slot * (row + 7u) + row + 1u;
         const auto format = count == 6u && row == 0u ? F::k32_32_32_32Float :
                             count == 6u && row == 1u ? F::k8_8_8_8UNorm : F::k16_16_16_16Float;
-        const u32 swizzle = row == 2u ? DstSel(1, 4, 1, 4) : DstSel(4, 5, 6, 7);
-        std::array<u32, 4> input{row == 2u ? 0u : src, 16u << 16u,
-                                row == 2u ? 0u : 2u, static_cast<u32>(format) << 12u | swizzle};
+        const bool empty_one = row == (count == 3u ? 0u : 2u);
+        const u32 swizzle = empty_one ? DstSel(1, 4, 1, 4) : DstSel(4, 5, 6, 7);
+        std::array<u32, 4> input{empty_one ? 0u : src, 16u << 16u,
+                                empty_one ? 0u : 2u, static_cast<u32>(format) << 12u | swizzle};
         if (row == 3u) input.fill(0u);
         const std::array<u32, 4> destination{dst, 3u << 16u, 16u, 0x5204u};
         std::copy(input.begin(), input.end(), test.initial.begin() + table / 4u + row * 48u + 40u);
@@ -37087,7 +37088,7 @@ void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
       for (u32 row = 0; row < count; ++row) {
         for (u32 lane = 0; lane < wave; ++lane) {
           std::array<u32, 2> value{};
-          if (row == 2u) value = {0x3c00u, 0x3c00u};
+          if (row == (count == 3u ? 0u : 2u)) value = {0x3c00u, 0x3c00u};
           else if (row != 3u && lane < 2u && !(row == 5u && lane == 1u))
             value = count == 6u && row == 1u ? std::array<u32, 2>{0x3c003c00u, 0x3c003c00u}
                                             : std::array<u32, 2>{0x38003c00u, 0xc0000000u};
@@ -37097,7 +37098,7 @@ void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
             expected_bytes[slot * (row + 7u) + row + 1u + lane * 3u] = std::byte{0xc3};
         }
       }
-      if (count == 2u) {
+      if (count == 2u || count == 3u) {
         test.required_spirv = {"StorageBufferArrayNonUniformIndexing"};
         test.forbidden_spirv = {"OpSwitch", "PhysicalStorageBuffer", "convert_indirect_buffer_format"};
       } else if (count == 6u) test.required_spirv = {"OpSwitch"};
@@ -37347,8 +37348,24 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
     test.decoded_counts = {{"V_LSHLREV_B32", wide ? 1u : 2u},
         {wide ? "BUFFER_STORE_FORMAT_XYZW" : "BUFFER_STORE_FORMAT_X", 1u}};
     test.required_spirv = {"get_bda_pointer", "convert_indirect_buffer_format"};
+    if (!wide) test.required_spirv.push_back("StorageBufferArrayNonUniformIndexing");
     test.forbidden_spirv = {"OpAtomicCompareExchange"};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    if (!wide) {
+      std::set<u32> nonuniform;
+      u32 shared_stores = 0;
+      for (size_t offset = 5; offset < compiled.spirv.size();) {
+        const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
+        const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+        if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
+          nonuniform.insert(words[1]);
+        if (opcode == spv::OpStore && nonuniform.contains(words[1])) ++shared_stores;
+        offset += words.size();
+      }
+      Require(test.name, "one shared store after the null candidate",
+              shared_stores == (wave > vulkan.SubgroupSize() ? 2u : 1u),
+              "homogeneous children duplicated the native store per descriptor");
+    }
     u32 bda_loads = 0, native_stores = 0;
     for (const auto *block : compiled.program.blocks)
       for (const auto &inst : *block) {
