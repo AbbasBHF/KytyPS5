@@ -656,9 +656,9 @@ void TestNestedPointerImageTable() {
   for (const auto source : {plan.info.images[0].source, plan.info.samplers[0].source}) {
     const auto& descriptor = plan.descriptor_sources[source];
     const auto& indirect = descriptor.indirect_descriptor;
-    Check(indirect && !indirect->selector && indirect->pointer_table &&
-              indirect->pointer_table->maximum == 65535u && indirect->table_stride == 592u &&
-              indirect->pointer_table->offset == (descriptor.dword_count == 8u ? 0x3d0u : 0x3f8u),
+    Check(indirect && !indirect->selector && indirect->table_maximum == 65535u &&
+              indirect->table_stride == 592u &&
+              indirect->pointer_offset == (descriptor.dword_count == 8u ? 0x3d0u : 0x3f8u),
           "nested pointer descriptors lost their row geometry or captured the GPU selector payload");
   }
 
