@@ -37272,6 +37272,96 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
+void CheckFiniteFirstLaneImageChoice(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 table = 512u, stride = 440u, poison = 0xdeadbeefu;
+  for (const u32 wave : {32u, 64u})
+  for (const u32 count : {0u, 4u}) {
+    TestCase test;
+    test.name = "FiniteFirstLaneImageChoice";
+    test.initial.assign((table + 4u * stride) / 4u, poison);
+    for (u32 row = 0; row < 4u; ++row) {
+      auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+      image[0] = 10u + row;
+      image[3] = DstSel(4, 0, 0, 1) |
+          (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+      std::copy_n(image.begin(), 8, test.initial.begin() + (table + row * stride) / 4u);
+    }
+    auto records = MakeStructuredStorageBufferData(stride, count);
+    records[0] = table;
+    std::copy_n(records.begin(), 4, test.user_data.begin() + 56);
+    const auto output = MakeStructuredStorageBufferData(0, wave * 4u);
+    std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+    test.has_user_data = test.has_compute_info = true;
+    test.compute_info.wave_size = wave;
+    test.compute_info.threads_num[0] = wave;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+    test.compute_info.thread_ids_num = 1;
+    auto &code = test.code;
+    code.push_back(EncodeSop1(0x04, 40, 126));
+    code.push_back(EncodeVop2(0x1b, 1, InlineU32(3), 0));
+    for (u32 word = 0; word < 8u; ++word)
+      code.push_back(EncodeVop1(0x01, 20u + word, InlineU32(0)));
+    // Masked vector descriptor writes become synchronized Select/Phi chains.
+    for (u32 row = 0; row < 4u; ++row) {
+      code.push_back(EncodeVopc(0xd2, InlineU32(row), 1));
+      const auto skip = code.size();
+      code.push_back(0u);
+      code.insert(code.end(), {EncodeSmem0(0x0b, 8, 28), EncodeSmem1(row * stride, 125)});
+      for (u32 word = 0; word < 8u; ++word)
+        code.push_back(EncodeVop1(0x01, 20u + word, 8u + word));
+      code[skip] = EncodeSopp(0x08, code.size() - skip - 1u);
+      code.push_back(EncodeSop1(0x04, 126, 40));
+    }
+    AppendVMovLiteral(&code, 5, poison);
+    AppendVMovLiteral(&code, 10, 0x3f000000u);
+    AppendVMovLiteral(&code, 11, 0x3f000000u);
+    code.push_back(EncodeVop2(0x1b, 2, InlineU32(31), 0));
+    code.push_back(EncodeVopc(0xd5, InlineU32(0), 2));
+    const auto loop = code.size();
+    // Same native waterfall as 7ceb0f3417f926f9, including narrowing EXEC.
+    for (u32 word = 0; word < 8u; ++word)
+      code.push_back(EncodeVop1(0x02, 32u + word, Vgpr(20u + word)));
+    code.push_back(EncodeSop1(0x04, 44, 126));
+    for (u32 word = 0; word < 8u; ++word)
+      code.push_back(EncodeVopc(0xd2, 32u + word, 20u + word));
+    code.insert(code.end(), {EncodeMimg0(0x27, 1), EncodeMimg1(5, 10, 8, 13),
+                            EncodeSop2(0x15, 126, 44, 126)});
+    code.push_back(EncodeSopp(0x09, loop - code.size() - 1u));
+    code.push_back(EncodeSop1(0x04, 126, 40));
+    code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
+    AppendBufferStoreDword(&code, 5, 30);
+    AppendEnd(&code);
+    test.opcodes = {O::S_MOV_B64, O::V_AND_B32, O::V_MOV_B32,
+        O::V_CMPX_EQ_U32, O::V_CMPX_NE_U32, O::S_CBRANCH_EXECZ,
+        O::S_BUFFER_LOAD_DWORDX8, O::V_READFIRSTLANE_B32, O::IMAGE_SAMPLE,
+        O::S_ANDN2_B64, O::S_CBRANCH_EXECNZ, O::V_LSHLREV_B32,
+        O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    Require(test.name, "finite correlated image choices", compiled.resources.images.size() <= 5u,
+            "descriptor words formed an uncorrelated product");
+    std::vector<VulkanHarness::Image> images;
+    for (const auto &descriptor : compiled.resources.images)
+      images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
+          vk::ImageUsageFlagBits::eSampled,
+          {std::bit_cast<u32>(float(descriptor.dwords[0]))}, 1,
+          vk::ImageLayout::eShaderReadOnlyOptimal));
+    const auto sampler = vulkan.CreateSampler(test.name, 1);
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, sampler, images);
+    test.expected = test.initial;
+    for (u32 lane = 0; lane < wave; ++lane)
+      if ((lane & 31u) != 0u)
+        test.expected[lane] = count == 0u ? 0u : std::bit_cast<u32>(float(10u + (lane & 3u)));
+    CompareWords(test, "first active lane, descriptor correlation and inactive canaries", test.expected,
+                 vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+    vulkan.Device().destroySampler(sampler);
+    for (auto &image : images) vulkan.DestroyImage(&image);
+    std::printf("[compute] %s wave=%u count=%u ok\n", test.name, wave, count);
+  }
+}
+
 void CheckFiniteInlineSamplerPhi(VulkanHarness &vulkan) {
   TestCase test;
   test.name = "FiniteInlineSamplerPhi";
@@ -46593,6 +46683,7 @@ int main(int argc, char **argv) {
     CheckNestedPointerImageTable(vulkan);
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
+    CheckFiniteFirstLaneImageChoice(vulkan);
     CheckFiniteInlineSamplerPhi(vulkan);
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
     return 0;
@@ -46769,6 +46860,7 @@ int main(int argc, char **argv) {
   CheckIndirectImageKeySwitch(vulkan);
   CheckDynamicSampleOffsets(vulkan, 32u);
   CheckDynamicSampleOffsets(vulkan, 64u);
+  CheckFiniteFirstLaneImageChoice(vulkan);
   CheckFiniteInlineSamplerPhi(vulkan);
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();

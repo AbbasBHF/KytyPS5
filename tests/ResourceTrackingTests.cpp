@@ -5531,6 +5531,159 @@ void TestFiniteImagePhiCycle() {
   }
 }
 
+void TestFiniteImageWaterfall() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant { Valid, Staggered, Cycle, DifferentMask, MixedWord, DifferentSelect, WiderExec, BadLeaf };
+  const auto make = [](Variant variant) {
+    auto fixture = std::make_unique<Fixture>();
+    auto& f = *fixture;
+    const auto lane = f.Emit(ValueOpcode::LaneId);
+    const auto active = f.Emit(ValueOpcode::ULessThan32, {lane, Value(16u)});
+    const auto choose = f.Emit(ValueOpcode::IEqual32,
+        {f.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(1u)}), Value(0u)});
+    const auto other = f.Emit(ValueOpcode::LogicalNot, {choose});
+    const auto other_mask = f.Emit(ValueOpcode::LogicalNot, {active});
+    std::array<Value, 4> table_words;
+    for (uint32_t word = 0; word < 4u; ++word) table_words[word] = f.UserData(word);
+    const auto table = f.Buffer(table_words);
+    std::array<Value, 8> a, b, words;
+    for (uint32_t word = 0; word < 8u; ++word)
+      for (const bool second : {false, true})
+        (second ? b : a)[word] = f.Emit(ValueOpcode::ReadConstBuffer, {table, Value(0u)},
+            f.AddMemory({.kind = ResourceKind::ScalarBuffer,
+                         .offset = (second ? 440u : 0u) + word * 4u}, 0x100u + word * 4u));
+    if (variant == Variant::BadLeaf) a[3] = lane;
+    if (variant == Variant::Staggered) {
+      f.block->terminator.kind = CFG::TerminatorKind::Return;
+      for (uint32_t word = 0; word < 8u; ++word) {
+        const auto yes = word == 1u ? f.Emit(ValueOpcode::SelectU32, {other, a[word], b[word]}) : a[word];
+        words[word] = f.Emit(ValueOpcode::SelectU32, {choose, yes, b[word]});
+      }
+    } else {
+      auto* entry = f.block;
+      auto* left = f.AddBlock();
+      auto* right = f.AddBlock();
+      auto* merge = f.AddBlock();
+      entry->AddBranch(left);
+      (variant == Variant::Cycle ? merge : entry)->AddBranch(right);
+      left->AddBranch(merge);
+      right->AddBranch(merge);
+      entry->condition = variant == Variant::Cycle ? Value{} : choose;
+      entry->terminator = variant == Variant::Cycle
+          ? Block::Terminator{.kind = CFG::TerminatorKind::Branch, .true_block = left}
+          : Block::Terminator{.kind = CFG::TerminatorKind::ConditionalBranch,
+                       .true_block = left, .false_block = right};
+      left->terminator = right->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
+      merge->terminator = {.kind = variant == Variant::Cycle ? CFG::TerminatorKind::Branch
+                                                            : CFG::TerminatorKind::Return,
+                           .true_block = variant == Variant::Cycle ? right : nullptr};
+      for (uint32_t word = 0; word < 8u; ++word) {
+        const auto condition = variant == Variant::DifferentSelect && word == 7u ? other : choose;
+        const auto yes = f.Emit(ValueOpcode::SelectU32, {condition, a[word], Value(0u)}, 0, left);
+        auto& phi = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+        const auto no = f.Emit(ValueOpcode::SelectU32,
+            {choose, b[word], variant == Variant::Cycle ? Value(&phi) : Value(0u)}, 0, right);
+        if (word & 1u) {
+          phi.AddPhiOperand(right, no);
+          phi.AddPhiOperand(left, yes);
+        } else {
+          phi.AddPhiOperand(left, yes);
+          phi.AddPhiOperand(right, no);
+        }
+        words[word] = Value(&phi);
+      }
+      f.block = merge;
+    }
+    for (uint32_t word = 0; word < 8u; ++word) {
+      if (variant == Variant::MixedWord && word == 7u) continue;
+      words[word] = f.Emit(ValueOpcode::ReadFirstLane,
+          {words[word], variant == Variant::DifferentMask && word == 7u ? other_mask : active});
+    }
+    const auto image = f.Image(words);
+    const auto sampler = f.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    f.Emit(ValueOpcode::ImageSampleRaw,
+        {image, sampler, f.ImageAddress(), variant == Variant::WiderExec ? Value(true) : active},
+        f.AddMemory({.kind = ResourceKind::Image,
+                     .image_dimension = Decoder::ImageDimension::Dim2D}, 0x66cu));
+    return fixture;
+  };
+  for (const auto variant : {Variant::Valid, Variant::Staggered, Variant::Cycle}) {
+    auto fixture = make(variant);
+    fixture->PlanAndTrack();
+    const auto plan = ExtractResourcePlan(fixture->program);
+    EliminateDeadCode(fixture->program.blocks);
+    ValidateProgram(fixture->program, true);
+    const auto& finite = plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
+    Check(finite && finite->sources.size() == 3u,
+          "waterfall image selection mixed descriptor words or lost a candidate");
+    uint32_t lanes = 0u, selects = 0u;
+    for (const auto* block : fixture->program.blocks) {
+      std::vector<const Inst*> defined;
+      for (const auto& inst : *block) {
+        if (inst.GetOpcode() == ValueOpcode::ReadFirstLane || inst.GetOpcode() == ValueOpcode::SelectU32) {
+          lanes += inst.GetOpcode() == ValueOpcode::ReadFirstLane;
+          selects += inst.GetOpcode() == ValueOpcode::SelectU32;
+          for (size_t arg = 0; arg < inst.NumArgs(); ++arg) {
+            const auto* input = inst.Arg(arg).Resolve().TryInstruction();
+            Check(input == nullptr || input->Parent() != block ||
+                      std::ranges::find(defined, input) != defined.end(),
+                  "projected descriptor choice uses an SSA value defined later in its block");
+          }
+        }
+        defined.push_back(&inst);
+      }
+    }
+    Check(lanes == 1u && selects == 2u,
+          "waterfall descriptor selection did not share one ordinal graph across all eight words");
+    if (variant != Variant::Valid) continue;
+    LinearTestMemory memory;
+    using F = Libs::Graphics::Prospero::BufferFormat;
+    for (uint32_t row = 0; row < 2u; ++row) {
+      const auto word = (256u + row * 440u) / 4u;
+      memory.words[word] = 0x1000u + row * 0x1000u;
+      memory.words[word + 1u] = uint32_t(F::k32Float) << 20u;
+      memory.words[word + 3u] = Libs::Graphics::DstSel(4, 0, 0, 0) |
+          (uint32_t(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+    }
+    std::array<uint32_t, 4> user_data{uint32_t(memory.base) + 256u, 8u << 16u, 60u, 0x5204u};
+    SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+        .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization, populated;
+    for (const uint32_t count : {0u, 60u, 0u, 60u}) {
+      user_data[2] = count;
+      memory.reads = 0u;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization),
+            "finite waterfall resource plan could not refresh its scalar descriptor leaves");
+      Check(snapshot.images.size() == (count == 0u ? 1u : 3u) &&
+                (count == 0u ? memory.reads == 0u : memory.reads != 0u),
+            "finite waterfall leaves froze empty table bounds or retained stale image candidates");
+      if (count != 0u) populated = specialization;
+    }
+    memory.words[256u / 4u] += 0x100u;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) && specialization == populated &&
+              std::ranges::any_of(snapshot.images, [](const auto& image) { return image.dwords[0] == 0x1100u; }),
+          "finite image payload refresh changed its format specialization or reused an old leaf");
+  }
+  for (const auto variant : {Variant::DifferentMask, Variant::MixedWord, Variant::DifferentSelect,
+                             Variant::WiderExec, Variant::BadLeaf}) {
+    auto fixture = make(variant);
+    const auto choices = [&] {
+      uint32_t count = 0u;
+      for (const auto* block : fixture->program.blocks)
+        for (const auto& inst : *block)
+          count += inst.GetOpcode() == ValueOpcode::ReadFirstLane || inst.GetOpcode() == ValueOpcode::SelectU32;
+      return count;
+    };
+    const auto before = choices();
+    CheckFatal([&] { fixture->PlanAndTrack(); }, "not a valid runtime value",
+               "finite waterfall accepted mismatched lane masks, choices or an unsupported leaf");
+    Check(choices() <= before && !fixture->program.resource_tracking_complete &&
+              fixture->program.descriptor_sources.empty(),
+          "rejected finite descriptor graph left projected instructions or committed sources");
+  }
+}
+
 void TestFiniteInlineSampler() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   Fixture fixture;
@@ -6627,6 +6780,7 @@ int main() {
     Run("packed scalar buffer selection", TestPackedScalarBufferSelection);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
     Run("finite image phi cycle", TestFiniteImagePhiCycle);
+    Run("finite image waterfall", TestFiniteImageWaterfall);
     Run("finite inline sampler", TestFiniteInlineSampler);
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
