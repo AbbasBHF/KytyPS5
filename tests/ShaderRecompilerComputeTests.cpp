@@ -37059,26 +37059,35 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
 
 void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
   constexpr u32 selectors = 128, table = 256, stride = 592, member = 448;
-  constexpr std::array keys{5u, 0u, 3u, 1u, 4u, 2u, 6u};
   const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
                             .limits.minStorageBufferOffsetAlignment;
   const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
+  for (const bool wide : {false, true})
   for (const u32 wave : {32u, 64u}) {
+    const std::array keys{wide ? 31u : 5u, 0u, 3u, 1u, 4u, 2u, 6u};
     TestCase test;
-    test.name = "GpuSelectedFormattedRecordStore";
+    test.name = wide ? "GpuSelectedFormattedRgba16Store" : "GpuSelectedFormattedRecordStore";
     test.initial.assign((slot * 7u + keys.size() * wave * 4u) / 4u, 0xdeadbeefu);
     auto bytes = std::as_writable_bytes(std::span(test.initial));
+    if (wide) std::fill_n(test.initial.begin() + table / 4u, 32u * 4u, 0u);
     for (u32 row = 0; row < 6u; ++row) {
-      const std::array descriptor{slot * (row + 1u), 1u << 16u, 20u,
-          (u32(Prospero::BufferFormat::k8SInt) << 12u) | DstSel(4, 0, 0, 0)};
+      if (wide && row != 0u && row != 3u) continue;
+      const std::array descriptor{slot * (row + 1u), (wide ? 8u : 1u) << 16u, 20u,
+          wide ? (u32(Prospero::BufferFormat::k16_16_16_16Float) << 12u) | DstSel(4, 5, 6, 7)
+               : (u32(Prospero::BufferFormat::k8SInt) << 12u) | DstSel(4, 0, 0, 0)};
       std::copy(descriptor.begin(), descriptor.end(),
-                test.initial.begin() + (table + row * stride + member) / 4u);
-      for (u32 element = 0; element < 20u; ++element)
-        bytes[slot * (row + 1u) + element] = std::byte(0x80u + row + element);
+                test.initial.begin() + (table + (wide ? row * 16u : row * stride + member)) / 4u);
+      for (u32 element = 0; element < 20u; ++element) {
+        if (wide) {
+          test.initial[slot * (row + 1u) / 4u + element * 2u] = 0x40003c00u;
+          test.initial[slot * (row + 1u) / 4u + element * 2u + 1u] = 0x38003400u;
+        } else bytes[slot * (row + 1u) + element] = std::byte(0x80u + row + element);
+      }
     }
     auto records = MakeStructuredStorageBufferData(stride, 6u);
     records[0] = table;
     std::copy_n(records.begin(), 4, test.user_data.begin() + 32u);
+    if (wide) { test.user_data[32] = table - 48u; test.user_data[33] = 0u; }
     auto selector_buffer = MakeStructuredStorageBufferData(0u, keys.size() * 4u);
     selector_buffer[0] = selectors;
     std::copy_n(selector_buffer.begin(), 4, test.user_data.begin() + 4u);
@@ -37095,24 +37104,40 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
     test.compute_info.workgroup_register = 44u;
     test.dispatch_x = keys.size();
     auto &code = test.code;
-    code.insert(code.end(), {EncodeSop2(0x1e, 23, 44, InlineU32(2)),
-        EncodeVop1(0x01, 30, 23), EncodeMubuf0(0x0c), EncodeMubuf1(4, 1, 30),
-        EncodeVop2(0x16, 6, InlineU32(16), 4)});
-    AppendVop3(&code, 0x360, 22, Vgpr(6), InlineU32(0));
-    code.insert(code.end(), {EncodeSop2(0x26, 23, 22, 255), stride,
-        EncodeSmem0(0x0a, 8, 16), EncodeSmem1(member, 23),
-        EncodeMubuf0(0x00, 0, true, false, true), EncodeMubuf1(4, 2, 0),
+    code.push_back(EncodeSop2(0x1e, 23, 44, InlineU32(2)));
+    if (wide) {
+      code.insert(code.end(), {EncodeSmem0(0x08, 22, 2), EncodeSmem1(0, 23),
+          EncodeSop2(0x27, 22, 22, 255), (5u << 16u) | 16u,
+          EncodeSop2(0x1e, 23, 22, InlineU32(4)),
+          EncodeSmem0(0x02, 8, 16), EncodeSmem1(48, 23)});
+    } else {
+      code.insert(code.end(), {EncodeVop1(0x01, 30, 23), EncodeMubuf0(0x0c),
+          EncodeMubuf1(4, 1, 30), EncodeVop2(0x16, 6, InlineU32(16), 4)});
+      AppendVop3(&code, 0x360, 22, Vgpr(6), InlineU32(0));
+      code.insert(code.end(), {EncodeSop2(0x26, 23, 22, 255), stride,
+          EncodeSmem0(0x0a, 8, 16), EncodeSmem1(member, 23)});
+    }
+    code.insert(code.end(), {EncodeMubuf0(0x00, 0, true, false, true), EncodeMubuf1(4, 2, 0),
         EncodeSop2(0x1e, 34, 44, InlineU32(std::countr_zero(wave))),
         EncodeVop2(0x25, 30, 34, 0), EncodeVop2(0x1a, 30, InlineU32(2), 30)});
     AppendBufferStoreDword(&code, 4, 30);
-    code.push_back(EncodeVop2(0x1a, 10, InlineU32(5), 0));
-    code.insert(code.end(), {EncodeVop2(0x25, 10, 255, 10), u32(-200)});
+    if (wide) {
+      // The existing direct RGBA16 fixture proves these rounded FP32-to-FP16 values.
+      for (const auto [vgpr, bits] : std::array<std::pair<u32, u32>, 4>{{
+          {10u, 0x3f807e63u}, {11u, 0xc0000000u}, {12u, 0x3f000000u}, {13u, 0x3e800000u}}})
+        AppendVMovLiteral(&code, vgpr, bits);
+    } else {
+      code.push_back(EncodeVop2(0x1a, 10, InlineU32(5), 0));
+      code.insert(code.end(), {EncodeVop2(0x25, 10, 255, 10), u32(-200)});
+    }
     AppendSMovLiteral(&code, 126, 0x55555555u);
     AppendSMovLiteral(&code, 127, wave == 64u ? 0x55555555u : 0u);
-    code.insert(code.end(), {EncodeMubuf0(0x04, 0, true, false, true),
+    // Captured e01c6000/80010f01, adjusted only to v10:13/v0 and s8:11.
+    code.insert(code.end(), {EncodeMubuf0(wide ? 0x07 : 0x04, 0, true, false, true),
                             EncodeMubuf1(10, 2, 0)});
     AppendEnd(&code);
-    test.decoded_counts = {{"V_LSHLREV_B32", 2u}, {"BUFFER_STORE_FORMAT_X", 1u}};
+    test.decoded_counts = {{"V_LSHLREV_B32", wide ? 1u : 2u},
+        {wide ? "BUFFER_STORE_FORMAT_XYZW" : "BUFFER_STORE_FORMAT_X", 1u}};
     test.required_spirv = {"get_bda_pointer", "convert_indirect_buffer_format"};
     test.forbidden_spirv = {"OpAtomicCompareExchange"};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
@@ -37121,7 +37146,7 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
       for (const auto &inst : *block) {
         using namespace ShaderRecompiler::IR;
         if (inst.GetOpcode() != ValueOpcode::LoadBufferU32 &&
-            inst.GetOpcode() != ValueOpcode::StoreBufferU32) continue;
+            inst.GetOpcode() != (wide ? ValueOpcode::StoreBufferU32x4 : ValueOpcode::StoreBufferU32)) continue;
         const auto &memory = compiled.program.memory_info[inst.Flags<MemoryFlags>().index];
         if (inst.GetOpcode() == ValueOpcode::LoadBufferU32)
           bda_loads += memory.kind == ResourceKind::IndirectBuffer && memory.formatted;
@@ -37133,8 +37158,9 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
     for (const auto &value : compiled.resources.buffers) {
       ShaderBufferResource descriptor{};
       std::copy_n(value.dwords.begin(), 4u, descriptor.fields);
-      test.storage_buffer_ranges.emplace_back(descriptor.Base48(),
-                                               std::max(4u, u32(descriptor.GetSize())));
+      auto range = std::max(4u, u32(descriptor.GetSize()));
+      if (wide && descriptor.Base48() == slot * 4u) range -= 11u; // Last active record is partial.
+      test.storage_buffer_ranges.emplace_back(descriptor.Base48(), range);
     }
     TestCase producer;
     producer.name = "FormattedRecordSelectorProducer";
@@ -37156,17 +37182,22 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
       const auto row = keys[group];
       test.expected[selectors / 4u + group] = (row << 16u) | 0xbeefu;
       for (u32 lane = 0; lane < wave; ++lane) {
+        const bool valid = wide ? row == 0u || row == 3u : row < 6u;
         test.expected[slot * 7u / 4u + group * wave + lane] =
-            row < 6u && lane < 20u ? u32(int32_t(0x80u + row + lane) - 256) : 0u;
-        if (row < 6u && lane < 20u && (lane & 1u) == 0u)
-          expected_bytes[slot * (row + 1u) + lane] =
+            valid && lane < 20u ? (wide ? 0x3f800000u : u32(int32_t(0x80u + row + lane) - 256)) : 0u;
+        if (valid && lane < (wide && row == 3u ? 18u : 20u) && (lane & 1u) == 0u) {
+          if (wide) {
+            test.expected[slot * (row + 1u) / 4u + lane * 2u] = 0xc0003c04u;
+            test.expected[slot * (row + 1u) / 4u + lane * 2u + 1u] = 0x34003800u;
+          } else expected_bytes[slot * (row + 1u) + lane] =
               std::byte(u32(std::clamp(int32_t(lane * 32u) - 200, -128, 127)) & 255u);
+        }
       }
     }
     auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
     vulkan.Dispatch(producer, producer_shader, buffer);
     vulkan.Dispatch(test, compiled, buffer);
-    CompareWords(test, "shared BDA reads, signed byte saturation, EXEC, OOB and neighboring canaries",
+    CompareWords(test, "shared BDA reads, formatted conversion, EXEC, OOB and neighboring canaries",
                  test.expected, vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
     vulkan.DestroyBuffer(&buffer);
     std::printf("[compute] %s wave=%u ok\n", test.name, wave);

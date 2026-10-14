@@ -5092,7 +5092,8 @@ void TestGpuSelectedBufferRecords() {
 
 void TestGpuSelectedFormattedRecordStore() {
   namespace Prospero = Libs::Graphics::Prospero;
-  const auto make = [](uint32_t stride = 592u, uint32_t shift = 16u, bool split = false) {
+  const auto make = [](uint32_t stride = 592u, uint32_t shift = 16u, bool split = false,
+                       bool wide = false) {
     auto fixture = std::make_unique<Fixture>();
     auto& f = *fixture;
     std::array<Value, 4> table_words, selector_words;
@@ -5100,29 +5101,39 @@ void TestGpuSelectedFormattedRecordStore() {
       table_words[word] = f.UserData(word);
       selector_words[word] = f.UserData(4u + word);
     }
-    const auto table = f.Buffer(table_words);
+    const auto table = wide ? f.Address(table_words[0], table_words[1]) : f.Buffer(table_words);
     const auto lane = f.Emit(ValueOpcode::LaneId);
-    const auto packed = f.Emit(ValueOpcode::LoadBufferU32,
+    const auto packed = wide ? f.Emit(ValueOpcode::ReadConstBuffer,
+        {f.Buffer(selector_words), f.Emit(ValueOpcode::IMul32, {lane, Value(8u)})},
+        f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = 4u}, 0x1c4cu)) :
+        f.Emit(ValueOpcode::LoadBufferU32,
         {f.Buffer(selector_words), lane, Value(0u), Value(0u), Value(true)},
         f.AddMemory({.kind = ResourceKind::Buffer, .idxen = true}, 0x1bcu));
-    const auto key = f.Emit(ValueOpcode::ReadLane,
+    const auto key = wide ? (shift == 0u ? packed : f.Emit(ValueOpcode::BitFieldUExtract,
+        {packed, Value(16u), Value(5u)})) : f.Emit(ValueOpcode::ReadLane,
         {f.Emit(ValueOpcode::ShiftRightLogical32, {packed, Value(shift)}), Value(0u)});
     const auto offset = f.Emit(ValueOpcode::IMul32, {key, Value(stride)});
     std::array<Value, 4> words;
     for (uint32_t word = 0; word < 4u; ++word) {
       const auto dynamic = split ? f.Emit(ValueOpcode::IAdd32, {offset, Value(word * 4u)}) : offset;
-      words[word] = f.Emit(ValueOpcode::ReadConstBuffer, {table, dynamic},
-          f.AddMemory({.kind = ResourceKind::ScalarBuffer,
-                       .offset = 448u + (split ? 0u : word * 4u),
-                       .component_index = word, .component_count = 4u}, 0x2e8u));
+      const auto flags = f.AddMemory({.kind = wide ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer,
+          .offset = (wide ? 48u : 448u) + (split ? 0u : word * 4u),
+          .component_index = word, .component_count = 4u}, wide ? 0x1d88u : 0x2e8u);
+      words[word] = wide ? f.Emit(ValueOpcode::LoadAddressU32,
+          {table, dynamic, Value(0u), Value(true)}, flags) :
+          f.Emit(ValueOpcode::ReadConstBuffer, {table, dynamic}, flags);
     }
     f.Emit(ValueOpcode::LoadBufferU32,
         {f.Buffer(words), lane, Value(0u), Value(0u), Value(true)},
         f.AddMemory({.kind = ResourceKind::Buffer, .formatted = true, .idxen = true}, 0x2f8u));
+    const auto data = wide ? f.Emit(ValueOpcode::CompositeConstructU32x4,
+        {Value(0x3f800000u), Value(0xc0000000u), Value(0x3f000000u), Value(0x3e800000u)}) :
+        Value(uint32_t(-127));
     for (uint32_t use = 0; use < 2u; ++use)
-      f.Emit(ValueOpcode::StoreBufferU32,
-          {f.Buffer(words), lane, Value(0u), Value(0u), Value(uint32_t(-127)), Value(true)},
-          f.AddMemory({.kind = ResourceKind::Buffer, .formatted = true,
+      f.Emit(wide ? ValueOpcode::StoreBufferU32x4 : ValueOpcode::StoreBufferU32,
+          {f.Buffer(words), lane, Value(0u), Value(0u), data, Value(true)},
+          f.AddMemory({.kind = ResourceKind::Buffer, .data_dwords = wide ? 4u : 1u,
+                       .component_count = wide ? 4u : 1u, .formatted = true,
                        .idxen = true, .coherent = true}, 0x1618u + use * 8u));
     f.PlanAndTrack();
     return fixture;
@@ -5250,6 +5261,115 @@ void TestGpuSelectedFormattedRecordStore() {
        {std::tuple{592u, 0u, false}, std::tuple{65540u, 16u, false}, std::tuple{592u, 16u, true}})
     CheckFatal([&] { make(stride, shift, split); }, "not a valid runtime value",
                "exact record store accepted an unbounded, wrapping or split descriptor offset");
+
+  auto wide = make(16u, 16u, false, true);
+  auto wide_plan = ExtractResourcePlan(wide->program);
+  uint32_t wide_root = UINT32_MAX;
+  for (uint32_t resource = 0; resource < wide_plan.info.buffers.size(); ++resource) {
+    const auto& source = wide_plan.descriptor_sources[wide_plan.info.buffers[resource].source];
+    if (!source.indirect_descriptor) continue;
+    const auto& indirect = *source.indirect_descriptor;
+    Check(wide_root == UINT32_MAX && !indirect.table_scalar && !indirect.selector &&
+              !indirect.table_maximum && !indirect.pointer_offset &&
+              indirect.key_count == Value(32u) && indirect.table_stride == 16u &&
+              indirect.table_offset == 0u && indirect.table_immediate == 48u &&
+              wide_plan.descriptor_sources[indirect.table_source].dword_count == 2u &&
+              wide_plan.info.buffers[resource].max_byte_extent == 16u,
+          "RGBA16 store lost its finite raw-pointer rows or captured the GPU selector");
+    wide_root = resource;
+  }
+  Check(wide_root != UINT32_MAX, "RGBA16 store has no native candidate root");
+  selection = nullptr;
+  uint32_t address_reads = 0u;
+  stores = 0u;
+  for (const auto* block : wide->program.blocks)
+    for (const auto& inst : *block) {
+      if (inst.GetOpcode() == ValueOpcode::GetBufferResourceIndex) {
+        Check(selection == nullptr && inst.Flags<uint32_t>() == wide_root &&
+                  inst.Arg(0).ResolveInstruction()->GetOpcode() == ValueOpcode::BitFieldUExtract,
+              "RGBA16 stores duplicated selection or replaced the runtime finite key");
+        selection = &inst;
+      }
+      if (inst.GetOpcode() == ValueOpcode::LoadAddressU32) {
+        Check(!wide->program.memory_info[inst.Flags<MemoryFlags>().index].planning_only,
+              "RGBA16 store consumed descriptor words still used by the BDA read");
+        ++address_reads;
+      }
+      if (inst.GetOpcode() == ValueOpcode::StoreBufferU32x4) {
+        Check(selection && inst.Arg(0).ResolveInstruction()->Arg(0).ResolveInstruction() == selection,
+              "RGBA16 store lost its dominating shared selection");
+        ++stores;
+      }
+    }
+  Check(address_reads == 4u && stores == 2u, "RGBA16 fixture lost shared descriptor uses");
+  std::fill_n(memory.words.begin() + table_offset / 4u, 32u * 4u, 0u);
+  constexpr uint32_t rgba = (uint32_t(Prospero::BufferFormat::k16_16_16_16Float) << 12u) | 0xfacu;
+  user_data[0] = uint32_t(memory.base) + table_offset - 48u;
+  user_data[1] = 0u;
+  const auto wide_materialize = [&] {
+    return MaterializeResources(wide_plan, runtime, snapshot, specialization);
+  };
+  for (const bool populated : {false, true, false, true}) {
+    for (const uint32_t row : {0u, 3u}) {
+      const std::array descriptor{0x100000u + row * 256u, 8u << 16u, 20u, rgba};
+      for (uint32_t word = 0; word < 4u; ++word)
+        memory.words[table_offset / 4u + row * 4u + word] = populated ? descriptor[word] : 0u;
+    }
+    memory.reads = 0u;
+    Check(wide_materialize() && memory.reads == 32u &&
+              snapshot.buffers.size() == wide_plan.info.buffers.size() + (populated ? 2u : 0u),
+          "finite RGBA16 table read GPU keys or retained stale null/active candidates");
+  }
+  const auto wide_mapping = specialization.buffers[wide_root].indirect_mapping_offset;
+  Check(snapshot.flattened_srt[wide_mapping] == 32u,
+        "finite RGBA16 table lost its complete key map");
+  for (uint32_t row = 0; row < 32u; ++row)
+    Check(snapshot.flattened_srt[wide_mapping + 1u + row * 2u] == row &&
+              snapshot.flattened_srt[wide_mapping + 2u + row * 2u] ==
+                  (row == 0u ? 0u : row == 3u ? 2u : 1u),
+          "finite RGBA16 table selected the wrong active or null candidate");
+  const auto wide_original = specialization;
+  memory.words[table_offset / 4u] += 4u;
+  Check(wide_materialize() && specialization == wide_original &&
+            snapshot.buffers[wide_root].dwords[0] == memory.words[table_offset / 4u],
+        "RGBA16 destination refresh froze the address or changed format specialization");
+  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 6>{{
+      {0u, memory.words[table_offset / 4u] | 1u}, {1u, 16u << 16u},
+      {1u, (8u << 16u) | (1u << 31u)}, {3u, rgba | (1u << 28u)},
+      {3u, (uint32_t(Prospero::BufferFormat::k32UInt) << 12u) | 4u}, {3u, rgba ^ 1u}}}) {
+    auto& field = memory.words[table_offset / 4u + word];
+    const auto saved = field;
+    field = value;
+    Check(!wide_materialize(), "RGBA16 store accepted unproved format, alignment, stride, bounds or swizzle");
+    field = saved;
+  }
+  wide_plan.info.buffers[wide_root].max_byte_extent = 4u;
+  Check(!wide_materialize(), "scalar formatted store incorrectly admitted an RGBA16 candidate");
+  wide_plan.info.buffers[wide_root].max_byte_extent = 16u;
+  auto& wide_indirect = *wide_plan.descriptor_sources[
+      wide_plan.info.buffers[wide_root].source].indirect_descriptor;
+  for (const bool overflow : {false, true}) {
+    wide_indirect.key_count = Value(overflow ? 32u : MaxIndirectDescriptorProbes + 1u);
+    wide_indirect.table_stride = overflow ? 0x10000000u : 16u;
+    memory.reads = 0u;
+    Check(!wide_materialize() && memory.reads == 0u,
+          "finite RGBA16 table read memory before rejecting its cap or wrapped span");
+  }
+  wide_indirect.key_count = Value(32u);
+  wide_indirect.table_stride = 16u;
+  Check(wide_materialize(), "RGBA16 candidates did not recover after invalid metadata");
+  ApplyResourceSpecialization(wide->program, specialization);
+  for (const auto* block : wide->program.blocks)
+    for (const auto& inst : *block)
+      if (inst.GetOpcode() == ValueOpcode::StoreBufferU32x4) {
+        const auto& info = wide->program.memory_info[inst.Flags<MemoryFlags>().index];
+        Check(info.kind == ResourceKind::Buffer && info.resource == wide_root && info.formatted &&
+                  info.coherent && info.data_bits == 32u && info.component_count == 4u,
+              "RGBA16 specialization lost native wide conversion, selection or GLC");
+      }
+  for (const auto [shift, split] : {std::pair{0u, false}, std::pair{16u, true}})
+    CheckFatal([&] { make(16u, shift, split, true); }, "not a valid runtime value",
+               "finite RGBA16 store accepted an unbounded key or independently wrapping DWORDs");
 }
 
 void TestFiniteBufferSelection() {
