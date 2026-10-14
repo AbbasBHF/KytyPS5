@@ -4705,6 +4705,26 @@ void TestNewShaderDecoderArchitecture() {
             byte_left_shift.src1.value == 1u,
         "decoder rejected or misdecoded captured V_LSHLREV_B32 byte shift");
 
+  const uint32_t vop2_sdwa_byte_left_destination[] = {
+      0x340a08f9u, 0x01861187u, // v_lshlrev_b32 v5.byte1, 7, v4.byte1; preserve
+  };
+  Instruction byte_left_destination;
+  ShaderRecompiler::Decoder::DecodeInstruction(vop2_sdwa_byte_left_destination, 0u,
+                                               byte_left_destination);
+  Check(byte_left_destination.family == Family::VOP2 &&
+            byte_left_destination.opcode == Opcode::V_LSHLREV_B32 &&
+            byte_left_destination.word_count == 2u &&
+            byte_left_destination.dst.reg == 5u &&
+            byte_left_destination.dst.sdwa_sel == 1u &&
+            byte_left_destination.dst.sdwa_dst_unused == 2u &&
+            byte_left_destination.dst.explicit_sdwa_dst &&
+            byte_left_destination.src0.kind == OperandKind::IntegerInlineConstant &&
+            byte_left_destination.src0.value == 7u &&
+            byte_left_destination.src0.sdwa_sel == 6u &&
+            byte_left_destination.src1.kind == OperandKind::Vgpr &&
+            byte_left_destination.src1.reg == 4u && byte_left_destination.src1.sdwa_sel == 1u,
+        "decoder rejected or misdecoded captured V_LSHLREV_B32 byte destination");
+
   const uint32_t mimg_nsa[] = {EncodeMimg0(0x20, 0xf) | (3u << 1u),
                                EncodeMimg1(4, 0, 1, 8), 0x03020100u,
                                0x07060504u, 0x0b0a0908u};

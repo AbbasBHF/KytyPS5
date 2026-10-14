@@ -23215,6 +23215,52 @@ TestCase Vop2SdwaBitwiseByteDestinations(u32 wave_size) {
   return test;
 }
 
+TestCase Vop2SdwaLshlrevByteDestinations(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr u32 sentinel = 0xa1b2c3d4u;
+  TestCase test;
+  test.name = wave_size == 64 ? "Vop2SdwaLshlrevByteDestinations64" : "Vop2SdwaLshlrevByteDestinations32";
+  test.initial = {0x44668122u};
+  test.expected = test.initial;
+  auto &code = test.code;
+  const auto store = [&](u32 reg, u32 expected) {
+    AppendStoreVgpr(&code, reg, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(expected);
+  };
+  AppendBufferLoadDword(&code, 4, 30);
+  for (const u32 count : {6u, 7u, 39u}) {
+    const u32 byte = count == 6u ? 0x40u : 0x80u;
+    for (u32 selector = 0; selector < 4u; ++selector) {
+      for (u32 unused = 0; unused < 3u; ++unused) {
+        AppendVMovLiteral(&code, 5, sentinel);
+        code.push_back(EncodeVop2(0x1a, 5, 249, 4));
+        // count7/byte1/preserve is captured 340a08f9 01861187 at PC4e98.
+        code.push_back(EncodeVop2Sdwa(InlineU32(count), selector, unused, 6, 1,
+                                      0, 0, 0, 0, 0, 0, 1));
+        const u32 shift = selector * 8u;
+        const u32 fill = unused == 1u && byte == 0x80u ? 0xffffff00u : 0u;
+        store(5, ((byte | fill) << shift) |
+                     (unused == 2u ? sentinel & ~(0xffu << shift) : 0u));
+      }
+    }
+  }
+  code.insert(code.end(), {EncodeVop2(0x1a, 4, 249, 4), 0x01861187u});
+  store(4, 0x44668022u); // Source1 aliases the preserved destination.
+  AppendVMovLiteral(&code, 5, sentinel);
+  code.push_back(EncodeSMovB32(126, InlineU32(0)));
+  code.insert(code.end(), {0x340a08f9u, 0x01861187u});
+  code.push_back(EncodeSMovB32(126, InlineU32(1)));
+  store(5, sentinel);
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::S_MOV_B32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpShiftLeftLogical", "OpBitFieldInsert", "OpBitFieldSExtract"};
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase Vop1SdwaMovByteDestinations() {
   using O = ShaderOpcode;
 
@@ -39393,6 +39439,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop1SdwaNotPartialSourcesAndDestinations);
   cases.push_back(Vop2SdwaBitwiseByteDestinations(32));
   cases.push_back(Vop2SdwaBitwiseByteDestinations(64));
+  cases.push_back(Vop2SdwaLshlrevByteDestinations(32));
+  cases.push_back(Vop2SdwaLshlrevByteDestinations(64));
   AddCase(Vop1SdwaMovByteDestinations);
   cases.push_back(Vop1SdwaMovByteSources(32));
   cases.push_back(Vop1SdwaMovByteSources(64));
@@ -45801,6 +45849,8 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop2SdwaBitwiseByteDestinations(32));
     RunCase(&vulkan, Vop2SdwaBitwiseByteDestinations(64));
+    RunCase(&vulkan, Vop2SdwaLshlrevByteDestinations(32));
+    RunCase(&vulkan, Vop2SdwaLshlrevByteDestinations(64));
     RunCase(&vulkan, Vop1SdwaNotPartialSourcesAndDestinations());
     return 0;
   }
