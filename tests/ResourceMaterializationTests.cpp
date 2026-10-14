@@ -1212,7 +1212,7 @@ void TestSignedStorageSpecialization() {
     Check(binding && ImageBindingResourceClass(*binding) == ImageResourceClass::Storage,
           "signed storage conversion did not reuse the unsigned storage binding");
   }
-  for (const auto format : {F::k16SInt, F::k32SInt}) {
+  for (const auto format : {F::k8SInt, F::k16SInt, F::k32SInt}) {
     data[0] = uint32_t(format) << 20u;
     auto &image = plan.info.images[0];
     image.read = true;
@@ -1232,6 +1232,8 @@ void TestSignedStorageSpecialization() {
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
               specialization.images[0].numeric_class == N::Sint &&
               specialization.images[0].conversion_format == F::kInvalid &&
+              Libs::Graphics::Prospero::NumBytesPerElement(format) ==
+                  (format == F::k8SInt ? 1u : format == F::k16SInt ? 2u : 4u) &&
               RawSignedStorageFormat(image, format) == F::kInvalid,
           "storage conversion changed ordinary signed image reads");
     image.resource_class = ImageResourceClass::Storage;

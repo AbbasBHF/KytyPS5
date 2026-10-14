@@ -35743,28 +35743,41 @@ TestCase ImageLoadFmaskUsesNativeSampleMapping() {
   return test;
 }
 
-TestCase ImageLoadR32SintUsesSignedSampledImage() {
+template <bool byte> TestCase ImageLoadSintUsesSignedSampledImage() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
-  AppendVMovU32(&code, 20, 2);
-  AppendVMovU32(&code, 21, 1);
-  code.push_back(EncodeMimg0(0x00, 0x1));
-  code.push_back(EncodeMimg1(0, 20));
-  AppendStoreVgpr(&code, 0, 0);
+  for (u32 pixel = 0; pixel < (byte ? 4u : 1u); ++pixel) {
+    AppendVMovU32(&code, 20, byte ? pixel : 2u);
+    AppendVMovU32(&code, 21, 1);
+    code.push_back(EncodeMimg0(0x00, 0x1));
+    code.push_back(EncodeMimg1(0, 20));
+    AppendStoreVgpr(&code, 0, pixel);
+  }
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "ImageLoadR32SintUsesSignedSampledImage";
+  test.name = byte ? "ImageLoadR8SintUsesSignedSampledImage"
+                   : "ImageLoadR32SintUsesSignedSampledImage";
   test.code = code;
-  test.expected = {0xffffff80u};
+  if constexpr (byte) test.expected = {0xffffff80u, 0xffffffffu, 0u, 127u};
+  else test.expected = {0xffffff80u};
   test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
-  test.sampled_image_rgba.resize(16);
-  test.sampled_image_rgba[6] = 0xffffff80u;
-  test.sampled_image_format = vk::Format::eR32Sint;
+  test.sampled_image_rgba.resize(byte ? 4u : 16u);
+  if constexpr (byte) test.sampled_image_rgba[1] = 0x7f00ff80u;
+  else test.sampled_image_rgba[6] = 0xffffff80u;
+  test.sampled_image_format = byte ? vk::Format::eR8Sint : vk::Format::eR32Sint;
   test.sampled_image_dwords_per_pixel = 1;
-  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32SInt);
+  constexpr auto format = byte ? Prospero::BufferFormat::k8SInt : Prospero::BufferFormat::k32SInt;
+  const auto surface = TextureGetSurfaceFormatInfo(format);
+  Require(test.name, "signed format metadata",
+          Prospero::NumBytesPerElement(format) == (byte ? 1u : 4u) &&
+              Prospero::SampledTextureNumericClass(format) == Prospero::TextureNumericClass::Sint &&
+              surface.vk_format == test.sampled_image_format &&
+              surface.conversion_format == Prospero::BufferFormat::kInvalid,
+          "signed sampled image lost its byte width, native mapping or numeric class");
+  test.user_data = MakeSampledTextureData(format);
   test.has_user_data = true;
   test.required_spirv = {"image_17", "OpTypeImage %int", "OpImageFetch %v4int",
                          "OpBitcast %v4uint"};
@@ -41191,7 +41204,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadVariants);
   AddCase(ImageLoadR32UintUsesIntegerSampledImage);
   AddCase(ImageLoadFmaskUsesNativeSampleMapping);
-  AddCase(ImageLoadR32SintUsesSignedSampledImage);
+  AddCase(ImageLoadSintUsesSignedSampledImage<false>);
+  AddCase(ImageLoadSintUsesSignedSampledImage<true>);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
   AddCase(ImageLoadPackedUnorm<false, false>);
   AddCase(ImageLoadPackedUnorm<false, true>);
@@ -46856,6 +46870,8 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--packed-texture-only") == 0) {
     VulkanHarness vulkan;
+    RunCase(&vulkan, ImageLoadSintUsesSignedSampledImage<false>());
+    RunCase(&vulkan, ImageLoadSintUsesSignedSampledImage<true>());
     vulkan.CheckPackedTextureComponents();
     CheckSigned16ImageStore(vulkan);
     vulkan.CheckBgra16Readback();
