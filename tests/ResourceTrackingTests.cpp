@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -24,6 +25,10 @@ using namespace Libs::Graphics::ShaderRecompiler::IR;
 using Libs::Graphics::ShaderComputeInputInfo;
 using Libs::Graphics::ShaderType;
 namespace Decoder = Libs::Graphics::ShaderRecompiler::Decoder;
+
+static_assert(std::is_constructible_v<Value, Inst*> &&
+              std::is_constructible_v<Value, bool> &&
+              !std::is_constructible_v<Value, const Inst*>);
 
 void Check(bool condition, const char *message) {
   if (!condition) {
@@ -692,7 +697,8 @@ void TestWaterfallImageTable() {
 
 void TestNestedPointerImageTable() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  const auto make = [](uint32_t variant = 0u) {
+  enum class Address { Shared, Equivalent, ImageMismatch, SamplerMismatch };
+  const auto make = [](uint32_t variant = 0u, Address choice = Address::Shared) {
     auto fixture = std::make_unique<Fixture>();
     std::array<Value, 4> table_words, key_words;
     for (uint32_t word = 0; word < 4u; ++word) {
@@ -749,6 +755,19 @@ void TestNestedPointerImageTable() {
                                     fixture->AddMemory(memory, 0x1f4u));
     }
     const auto address = fixture->Address(pointer[0], pointer[1]);
+    auto other_address = address;
+    if (choice == Address::Equivalent) {
+      other_address = fixture->Address(pointer[0], pointer[1]);
+    } else if (choice != Address::Shared) {
+      for (uint32_t word = 0; word < 2u; ++word) {
+        MemoryInfo memory;
+        memory.kind = ResourceKind::ScalarBuffer;
+        memory.offset = 8u + word * 4u;
+        pointer[word] = fixture->Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+                                      fixture->AddMemory(memory, 0x1fcu));
+      }
+      other_address = fixture->Address(pointer[0], pointer[1]);
+    }
     const auto load = [&](uint32_t first, uint32_t width) {
       if (width == 8u && variant >= 7u && variant <= 9u)
         first = variant == 7u ? 0x4000u : variant == 8u ? 0x3ff0u : 0x3fe0u;
@@ -759,8 +778,12 @@ void TestNestedPointerImageTable() {
         memory.kind = ResourceKind::ScalarAddress;
         memory.offset = first + word * 4u;
         if (variant == 3u && width == 8u && word == 7u) memory.offset += 4u;
+        const bool alternate = word == 1u &&
+            (choice == Address::Equivalent ||
+             (choice == Address::ImageMismatch && width == 8u) ||
+             (choice == Address::SamplerMismatch && width == 4u));
         words[word] = fixture->Emit(ValueOpcode::LoadAddressU32,
-            {address, Value(0u), Value(0u), Value(true)},
+            {alternate ? other_address : address, Value(0u), Value(0u), Value(true)},
             fixture->AddMemory(memory, first == 0x3d0u ? 0x1110u : 0x1118u));
       }
       return words;
@@ -820,6 +843,16 @@ void TestNestedPointerImageTable() {
               snapshot.samplers[row + 1u].dwords[0] == row,
           "nested pointer table mixed rows or pointee members");
   const auto populated = specialization;
+  auto equivalent = make(0u, Address::Equivalent);
+  equivalent->PlanAndTrack();
+  Check(MaterializeResources(ExtractResourcePlan(equivalent->program), runtime, snapshot, specialization) &&
+            specialization == populated,
+        "equivalent nested pointer address instructions changed descriptor selection");
+  for (const auto choice : {Address::ImageMismatch, Address::SamplerMismatch}) {
+    auto mismatched = make(0u, choice);
+    CheckFatal([&] { mismatched->PlanAndTrack(); }, "not a valid runtime value",
+        "nested pointer planning combined descriptor words from different pointer pairs");
+  }
   const auto reads = memory.reads;
   user_data[2] = 0u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
