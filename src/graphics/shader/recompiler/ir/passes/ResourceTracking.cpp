@@ -2204,6 +2204,7 @@ private:
 		const auto* memory = ScalarReadMemory(*read, memory_index);
 		Value index;
 		Value count;
+		Value first(0u);
 		uint32_t workgroup_axis = UINT32_MAX;
 		DescriptorSource count_source;
 		uint32_t row_stride = 0;
@@ -2214,6 +2215,20 @@ private:
 		    ((offset | stride | memory->offset) & 3u) == 0u &&
 		    uint64_t {offset} + memory->offset <= UINT32_MAX) {
 			workgroup_axis = WorkgroupAxis(index);
+			if (workgroup_axis == UINT32_MAX) {
+				const auto* sum = index.Resolve().TryInstruction();
+				if (sum != nullptr && sum->GetOpcode() == ValueOpcode::IAdd32) {
+					for (uint32_t arm = 0; arm < 2u; ++arm) {
+						const auto axis = WorkgroupAxis(sum->Arg(arm));
+						const auto base = sum->Arg(arm ^ 1u);
+						if (axis == UINT32_MAX ||
+						    !ValidateRuntimeValue(m_program, base, RuntimeValueType::Integer)) continue;
+						workgroup_axis = axis;
+						first = base;
+						break;
+					}
+				}
+			}
 			const auto* bound = BoundedLoop(index, read->Parent());
 			if (bound != nullptr && bound->GetOpcode() == ValueOpcode::ULessThan32) {
 				count = bound->Arg(1);
@@ -2269,7 +2284,7 @@ private:
 		if (rows) indirect.selector->rows.emplace(
 		    DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows {
 		        .source = InternSource(count_source), .stride = row_stride});
-		if (!count.IsEmpty() || workgroup_axis != UINT32_MAX) indirect.selector_first = Value(0u);
+		if (!count.IsEmpty() || workgroup_axis != UINT32_MAX) indirect.selector_first = first;
 		return true;
 	}
 

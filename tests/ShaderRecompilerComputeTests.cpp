@@ -10968,118 +10968,136 @@ public:
       constexpr auto record_keys = base + 0xd1000;
       constexpr auto record_table = base + 0xd2000;
       constexpr auto record_output = base + 0xd7000;
-      std::vector<u32> record_shader{
-          EncodeSop2(0x26, 16, 13, InlineU32(12)),
-          EncodeSmem0(0x08, 16, 0), EncodeSmem1(0, 16), EncodeSopp(0x0c, 0),
-          EncodeSop2(0x26, 17, 16, 255), 192u,
-          EncodeSmem0(0x0a, 20, 2), EncodeSmem1(160, 17),
-          EncodeSmem0(0x0a, 24, 2), EncodeSmem1(176, 17), EncodeSopp(0x0c, 0),
-          EncodeMubuf0(0x83, 0, true, false), EncodeMubuf1(4, 5, 0),
-          EncodeSopp(0x0c, 0)};
-      AppendVop3(&record_shader, 0x346, 8, 13, 12, Vgpr(0));
-      record_shader.insert(record_shader.end(), {
-          EncodeMubuf0(0x1d, 0, true, false), EncodeMubuf1(4, 2, 8)});
-      AppendVMovLiteral(&record_shader, 10, 0x5au);
-      AppendSMovLiteral(&record_shader, 126, 0x55555555u);
-      AppendSMovLiteral(&record_shader, 127, 0x55555555u);
-      record_shader.insert(record_shader.end(), {
-          EncodeMubuf0(0x18, 0, true, false, true), EncodeMubuf1(10, 6, 0)});
-      AppendEnd(&record_shader);
-      ShaderMapUserData(reinterpret_cast<uint64_t>(record_shader.data()),
-          {.type = Prospero::ShaderBinaryType::kCs,
-           .code_size_bytes = static_cast<u32>(record_shader.size() * sizeof(u32))});
-      std::array<u32, 96> records;
-      records.fill(0xdeadbeefu);
-      const std::array<u32, 4> numeric_descriptor{0x640u, 3u, 0x3ba3d70au, 0x3a23d70au};
-      std::copy(numeric_descriptor.begin(), numeric_descriptor.end(), records.begin() + 76u);
-      for (u32 row = 0; row < 2u; ++row) {
-        const auto payload = base + 0xd3000 + row * 0x1000;
-        const auto target = base + 0xd5000 + row * 0x1000;
-        const std::array<u32, 8> descriptors{
-            static_cast<u32>(payload), static_cast<u32>(payload >> 32u) | (8u << 16u), 4u,
-            (u32(Prospero::BufferFormat::k16_16_16_16Float) << 12u) | DstSel(4, 5, 6, 7),
-            static_cast<u32>(target), static_cast<u32>(target >> 32u) | (1u << 16u), 4u, 0x5204u};
-        std::copy(descriptors.begin(), descriptors.end(), records.begin() + row * 48u + 40u);
-        const std::array<u32, 8> data{0x40003c00u + row, 0xc0003800u + row,
-            0x44004200u + row, 0xc400bc00u + row, 0x48004600u + row, 0xc800c600u + row,
-            0x4c004a00u + row, 0xcc00ca00u + row};
-        LibKernel::Memory::WriteBacking(payload, data.data(), sizeof(data));
-      }
-      LibKernel::Memory::WriteBacking(record_table, records.data(), sizeof(records));
-      const auto produce = [&](uint64_t address, u32 stride, std::array<u32, 3> values) {
-        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(writer.data()),
-                             .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
-                             .wave_size = 64, .user_sgpr = 15});
-        for (u32 word = 0; word < 3u; ++word) {
-          set_buffer(word * 4u, address + word * stride, 4u);
-          shaders.SetCsUserSgpr(12u + word, values[word], HW::UserSgprType::Unknown);
+      for (const bool based : {false, true}) {
+        std::vector<u32> record_shader;
+        if (based) {
+          // The later captured shader starts its prefix at a clean SRT DWORD.
+          record_shader = {EncodeSmem0(0x00, 18, 2), EncodeSmem1(0x234, 125), EncodeSopp(0x0c, 0),
+              EncodeSop2(0x02, 18, 18, 13),
+              EncodeSop2(0x1e, 16, 18, InlineU32(3)),
+              EncodeSop2(0x02, 16, 16, InlineU32(4))};
+        } else record_shader = {EncodeSop2(0x26, 16, 13, InlineU32(12))};
+        record_shader.insert(record_shader.end(), {
+            EncodeSmem0(0x08, 16, 0), EncodeSmem1(0, 16), EncodeSopp(0x0c, 0)});
+        if (based) record_shader.insert(record_shader.end(), {
+            EncodeSop2(0x27, 16, 16, 255), (5u << 16u) | 16u});
+        record_shader.insert(record_shader.end(), {
+            EncodeSop2(0x26, 17, 16, 255), 192u,
+            EncodeSmem0(based ? 0x02 : 0x0a, 20, 2), EncodeSmem1(160, 17),
+            EncodeSmem0(based ? 0x02 : 0x0a, 24, 2), EncodeSmem1(176, 17), EncodeSopp(0x0c, 0),
+            EncodeMubuf0(0x83, 0, true, false), EncodeMubuf1(4, 5, 0),
+            EncodeSopp(0x0c, 0)});
+        AppendVop3(&record_shader, 0x346, 8, 13, 12, Vgpr(0));
+        record_shader.insert(record_shader.end(), {
+            EncodeMubuf0(0x1d, 0, true, false), EncodeMubuf1(4, 2, 8)});
+        AppendVMovLiteral(&record_shader, 10, 0x5au);
+        AppendSMovLiteral(&record_shader, 126, 0x55555555u);
+        AppendSMovLiteral(&record_shader, 127, 0x55555555u);
+        record_shader.insert(record_shader.end(), {
+            EncodeMubuf0(0x18, 0, true, false, true), EncodeMubuf1(10, 6, 0)});
+        AppendEnd(&record_shader);
+        ShaderMapUserData(reinterpret_cast<uint64_t>(record_shader.data()),
+            {.type = Prospero::ShaderBinaryType::kCs,
+             .code_size_bytes = static_cast<u32>(record_shader.size() * sizeof(u32))});
+        std::array<u32, 96> records;
+        records.fill(0xdeadbeefu);
+        const std::array<u32, 4> numeric_descriptor{0x640u, 3u, 0x3ba3d70au, 0x3a23d70au};
+        std::copy(numeric_descriptor.begin(), numeric_descriptor.end(), records.begin() + 76u);
+        for (u32 row = 0; row < 2u; ++row) {
+          const auto payload = base + 0xd3000 + row * 0x1000;
+          const auto target = base + 0xd5000 + row * 0x1000;
+          const std::array<u32, 8> descriptors{
+              static_cast<u32>(payload), static_cast<u32>(payload >> 32u) | (8u << 16u), 4u,
+              (u32(Prospero::BufferFormat::k16_16_16_16Float) << 12u) | DstSel(4, 5, 6, 7),
+              static_cast<u32>(target), static_cast<u32>(target >> 32u) | (1u << 16u), 4u, 0x5204u};
+          std::copy(descriptors.begin(), descriptors.end(), records.begin() + row * 48u + 40u);
+          const std::array<u32, 8> data{0x40003c00u + row, 0xc0003800u + row,
+              0x44004200u + row, 0xc400bc00u + row, 0x48004600u + row, 0xc800c600u + row,
+              0x4c004a00u + row, 0xcc00ca00u + row};
+          LibKernel::Memory::WriteBacking(payload, data.data(), sizeof(data));
         }
-        processor.DispatchDirect(1, 1, 1, 0x41u);
-      };
-      for (const u32 wave : {32u, 64u}) {
-        for (const auto dimensions : {std::array{2u, 1u, 1u}, std::array{0u, 1u, 1u},
-                                     std::array{2u, 0u, 1u}, std::array{2u, 1u, 0u},
-                                     std::array{1u, 1u, 1u}, std::array{2u, 1u, 1u}}) {
-          const bool empty = std::ranges::find(dimensions, 0u) != dimensions.end();
-          const std::array<u32, 3> stale_args{};
-          std::array<u32, 7> stale_keys;
-          stale_keys.fill(sentinel);
-          Require(name, "record fixture reset", context.InvalidateMemory(record_args, 0x8000),
-                  "record fixture escaped its mapped allocation");
-          LibKernel::Memory::WriteBacking(record_args, stale_args.data(), sizeof(stale_args));
-          LibKernel::Memory::WriteBacking(record_keys, stale_keys.data(), sizeof(stale_keys));
-          std::vector<u32> expected_output(wave * 4u, sentinel);
-          LibKernel::Memory::WriteBacking(record_output, expected_output.data(), expected_output.size() * 4u);
-          const std::array<u32, 4> untouched{sentinel, sentinel, sentinel, sentinel};
-          for (u32 row = 0; row < 2u; ++row)
-            LibKernel::Memory::WriteBacking(base + 0xd5000 + row * 0x1000, untouched.data(), sizeof(untouched));
-          produce(record_args, 4u, dimensions);
-          produce(record_keys, 12u, {1u, 0u, 22369622u});
-          std::array<u32, 3> cpu_args{};
-          std::array<u32, 7> cpu_keys{};
-          Require(name, "GPU record dependencies remain pending",
-                  cache.HasGpuDirtyBytes(record_args, 12u) && cache.HasGpuDirtyBytes(record_keys, 16u) &&
-                      LibKernel::Memory::TryReadBacking(record_args, cpu_args.data(), sizeof(cpu_args)) &&
-                      LibKernel::Memory::TryReadBacking(record_keys, cpu_keys.data(), sizeof(cpu_keys)) &&
-                      cpu_args == stale_args && cpu_keys == stale_keys,
-                  "the producer did not leave dispatch counts and selectors GPU-owned");
-          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(record_shader.data()),
-                               .num_thread_x = wave, .num_thread_y = 1, .num_thread_z = 1,
-                               .user_sgpr = 13, .tgid_x_en = true});
-          set_buffer(0, record_keys, 3u, 12u);
-          set_buffer(4, record_table, 2u, 192u);
-          set_buffer(8, record_output, wave * 2u, 8u);
-          shaders.SetCsUserSgpr(12, std::countr_zero(wave), HW::UserSgprType::Unknown);
-          processor.DispatchIndirect(record_args, 0x41u |
-              (wave == 32u ? 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT : 0u));
-          cache.ReadMemory(record_output, expected_output.size() * 4u);
-          std::vector<u32> actual_output(expected_output.size());
-          Require(name, "record output readback", LibKernel::Memory::TryReadBacking(
-                      record_output, actual_output.data(), actual_output.size() * 4u),
-                  "indirect record output could not be read back");
-          if (!empty)
-            for (u32 group = 0; group < dimensions[0]; ++group) {
-              const auto row = 1u - group;
-              for (u32 lane = 0; lane < wave; ++lane) {
-                const auto out = (group * wave + lane) * 2u;
-                expected_output[out] = expected_output[out + 1u] = 0u;
-                if (lane < 4u)
-                  Require(name, "unchanged formatted input", LibKernel::Memory::TryReadBacking(
-                              base + 0xd3000 + row * 0x1000 + lane * 8u, expected_output.data() + out, 8u),
-                          "the formatted source escaped its mapped allocation");
+        LibKernel::Memory::WriteBacking(record_table, records.data(), sizeof(records));
+        const auto produce = [&](uint64_t address, u32 stride, std::array<u32, 3> values) {
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(writer.data()),
+                               .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = 64, .user_sgpr = 15});
+          for (u32 word = 0; word < 3u; ++word) {
+            set_buffer(word * 4u, address + word * stride, 4u);
+            shaders.SetCsUserSgpr(12u + word, values[word], HW::UserSgprType::Unknown);
+          }
+          processor.DispatchDirect(1, 1, 1, 0x41u);
+        };
+        for (const u32 wave : {32u, 64u}) {
+          u32 first = based ? 2u : 0u;
+          for (const auto dimensions : {std::array{2u, 1u, 1u}, std::array{0u, 1u, 1u},
+                                       std::array{2u, 0u, 1u}, std::array{2u, 1u, 0u},
+                                       std::array{1u, 1u, 1u}, std::array{2u, 1u, 1u}}) {
+            const bool empty = std::ranges::find(dimensions, 0u) != dimensions.end();
+            const std::array<u32, 3> stale_args{};
+            std::array<u32, 10> stale_keys;
+            stale_keys.fill(sentinel);
+            Require(name, "record fixture reset", context.InvalidateMemory(record_args, 0x8000),
+                    "record fixture escaped its mapped allocation");
+            LibKernel::Memory::WriteBacking(record_args, stale_args.data(), sizeof(stale_args));
+            LibKernel::Memory::WriteBacking(record_keys, stale_keys.data(), sizeof(stale_keys));
+            LibKernel::Memory::WriteBacking(record_table + 0x234, &first, sizeof(first));
+            std::vector<u32> expected_output(wave * 4u, sentinel);
+            LibKernel::Memory::WriteBacking(record_output, expected_output.data(), expected_output.size() * 4u);
+            const std::array<u32, 4> untouched{sentinel, sentinel, sentinel, sentinel};
+            for (u32 row = 0; row < 2u; ++row)
+              LibKernel::Memory::WriteBacking(base + 0xd5000 + row * 0x1000, untouched.data(), sizeof(untouched));
+            produce(record_args, 4u, dimensions);
+            produce(record_keys + (based ? first * 8u + 4u : 0u), based ? 8u : 12u,
+                    based ? std::array{0x1beefu, 0xbeefu, 0x1fbeefu}
+                          : std::array{1u, 0u, 22369622u});
+            std::array<u32, 3> cpu_args{};
+            std::array<u32, 10> cpu_keys{};
+            Require(name, "GPU record dependencies remain pending",
+                    cache.HasGpuDirtyBytes(record_args, 12u) && cache.HasGpuDirtyBytes(record_keys, sizeof(stale_keys)) &&
+                        LibKernel::Memory::TryReadBacking(record_args, cpu_args.data(), sizeof(cpu_args)) &&
+                        LibKernel::Memory::TryReadBacking(record_keys, cpu_keys.data(), sizeof(cpu_keys)) &&
+                        cpu_args == stale_args && cpu_keys == stale_keys,
+                    "the producer did not leave dispatch counts and selectors GPU-owned");
+            shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(record_shader.data()),
+                                 .num_thread_x = wave, .num_thread_y = 1, .num_thread_z = 1,
+                                 .user_sgpr = 13, .tgid_x_en = true});
+            set_buffer(0, record_keys, based ? 5u : 3u, based ? 8u : 12u);
+            set_buffer(4, record_table, 2u, 192u);
+            if (based) shaders.SetCsUserSgpr(5, record_table >> 32u, HW::UserSgprType::Unknown);
+            set_buffer(8, record_output, wave * 2u, 8u);
+            shaders.SetCsUserSgpr(12, std::countr_zero(wave), HW::UserSgprType::Unknown);
+            processor.DispatchIndirect(record_args, 0x41u |
+                (wave == 32u ? 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT : 0u));
+            cache.ReadMemory(record_output, expected_output.size() * 4u);
+            std::vector<u32> actual_output(expected_output.size());
+            Require(name, "record output readback", LibKernel::Memory::TryReadBacking(
+                        record_output, actual_output.data(), actual_output.size() * 4u),
+                    "indirect record output could not be read back");
+            if (!empty)
+              for (u32 group = 0; group < dimensions[0]; ++group) {
+                const auto row = 1u - group;
+                for (u32 lane = 0; lane < wave; ++lane) {
+                  const auto out = (group * wave + lane) * 2u;
+                  expected_output[out] = expected_output[out + 1u] = 0u;
+                  if (lane < 4u)
+                    Require(name, "unchanged formatted input", LibKernel::Memory::TryReadBacking(
+                                base + 0xd3000 + row * 0x1000 + lane * 8u, expected_output.data() + out, 8u),
+                            "the formatted source escaped its mapped allocation");
+                }
               }
+            Require(name, "coherent exact workgroup selector prefix", actual_output == expected_output,
+                    "GPU counts or selectors were stale, over-enumerated, or selected the wrong record");
+            for (u32 row = 0; row < 2u; ++row) {
+              const auto target = base + 0xd5000 + row * 0x1000;
+              cache.ReadMemory(target, sizeof(untouched));
+              auto expected = untouched;
+              if (!empty && (dimensions[0] == 2u || row == 1u)) expected[0] = 0xa55aa55au;
+              std::array<u32, 4> actual{};
+              Require(name, "selected byte store and canaries", LibKernel::Memory::TryReadBacking(
+                          target, actual.data(), sizeof(actual)) && actual == expected,
+                      "masked/OOB record stores changed an inactive row or adjacent bytes");
             }
-          Require(name, "coherent exact workgroup selector prefix", actual_output == expected_output,
-                  "GPU counts or selectors were stale, over-enumerated, or selected the wrong record");
-          for (u32 row = 0; row < 2u; ++row) {
-            const auto target = base + 0xd5000 + row * 0x1000;
-            cache.ReadMemory(target, sizeof(untouched));
-            auto expected = untouched;
-            if (!empty && (dimensions[0] == 2u || row == 1u)) expected[0] = 0xa55aa55au;
-            std::array<u32, 4> actual{};
-            Require(name, "selected byte store and canaries", LibKernel::Memory::TryReadBacking(
-                        target, actual.data(), sizeof(actual)) && actual == expected,
-                    "masked/OOB record stores changed an inactive row or adjacent bytes");
+            if (based) first ^= 2u;
           }
         }
       }

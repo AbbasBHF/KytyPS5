@@ -5236,8 +5236,9 @@ void TestWorkgroupSelectedBufferRecords() {
 
 void TestGpuSelectedFormattedRecordStore() {
   namespace Prospero = Libs::Graphics::Prospero;
+  enum class Prefix { None, Forward, Reversed, Lane, TwoAxes };
   const auto make = [](uint32_t stride = 592u, uint32_t shift = 16u, bool split = false,
-                       bool wide = false) {
+                       bool wide = false, Prefix prefix = Prefix::None) {
     auto fixture = std::make_unique<Fixture>();
     auto& f = *fixture;
     std::array<Value, 4> table_words, selector_words;
@@ -5247,8 +5248,20 @@ void TestGpuSelectedFormattedRecordStore() {
     }
     const auto table = wide ? f.Address(table_words[0], table_words[1]) : f.Buffer(table_words);
     const auto lane = f.Emit(ValueOpcode::LaneId);
+    auto selector_index = lane;
+    if (prefix != Prefix::None) {
+      const auto group = f.Emit(ValueOpcode::GetBuiltin,
+          {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)});
+      const auto first = prefix == Prefix::Lane ? lane : prefix == Prefix::TwoAxes
+          ? f.Emit(ValueOpcode::GetBuiltin,
+              {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(1u)})
+          : f.Emit(ValueOpcode::LoadAddressU32, {table, Value(0u), Value(0u), Value(true)},
+              f.AddMemory({.kind = ResourceKind::ScalarAddress, .offset = 0x234u}, 0x1088u));
+      selector_index = f.Emit(ValueOpcode::IAdd32,
+          {prefix == Prefix::Reversed ? group : first, prefix == Prefix::Reversed ? first : group});
+    }
     const auto packed = wide ? f.Emit(ValueOpcode::ReadConstBuffer,
-        {f.Buffer(selector_words), f.Emit(ValueOpcode::IMul32, {lane, Value(8u)})},
+        {f.Buffer(selector_words), f.Emit(ValueOpcode::IMul32, {selector_index, Value(8u)})},
         f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = 4u}, 0x1c4cu)) :
         f.Emit(ValueOpcode::LoadBufferU32,
         {f.Buffer(selector_words), lane, Value(0u), Value(0u), Value(true)},
@@ -5514,6 +5527,97 @@ void TestGpuSelectedFormattedRecordStore() {
   for (const auto [shift, split] : {std::pair{0u, false}, std::pair{16u, true}})
     CheckFatal([&] { make(16u, shift, split, true); }, "not a valid runtime value",
                "finite RGBA16 store accepted an unbounded key or independently wrapping DWORDs");
+
+  struct PrefixMemory : LinearTestMemory { uint32_t read_attempts = 0u; } prefix_memory;
+  const auto read_prefix = [](void* userdata, uint64_t address, std::span<uint32_t> words) {
+    auto* memory = static_cast<PrefixMemory*>(userdata);
+    ++memory->read_attempts;
+    return ReadLinearTestMemory(memory, address, words);
+  };
+  std::ranges::fill(prefix_memory.words, 0xdeadbeefu);
+  constexpr uint32_t selector_offset = 0x1000u;
+  constexpr uint32_t first_offset = table_offset - 48u + 0x234u;
+  for (uint32_t row = 0; row < 2u; ++row) {
+    const std::array descriptor{0x100000u + row * 256u, 8u << 16u, 20u, rgba};
+    std::copy(descriptor.begin(), descriptor.end(),
+              prefix_memory.words.begin() + table_offset / 4u + row * 4u);
+  }
+  const std::array numeric_descriptor{0xbf8d214eu, 0xbf78904bu, 0x3e930d39u, 0x33d6bf95u};
+  std::copy(numeric_descriptor.begin(), numeric_descriptor.end(),
+            prefix_memory.words.begin() + table_offset / 4u + 4u * 4u);
+  for (uint32_t index = 0; index < 12u; ++index)
+    prefix_memory.words[selector_offset / 4u + index * 2u + 1u] =
+        ((index < 4u ? index & 1u : index < 6u ? 1u : 4u) << 16u) | 0xbeefu;
+  std::array<uint32_t, 8> prefix_data{uint32_t(prefix_memory.base) + table_offset - 48u, 0u, 0u, 0u,
+      uint32_t(prefix_memory.base) + selector_offset, 8u << 16u, 12u, 0x5204u};
+  std::array counts{2u, 1u, 1u};
+  SrtRuntime prefix_runtime{.user_data = prefix_data, .read_memory = read_prefix,
+      .userdata = &prefix_memory, .read_specialization_memory = read_prefix,
+      .workgroup_counts = counts};
+  prefix_memory.watched_address = prefix_memory.base + selector_offset + 4u;
+  for (const auto prefix : {Prefix::Forward, Prefix::Reversed}) {
+    const auto selected = make(16u, 16u, false, true, prefix);
+    auto selected_plan = ExtractResourcePlan(selected->program);
+    auto& indirect = *selected_plan.descriptor_sources[
+        selected_plan.info.buffers[wide_root].source].indirect_descriptor;
+    Check(indirect.workgroup_axis == 0u && !indirect.selector_first.IsImmediate() &&
+              indirect.key_count.IsEmpty() && indirect.selector && indirect.selector->stride == 8u &&
+              indirect.selector->offset == 4u && indirect.table_immediate == 48u,
+          "runtime-first selector lost its workgroup prefix or captured table geometry");
+    const auto refresh = [&] {
+      prefix_memory.watched_reads = 0u;
+      prefix_memory.read_attempts = 0u;
+      return MaterializeResources(selected_plan, prefix_runtime, snapshot, specialization);
+    };
+    for (const uint32_t first : {0u, 2u, 4u, 0u}) {
+      prefix_memory.words[first_offset / 4u] = first;
+      Check(refresh() && snapshot.buffers.size() == selected_plan.info.buffers.size() + (first == 4u ? 0u : 1u) &&
+                snapshot.buffers[wide_root].dwords[0] == 0x100000u + (first == 4u ? 256u : 0u),
+            "runtime-first refresh froze a prior selector range or enumerated unrelated numeric rows");
+      for (const auto read : {std::pair{prefix_memory.base + first_offset, uint64_t{4u}},
+                             std::pair{prefix_memory.base + selector_offset + first * 8u + 4u, uint64_t{12u}}})
+        Check(std::ranges::find(snapshot.specialization_reads, read) != snapshot.specialization_reads.end(),
+              "runtime first or selected prefix escaped specialization read capture");
+    }
+    prefix_memory.fail_address = prefix_memory.base + first_offset;
+    Check(!refresh() && prefix_memory.read_attempts == 1u,
+          "unreadable runtime first reached the selector payload");
+    prefix_memory.fail_address = UINT64_MAX;
+    prefix_memory.words[first_offset / 4u] = 6u;
+    Check(!refresh(), "an actually selected invalid numeric descriptor was silently omitted");
+    for (const uint32_t first : {UINT32_MAX, 0x20000000u}) {
+      prefix_memory.words[first_offset / 4u] = first;
+      Check(!refresh() && prefix_memory.read_attempts == 1u,
+            "wrapped first-plus-group or scaled prefix read selector payload");
+    }
+    prefix_memory.words[first_offset / 4u] = UINT32_MAX;
+    counts[0] = 7u;
+    indirect.selector->stride = 0xfffffffcu;
+    Check(!refresh() && prefix_memory.read_attempts == 1u,
+          "wrapped first-plus-group overflowed the host prefix product before rejection");
+    indirect.selector->stride = 8u;
+    counts[0] = 1u;
+    prefix_memory.words[first_offset / 4u] = 0x1fffffffu;
+    Check(refresh() && prefix_memory.watched_reads == 0u && snapshot.buffers[wide_root].dwords[0] == 0x100000u,
+          "last nonwrapping selector DWORD lost scalar OOB key zero");
+    prefix_memory.words[first_offset / 4u] = UINT32_MAX;
+    for (const auto empty : {std::array{0u, 1u, 1u}, std::array{2u, 0u, 1u}, std::array{2u, 1u, 0u}}) {
+      counts = empty;
+      Check(refresh() && prefix_memory.watched_reads == 0u &&
+                snapshot.buffers.size() == selected_plan.info.buffers.size() &&
+                snapshot.buffers[wide_root].dwords[0] == 0u,
+            "empty dispatch evaluated an unreachable wrapped selector prefix");
+    }
+    counts = {2u, 1u, 1u};
+  }
+  for (const auto prefix : {Prefix::Lane, Prefix::TwoAxes}) {
+    const auto rejected = make(16u, 16u, false, true, prefix);
+    const auto& indirect = rejected->program.descriptor_sources[
+        rejected->program.info.buffers[wide_root].source].indirect_descriptor;
+    Check(indirect && indirect->workgroup_axis == UINT32_MAX && !indirect->selector &&
+              indirect->key_count == Value(32u),
+          "lane-varying or multiple-axis first incorrectly narrowed the finite descriptor domain");
+  }
 }
 
 void TestFiniteBufferSelection() {
