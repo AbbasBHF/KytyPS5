@@ -14476,12 +14476,13 @@ void TestBoundedScalarMaterialImageKeys() {
     bool clean = true;
     bool mixed = false;
     bool same_key = false;
-    uint32_t keys = 0;
+    uint32_t key_reads = 0;
     uint32_t images = 0;
   } memory;
   const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
     auto &m = *static_cast<Memory *>(data);
-    if (!m.clean || address == m.unavailable) return false;
+    if (!m.clean || (m.unavailable >= address &&
+        m.unavailable - address < words.size_bytes())) return false;
     if (words.size() == 1 && address >= 0x10a0u && address < 0x10c0u) {
       const uint32_t descriptors[] = {0x2000u, m.stride << 16u, m.records, 0x5204u,
                                      0x4000u, 16u << 16u, 8u, 0x4dfacu};
@@ -14489,13 +14490,17 @@ void TestBoundedScalarMaterialImageKeys() {
       return true;
     }
     if (address == 0x4024u && words.size() == 1) { words[0] = m.count; return true; }
-    for (const uint32_t row : {0u, 1u}) {
-      for (const uint32_t field : {0x7cu, 0x94u}) {
-        if (address != 0x2000u + row * 160u + field || words.size() != 1) continue;
-        ++m.keys;
-        words[0] = (row == 0 || m.same_key ? 5582u : 5567u) + (field == 0x94u ? 6u : 0u);
-        return true;
+    if (address >= 0x2000u && address < 0x2140u && (address & 3u) == 0u &&
+        words.size_bytes() <= 0x2140u - address) {
+      ++m.key_reads;
+      std::ranges::fill(words, 0xdeadbeefu);
+      for (size_t i = 0; i < words.size(); ++i) {
+        const auto offset = address - 0x2000u + i * sizeof(uint32_t);
+        const auto row = offset / 160u, field = offset % 160u;
+        if (field == 0x7cu || field == 0x94u)
+          words[i] = (row == 0 || m.same_key ? 5582u : 5567u) + (field == 0x94u ? 6u : 0u);
       }
+      return true;
     }
     for (const uint32_t key : {5567u, 5582u, 5573u, 5588u}) {
       if (address != 0x100000u + key * 32u || words.size() != 8) continue;
@@ -14518,8 +14523,13 @@ void TestBoundedScalarMaterialImageKeys() {
   for (const uint32_t stride : {160u, 16u}) {
     memory = {.stride = stride, .records = stride == 160u ? 409u : 20u};
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              memory.keys == 4 && memory.images == 4 && snapshot.images.size() == 4,
+              memory.key_reads == 2 && memory.images == 4 && snapshot.images.size() == 4,
           "scalar material selection used V# stride as its instruction stride or scanned unused keys");
+    for (const uint32_t field : {0x7cu, 0x94u})
+      Check(std::ranges::find(snapshot.specialization_reads,
+                std::pair<uint64_t, uint64_t>{0x2000u + field, 164u}) !=
+                snapshot.specialization_reads.end(),
+            "scalar material selector did not capture its bounded strided batch");
     for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
       const auto &selector = *plan.descriptor_sources[plan.info.images[root].source].indirect_descriptor->selector;
       const uint32_t first = selector.offset == 0x94u ? 5573u : 5567u;
@@ -14533,7 +14543,7 @@ void TestBoundedScalarMaterialImageKeys() {
   for (const bool same_key : {false, true}) {
     memory = {.count = same_key ? 2u : 1u, .same_key = same_key};
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              memory.keys == (same_key ? 4u : 2u) && memory.images == 2 &&
+              memory.key_reads == 2 && memory.images == 2 &&
               snapshot.images.size() == 2 &&
               std::ranges::all_of(specialization.images, [](const auto &image) {
                 return image.indirect_root == ImageResource::NoIndirectImage;
@@ -14541,16 +14551,18 @@ void TestBoundedScalarMaterialImageKeys() {
   }
   memory = {.count = 0};
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            memory.keys == 0 && memory.images == 0 && snapshot.images.size() == 2,
+            memory.key_reads == 0 && memory.images == 0 && snapshot.images.size() == 2,
         "empty scalar material loop retained image probes");
   memory = {.clean = false};
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "dirty scalar material proof was accepted");
-  memory = {.unavailable = 0x2094u};
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
-        "unavailable selected material key was accepted");
+  for (const uint64_t unavailable : {0x2094u, 0x211cu}) {
+    memory = {.unavailable = unavailable};
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "unavailable selected material key was accepted");
+  }
   memory = {.stride = 1, .records = 311};
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.keys == 0,
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.key_reads == 0,
         "scalar material byte range escaped V# bounds");
   memory = {.mixed = true};
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
