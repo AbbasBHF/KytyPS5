@@ -30179,8 +30179,10 @@ TestCase BufferLoadDwordGpuSelectedDescriptors() {
   return BufferLoadsGpuSelectedDescriptors(1u);
 }
 
-TestCase BufferLoadFormatXGpuSelectedDescriptors(u32 wave) {
+TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   using O = ShaderOpcode;
+  const bool formatted = load == O::BUFFER_LOAD_FORMAT_X;
+  const bool byte = load == O::BUFFER_LOAD_UBYTE;
   using F = Prospero::BufferFormat;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
   struct DescriptorCase {
@@ -30191,7 +30193,9 @@ TestCase BufferLoadFormatXGpuSelectedDescriptors(u32 wave) {
     bool zero_payload = false;
     bool unmapped = false;
   };
-  std::vector<DescriptorCase> cases = {
+  std::vector<DescriptorCase> cases;
+  if (formatted) {
+    cases = {
       {F::k8UInt, 4, 1, 4, 3, 1, 0, 0, false, 0x7f},
       {F::k8UInt, 4, 0, 4, 3, 0, 3, 0, false, 0x80},
       {F::k16UInt, 4, 2, 4, 0, 1, 0, 0, false, 0x80ff},
@@ -30236,10 +30240,42 @@ TestCase BufferLoadFormatXGpuSelectedDescriptors(u32 wave) {
       {F::k32UInt, 2, 4, 1, 0, 0, 0, 0, false, 0, false, true},
       {F::k32UInt, 3, 4, 1, 0, 0, 0, 0, false, 0, false, true},
       {static_cast<F>(127), 4, 4, 1, 0, 0, 0, 0, false, 0, false, true},
-  };
+    };
+  } else if (!byte) {
+    cases = {
+        {F::k32Float, 1, 0, 16, 3, 0, 0, 0, false, 0x7f01},
+        {F::k8UInt, 7, 0, 16, 3, 0, 1, 0, false, 0x7f01},
+        {F::k8UInt, 4, 0, 16, 3, 0, 2, 0, false, 0x80ff},
+        {F::k8UInt, 4, 0, 16, 3, 0, 3, 0, false, 0x80ff},
+        {F::k8UInt, 4, 0, 4, 3, 0, 2, 0, false, 0x80ff},
+        {F::k8UInt, 4, 0, 4, 3, 0, 3, 0, false, 0},
+        {F::k8UInt, 4, 4, 2, 0, 1, 2, 0, false, 0x8001},
+        {F::k8UInt, 4, 4, 2, 0, 1, 3, 0, false, 0x8001},
+        {F::k8UInt, 4, 4, 1, 1, 1, 0, 0, false, 0},
+        {F::k8UInt, 4, 4, 1, 1, 0, 8, 0, false, 0x3c00},
+        {F::k8UInt, 4, 4, 1, 2, 1, 2, 0, false, 0x8001},
+        {F::k8UInt, 4, 4, 0, 2, 0, 0, 0, false, 0, false, true},
+        {F::k8UInt, 4, 0, 16, 3, 0, 0, 2, false, 0x80ff},
+        {F::k8UInt, 4, 0, 4, 3, 0, 0, 8, false, 0, false, true},
+        {F::kInvalid, 4, 4, 1, 0, 0, 0, 0, false, 0, false, true},
+        {F::k8UInt, 4, 0, 16, 3, 0, 15, 0, false, 0, false, true},
+        {F::k8UInt, 4, 8, 2, 0, 1, 2, 4, true, 0x4000},
+    };
+  } else {
+    cases = {
+        {F::k32Float, 1, 0, 16, 3, 0, 0, 0, false, 0x01},
+        {F::k8UInt, 7, 0, 16, 3, 0, 1, 0, false, 0x7f},
+        {F::k8UInt, 4, 0, 16, 3, 0, 2, 0, false, 0xff},
+        {F::k8UInt, 4, 0, 4, 3, 0, 3, 0, false, 0x80},
+        {F::k8UInt, 4, 0, 4, 3, 0, 4, 0, false, 0, false, true},
+        {F::k8UInt, 4, 4, 2, 0, 1, 3, 0, false, 0x80},
+        {F::k8UInt, 4, 0, 16, 3, 0, 0, 2, false, 0xff},
+        {F::k8UInt, 4, 8, 2, 0, 1, 3, 4, true, 0x40},
+    };
+  }
   // Visit every geometry entry and every selector. Zero payloads have exact zero
   // results in all numeric classes; selector ONE depends only on integer vs float.
-  for (u32 format = 0; format <= static_cast<u32>(F::k32_32_32_32Float); ++format) {
+  for (u32 format = 0; formatted && format <= static_cast<u32>(F::k32_32_32_32Float); ++format) {
     const auto info = ShaderRecompiler::Format::GetFormatInfo(static_cast<F>(format));
     using T = ShaderRecompiler::Format::ComponentType;
     for (u32 selector = 0; selector < 8u; ++selector) {
@@ -30249,8 +30285,12 @@ TestCase BufferLoadFormatXGpuSelectedDescriptors(u32 wave) {
     }
   }
   TestCase test;
-  test.name = wave == 32 ? "BufferLoadFormatXGpuSelectedDescriptors32"
-                        : "BufferLoadFormatXGpuSelectedDescriptors64";
+  test.name = formatted ? (wave == 32 ? "BufferLoadFormatXGpuSelectedDescriptors32"
+                                      : "BufferLoadFormatXGpuSelectedDescriptors64")
+                        : byte ? (wave == 32 ? "BufferLoadUbyteGpuSelectedDescriptors32"
+                                              : "BufferLoadUbyteGpuSelectedDescriptors64")
+                               : (wave == 32 ? "BufferLoadUshortGpuSelectedDescriptors32"
+                                             : "BufferLoadUshortGpuSelectedDescriptors64");
   const auto align256 = [](u32 bytes) { return (bytes + 255u) & ~255u; };
   const auto selection_base = align256(static_cast<u32>(cases.size()) * 4u);
   const auto descriptor_base = align256(selection_base + static_cast<u32>(cases.size()) * 4u);
@@ -30288,7 +30328,7 @@ TestCase BufferLoadFormatXGpuSelectedDescriptors(u32 wave) {
   code.push_back(EncodeSmem1(descriptor_base, 20));
   code.push_back(EncodeVop1(0x01, 21, 12));
   code.push_back(EncodeVop1(0x01, 22, 13));
-  code.push_back(EncodeMubuf0(0x00, 0, true, true));
+  code.push_back(EncodeMubuf0(formatted ? 0x00 : byte ? 0x08 : 0x0a, 0, true, true, !formatted));
   code.push_back(EncodeMubuf1(4, 2, 21, 14));
   AppendBufferStoreDword(&code, 4, 30);
   code.push_back(EncodeSop2(0x00, 28, 28, InlineU32(1)));
@@ -30301,21 +30341,37 @@ TestCase BufferLoadFormatXGpuSelectedDescriptors(u32 wave) {
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.wave_size = wave;
   test.has_compute_info = true;
-  test.required_spirv = {"PhysicalStorageBuffer", "OpSwitch", "OpLoopMerge"};
+  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge", formatted ? "OpSwitch" : "Volatile"};
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHLREV_B32,
                   O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_LSHL_B32,
-                  O::S_BUFFER_LOAD_DWORDX8, O::BUFFER_LOAD_FORMAT_X,
+                  O::S_BUFFER_LOAD_DWORDX8, load,
                   O::BUFFER_STORE_DWORD, O::S_ADD_U32, O::S_CMP_LT_U32,
                   O::S_CBRANCH_SCC1, O::S_ENDPGM};
   return test;
 }
 
 TestCase BufferLoadFormatXGpuSelectedDescriptors() {
-  return BufferLoadFormatXGpuSelectedDescriptors(32u);
+  return BufferLoadGpuSelectedDescriptors(32u, ShaderOpcode::BUFFER_LOAD_FORMAT_X);
 }
 
 TestCase BufferLoadFormatXGpuSelectedDescriptors64() {
-  return BufferLoadFormatXGpuSelectedDescriptors(64u);
+  return BufferLoadGpuSelectedDescriptors(64u, ShaderOpcode::BUFFER_LOAD_FORMAT_X);
+}
+
+TestCase BufferLoadUshortGpuSelectedDescriptors() {
+  return BufferLoadGpuSelectedDescriptors(32u, ShaderOpcode::BUFFER_LOAD_USHORT);
+}
+
+TestCase BufferLoadUshortGpuSelectedDescriptors64() {
+  return BufferLoadGpuSelectedDescriptors(64u, ShaderOpcode::BUFFER_LOAD_USHORT);
+}
+
+TestCase BufferLoadUbyteGpuSelectedDescriptors() {
+  return BufferLoadGpuSelectedDescriptors(32u, ShaderOpcode::BUFFER_LOAD_UBYTE);
+}
+
+TestCase BufferLoadUbyteGpuSelectedDescriptors64() {
+  return BufferLoadGpuSelectedDescriptors(64u, ShaderOpcode::BUFFER_LOAD_UBYTE);
 }
 
 TestCase BufferStoreDwordx4DropsOnlyOutOfBoundsTail() {
@@ -39411,6 +39467,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors64);
+  AddCase(BufferLoadUshortGpuSelectedDescriptors);
+  AddCase(BufferLoadUshortGpuSelectedDescriptors64);
+  AddCase(BufferLoadUbyteGpuSelectedDescriptors);
+  AddCase(BufferLoadUbyteGpuSelectedDescriptors64);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
   AddCase(BufferStoreFormatXyzwDropsPartialRecord);
@@ -45324,6 +45384,10 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferLoadDwordx3GpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors64());
+    RunCase(&vulkan, BufferLoadUshortGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferLoadUshortGpuSelectedDescriptors64());
+    RunCase(&vulkan, BufferLoadUbyteGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferLoadUbyteGpuSelectedDescriptors64());
     RunCase(&vulkan, BufferLoadFormatXRejectsPartialRecord());
     RunCase(&vulkan, BufferLoadFormatXyRejectsPartialRecord());
     RunCase(&vulkan, BufferLoadDwordx4SnapshotsOverlappingAddress());
