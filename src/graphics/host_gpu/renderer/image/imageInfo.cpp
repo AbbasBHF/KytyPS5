@@ -21,7 +21,7 @@ bool IsDepthPlane(const ImageInfo& info) {
 	        info.tile_mode == Prospero::TileMode::kLinear);
 }
 
-GuestRange ContiguousMipRange(const ImageInfo& info, uint32_t level) {
+GuestRange TiledMipRange(const ImageInfo& info, uint32_t level) {
 	const auto& block = info.tiling.block;
 	if (info.tile_mode != Prospero::TileMode::kStandard4KB ||
 	    block.family != TileBlockFamily::Standard4KB || info.IsVolume() || info.samples != 1 ||
@@ -42,11 +42,10 @@ GuestRange ContiguousMipRange(const ImageInfo& info, uint32_t level) {
 	    !TileGetBlockOffset(block, mip.tail_x, mip.tail_y, 0, origin)) {
 		return {};
 	}
-	// Standard4KB interleaves monotonically ordered X/Y bits. A dense rectangle
-	// fills exactly this power-of-two interval, including when rebased into a tail.
+	// Standard4KB interleaves monotonically ordered X/Y bits, so the last
+	// corner bounds every active texel. Tiling preserves any holes in this span.
 	const uint64_t size = uint64_t {last} + block.bytes_per_element;
-	if (!std::has_single_bit(size) || size != uint64_t {width} * height * block.bytes_per_element ||
-	    (origin & (size - 1u)) != 0 || size > block.block_size - origin ||
+	if ((origin & (std::bit_ceil(size) - 1u)) != 0 || size > block.block_size - origin ||
 	    mip.offset > UINT64_MAX - origin) {
 		return {};
 	}
@@ -57,11 +56,11 @@ uint32_t CompactMipSize(const ImageInfo& info) {
 	if (info.resources.levels != 1 || info.resources.layers != 1) {
 		return 0;
 	}
-	const auto range = ContiguousMipRange(info, 0);
-	if (range.size == 0 || range.address != 0) {
+	const auto range = TiledMipRange(info, 0);
+	if (range.size == 0 || range.size % 4 != 0 || range.address != 0) {
 		return 0;
 	}
-	const auto alignment = std::max<uint64_t>(256, range.size);
+	const auto alignment = std::max<uint64_t>(256, std::bit_ceil(range.size));
 	const auto in_block  = info.data.address & (info.tiling.block.block_size - 1u);
 	return (info.data.address & (alignment - 1u)) == 0 &&
 	               range.size <= info.tiling.block.block_size - in_block
@@ -226,7 +225,7 @@ uint32_t ImageInfo::DataAlignment() const {
 	}
 	const auto compact_size = CompactMipSize(*this);
 	if (compact_size != 0 && data.size == compact_size && mip_layout[0].size == compact_size) {
-		return std::max(256u, compact_size);
+		return std::max(256u, std::bit_ceil(compact_size));
 	}
 	return tiling.block.block_size;
 }
@@ -260,14 +259,14 @@ int32_t ImageInfo::SliceOf(const ImageInfo& container, int32_t mip) const noexce
 	}
 
 	// PS5 block slices contain the entire reversed mip chain. A rebased tail
-	// descriptor covers only its active bytes within the shared tail block.
+	// descriptor covers its addressed span within the shared tail block.
 	const auto slice_stride = container.data.size / container.resources.layers;
 	const auto child_stride = data.size / resources.layers;
 	auto mip_offset = layout.offset;
 	auto mip_size   = layout.size / container.resources.layers;
 	const auto compact_size = CompactMipSize(*this);
 	if (compact_size != 0 && child_stride == compact_size && mip_layout[0].size == compact_size) {
-		const auto range = ContiguousMipRange(container, level);
+		const auto range = TiledMipRange(container, level);
 		if (range.size != compact_size) {
 			return -1;
 		}

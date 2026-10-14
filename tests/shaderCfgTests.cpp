@@ -1366,18 +1366,26 @@ void TestRebasedTextureMipViews() {
   Check(view.MipOf(chain) == -1,
         "full-block child ignored the parent mip's nonzero tail origin");
 
-  for (uint32_t variant = 0; variant < 7; ++variant) {
+  for (uint32_t variant = 0; variant < 9; ++variant) {
     view = make_view(4, 0);
     view.data = {chain.data.address, 0};
     view.pitch = 0;
     switch (variant) {
-    case 0: view.extent = {8, 16, 1}; break; // Holes in the Standard4KB span.
+    case 0: view.extent = {7, 16, 1}; break; // Unproven non-power-of-two view.
     case 1: view.resources.levels = 2; break;
     case 2: view.resources.layers = 2; break;
     case 3: view.type = Prospero::ImageType::kColor3D; break;
     case 4: view.tile_mode = Prospero::TileMode::kStandard64KB; break;
     case 5: view.metadata.kind = ImageMetadataKind::Dcc; break;
     case 6: view.data = {0x5032b23800, 0x1000}; break;
+    case 7:
+    case 8:
+      view.guest_format = variant == 7 ? Prospero::BufferFormat::k8UNorm
+                                       : Prospero::BufferFormat::k16UNorm;
+      view.pixel_format = variant == 7 ? vk::Format::eR8Unorm : vk::Format::eR16Unorm;
+      view.bytes_per_block = 0;
+      view.extent = {1, 1, 1};
+      break;
     }
     view.UpdateSize();
     Check(view.data.size >= 0x1000 && view.DataAlignment() >= 0x1000,
@@ -1388,6 +1396,40 @@ void TestRebasedTextureMipViews() {
   view.UpdateSize();
   Check(view.data.size == 0x1000 && view.DataAlignment() == 0x1000,
         "misaligned descriptor received compact tail alignment");
+
+  view = make_view(4, 0);
+  view.data = {chain.data.address, 0};
+  view.extent.width = 8;
+  view.UpdateSize();
+  Check(view.data.size == 0x600 && view.DataAlignment() == 0x800,
+        "sparse rectangle confused addressed span with active byte count");
+
+  auto sparse_chain = chain;
+  sparse_chain.data = {0x503225f000, 0};
+  sparse_chain.pixel_format = vk::Format::eR32G32B32A32Uint;
+  sparse_chain.guest_format = Prospero::BufferFormat::k32_32_32_32UInt;
+  sparse_chain.extent = {64, 64, 1};
+  sparse_chain.resources = {6, 7};
+  sparse_chain.pitch = sparse_chain.bytes_per_block = 0;
+  sparse_chain.UpdateSize();
+  auto sparse = sparse_chain;
+  sparse.data = {0x50322e3500, 0};
+  sparse.extent = {2, 2, 1};
+  sparse.resources = {1, 1};
+  sparse.pitch = 0;
+  sparse.UpdateSize();
+  Check(sparse_chain.tiled_slice_stride == 0x16000 &&
+            sparse.data.size == 0x60 && sparse.mip_layout[0].size == 0x60 &&
+            sparse.DataAlignment() == 0x100 && sparse.LinearSize() == 0x200 &&
+            sparse.MipOf(sparse_chain) == 5 && sparse.SliceOf(sparse_chain, 5) == 6,
+        "captured sparse 2x2 view lost its byte span, tail origin, or array layer");
+  sparse.UpdateSize();
+  Check(sparse.data.size == 0x60 && sparse.mip_layout[0].size == 0x60 &&
+            sparse.DataAlignment() == 0x100,
+        "repeated sparse view sizing changed its span or alignment");
+  sparse.data.address -= 0x100;
+  Check(sparse.MipOf(sparse_chain) == -1,
+        "sparse view accepted a different mip-tail origin");
 }
 
 void TestShaderFeatureCollection() {

@@ -18673,15 +18673,18 @@ public:
       check_round_trip("odd multi-mip", total.size, layout);
     }
 
-    {
-      constexpr auto format = Prospero::BufferFormat::k16_16_16_16Float;
+    for (const bool sparse : {false, true}) {
+      const auto format = sparse ? Prospero::BufferFormat::k32_32_32_32UInt
+                                 : Prospero::BufferFormat::k16_16_16_16Float;
       constexpr auto tile = Prospero::TileMode::kStandard4KB;
-      auto view = MakeTilingImage(format, 16, 16, 1, 1, tile, 0, false);
-      view.data.address = 0x5032b23800;
+      const uint32_t extent = sparse ? 2 : 16;
+      auto view = MakeTilingImage(format, extent, extent, 1, 1, tile, 0, false);
+      view.data.address = sparse ? 0x50322e3500 : 0x5032b23800;
       view.UpdateSize();
       Require(name, "rebased mip footprint",
-              view.data.size == 0x800 && view.DataAlignment() == 0x800 &&
-                  view.mip_layout[0].pitch == 32 &&
+              view.data.size == (sparse ? 0x60 : 0x800) &&
+                  view.DataAlignment() == (sparse ? 0x100 : 0x800) &&
+                  view.mip_layout[0].pitch == (sparse ? 16 : 32) &&
                   view.mip_layout[0].height == 16 &&
                   view.tiled_slice_stride == 0x1000,
               "a compact view changed its allocation geometry");
