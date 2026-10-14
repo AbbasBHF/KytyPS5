@@ -1060,6 +1060,7 @@ void TestGuardedDirectImageTable() {
 void TestBoundedComputeImageLoop() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Clamp { None, Right, Left, Dynamic };
+  enum class PostTest { None, Signed, Unsigned, WrongPolarity, Previous, Bypass, Variable, AnyLane };
   enum class Variant {
     Bounded, Plain, Nonzero, TrueEdge, WrongGuard, EntryBypass, ExitBypass, GuardBlock,
     WrongStep, DivergentBound, DivergentKey, Disjunction, WrongPolarity,
@@ -1069,7 +1070,9 @@ void TestBoundedComputeImageLoop() {
     GuardedDiamond, GuardedDiamondBypass
   };
   const auto make_plan = [](Variant variant, bool material = false, uint32_t first = 0u,
-                            Clamp clamp = Clamp::None) {
+                            Clamp clamp = Clamp::None, PostTest post = PostTest::None,
+                            uint32_t post_bound = 6u) {
+    const bool post_test = post != PostTest::None;
     const bool diamond = variant >= Variant::GuardedDiamond;
     Fixture fixture(diamond ? ShaderType::Vertex : ShaderType::Compute);
     fixture.program.wave_size = 64u;
@@ -1083,12 +1086,13 @@ void TestBoundedComputeImageLoop() {
     auto *guard = masked ? fixture.AddBlock() : header;
     auto *increment = masked ? fixture.AddBlock() : latch;
     auto *final_exit = variant == Variant::PreviousBound ? fixture.AddBlock() : exit;
-    const bool forwarded = variant >= Variant::Forwarded && variant <= Variant::ForwardedIncrementBypass;
+    const bool forwarded = post_test ||
+        (variant >= Variant::Forwarded && variant <= Variant::ForwardedIncrementBypass);
     auto *forward = forwarded ? fixture.AddBlock() : increment;
     auto *incoming = variant == Variant::ForwardedChain ? fixture.AddBlock() : forward;
-    auto *detour = variant == Variant::ForwardedJoin ? fixture.AddBlock() : nullptr;
+    auto *detour = variant == Variant::ForwardedJoin || post == PostTest::Bypass ? fixture.AddBlock() : nullptr;
     entry->AddBranch(header);
-    if (!masked) {
+    if (!masked && !post_test) {
       header->AddBranch(exit);
       header->AddBranch(body);
       body->AddBranch(latch);
@@ -1144,18 +1148,19 @@ void TestBoundedComputeImageLoop() {
         ValueOpcode::GetBuiltin,
         {Value(static_cast<uint32_t>(diamond ? StageInputKind::VertexIndex
                                             : StageInputKind::LocalInvocationId)), Value(0u)});
-    auto count = variant == Variant::DivergentBound ? local : fixture.UserData(2);
-    if (first != 0u && variant != Variant::DivergentBound)
+    auto count = post_test && post != PostTest::Variable ? Value(post_bound) :
+        variant == Variant::DivergentBound ? local : fixture.UserData(2);
+    if (!post_test && first != 0u && variant != Variant::DivergentBound)
       count = fixture.Emit(ValueOpcode::LoadAddressU32,
           {fixture.Address(fixture.UserData(0), fixture.UserData(1)), Value(0u), Value(0u), Value(true)},
           fixture.AddMemory({.kind = ResourceKind::ScalarAddress}, 0x10));
-    const auto in_range = fixture.Emit(material ? ValueOpcode::ULessThan32 : ValueOpcode::SLessThan32,
+    const auto in_range = post_test ? Value{} : fixture.Emit(material ? ValueOpcode::ULessThan32 : ValueOpcode::SLessThan32,
                                        {variant == Variant::WrongGuard
                                             ? Value(0u) : key,
                                         count}, 0, compare);
     const auto initial_active = fixture.Emit(ValueOpcode::INotEqual32,
                                              {local, Value(0u)}, 0, entry);
-    if (forwarded) {
+    if (forwarded && !post_test) {
       forward->AddBranch(incoming == forward ? header : incoming);
       forward->terminator = {.kind = CFG::TerminatorKind::Branch,
                             .true_block = incoming == forward ? header : incoming};
@@ -1260,7 +1265,7 @@ void TestBoundedComputeImageLoop() {
           .kind = CFG::TerminatorKind::Branch,
           .true_block = fixture.program.blocks[1u]};
       fixture.program.blocks[4]->terminator.kind = CFG::TerminatorKind::Return;
-    } else {
+    } else if (!post_test) {
       const auto active = initial_active;
       const auto allowed = fixture.Emit(variant == Variant::Disjunction
                                            ? ValueOpcode::LogicalOr : ValueOpcode::LogicalAnd,
@@ -1289,6 +1294,35 @@ void TestBoundedComputeImageLoop() {
     const auto step = fixture.Emit(ValueOpcode::IAdd32,
                                    {key, Value(variant == Variant::WrongStep ? 2u : 1u)},
                                    0, increment);
+    if (post_test) {
+      const auto branch = [](Block *from, Block *to) {
+        from->AddBranch(to);
+        from->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = to};
+      };
+      const auto choose = [](Block *from, Block *yes, Block *no, Value condition) {
+        from->AddBranch(yes);
+        from->AddBranch(no);
+        from->condition = condition;
+        from->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                           .true_block = yes, .false_block = no};
+      };
+      entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+      branch(header, body);
+      branch(body, latch);
+      auto *test_block = detour != nullptr ? detour : latch;
+      if (detour != nullptr) choose(latch, detour, forward, initial_active);
+      const auto compared = post == PostTest::Previous ? key : step;
+      const auto predicate = fixture.Emit(post == PostTest::Unsigned ? ValueOpcode::ULessThan32 :
+          ValueOpcode::SLessThan32, {compared, count}, 0, test_block);
+      const auto condition = fixture.Emit(ValueOpcode::ConditionRef, {predicate},
+          post == PostTest::AnyLane ? CFG::BranchCondition::ExecNonZero :
+                                     CFG::BranchCondition::SccNonZero, test_block);
+      choose(test_block, post == PostTest::WrongPolarity ? exit : forward,
+             post == PostTest::WrongPolarity ? forward : exit, condition);
+      branch(forward, incoming == forward ? header : incoming);
+      if (incoming != forward) branch(incoming, header);
+      exit->terminator.kind = CFG::TerminatorKind::Return;
+    }
     phi.AddPhiOperand(entry, variant == Variant::DivergentKey ? local : Value(first));
     phi.AddPhiOperand(forwarded ? incoming : increment, step);
     Check(!forwarded || step.ResolveInstruction()->Parent() != phi.PhiBlock(1),
@@ -1332,7 +1366,7 @@ void TestBoundedComputeImageLoop() {
     fixture.Emit(ValueOpcode::ImageSampleRaw,
                  {image, sampler, fixture.ImageAddress(), Value(true)},
                  fixture.AddMemory(sample, 0x29c));
-    if (first != 0u) {
+    if (first != 0u && !post_test) {
       const auto output = fixture.Image({Value(0x8000u),
           Value(static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32UInt) << 20u),
           Value(0u), Value((static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u) |
@@ -1348,7 +1382,7 @@ void TestBoundedComputeImageLoop() {
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
     Check(indirect && indirect->selector.has_value() == material &&
               indirect->table_offset == 0x6b0u &&
-              (first == 0u ? indirect->key_count.Resolve() == count.Resolve()
+              (post_test || first == 0u ? indirect->key_count.Resolve() == count.Resolve()
                            : indirect->selector_first == Value(first) && !indirect->signed_count),
           "bounded compute loop lost its runtime image count");
     if (first != 0u)
@@ -1401,10 +1435,29 @@ void TestBoundedComputeImageLoop() {
     CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
                "compute image loop accepted a guard without a uniform bound");
   }
+  const auto post_test_plan = [&](PostTest post = PostTest::Signed, uint32_t bound = 6u,
+                                  uint32_t first = 0u, Variant variant = Variant::Forwarded) {
+    return make_plan(variant, false, first, Clamp::None, post, bound);
+  };
+  post_test_plan(PostTest::Signed, 6u, 0u, Variant::ForwardedChain);
+  for (const auto post : {PostTest::WrongPolarity, PostTest::Previous, PostTest::Bypass,
+                          PostTest::Variable, PostTest::AnyLane})
+    CheckFatal([&] { post_test_plan(post); }, "not a valid runtime value",
+               "post-tested image loop accepted an unproved carried-edge bound");
+  for (const auto bound : {0u, 0x80000000u, UINT32_MAX})
+    CheckFatal([&] { post_test_plan(PostTest::Signed, bound); }, "not a valid runtime value",
+               "post-tested image loop accepted a nonpositive signed bound");
+  CheckFatal([&] { post_test_plan(PostTest::Unsigned, 0u); }, "not a valid runtime value",
+             "post-tested image loop accepted a zero unsigned bound");
+  for (const auto first : {1u, UINT32_MAX})
+    CheckFatal([&] { post_test_plan(PostTest::Unsigned, 6u, first); }, "not a valid runtime value",
+               "post-tested image loop accepted a nonzero or wrapping initial value");
+  CheckFatal([&] { post_test_plan(PostTest::Signed, 6u, 0u, Variant::WrongStep); },
+             "not a valid runtime value", "post-tested image loop accepted a two-step induction");
 
   LinearTestMemory memory;
   const auto table = 0x1800u + 0x6b0u;
-  for (uint32_t key = 0; key < 3u; ++key) {
+  for (uint32_t key = 0; key < 6u; ++key) {
     const auto word = (table - memory.base) / 4u + key * 8u;
     memory.words[word] = 0x100u + key;
     memory.words[word + 1u] = static_cast<uint32_t>(
@@ -1419,6 +1472,19 @@ void TestBoundedComputeImageLoop() {
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  for (const auto post : {PostTest::Signed, PostTest::Unsigned}) {
+    for (const auto count : {6u, 1u}) {
+      const auto post_plan = post_test_plan(post, count);
+      memory.descriptor_reads = 0u;
+      memory.fail_address = table + count * 32u;
+      Check(MaterializeResources(post_plan, runtime, snapshot, specialization) &&
+                memory.descriptor_reads == count && snapshot.images.size() == count &&
+                snapshot.images.front().dwords[0] == 0x100u &&
+                snapshot.images.back().dwords[0] == 0x100u + count - 1u,
+            "post-tested image loop did not enumerate precisely zero through bound minus one");
+    }
+  }
+  memory.fail_address = UINT64_MAX;
   for (const uint32_t count : {2u, 3u, 2u}) {
     user_data[2] = count;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&

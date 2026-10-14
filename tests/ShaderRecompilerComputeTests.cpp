@@ -37372,12 +37372,13 @@ void CheckCountedRowImageSelector(VulkanHarness &vulkan) {
 void CheckPointerImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
   constexpr u32 base = 256u, table_offset = 24364u;
-  for (const u32 variant : {0u, 1u, 2u})
+  for (const u32 variant : {0u, 1u, 2u, 3u, 4u})
   for (const u32 wave : {32u, 64u}) {
-    const bool packed = variant == 2u;
-    const u32 count = variant * 2u;
+    const bool packed = variant == 2u, post_tested = variant >= 3u;
+    const u32 count = post_tested ? (variant == 3u ? 1u : 6u) : variant * 2u;
     TestCase test;
-    test.name = packed ? "PackedPointerImageTable" : "CountedPointerImageTable";
+    test.name = post_tested ? "PostTestedPointerImageTable"
+                           : packed ? "PackedPointerImageTable" : "CountedPointerImageTable";
     test.dispatch_x = packed ? 4u : 1u;
     test.bda_mappings = {{0u, 0u}};
     test.initial.resize((base + table_offset + 32u * 32u) / 4u);
@@ -37407,10 +37408,15 @@ void CheckPointerImageTable(VulkanHarness &vulkan) {
     test.compute_info.workgroup_register = 44u;
     auto &code = test.code;
     AppendVMovLiteral(&code, 0, 0u);
-    AppendVMovLiteral(&code, 20, 0x3f000000u);
-    AppendVMovLiteral(&code, 21, 0x3f000000u);
+    AppendVMovLiteral(&code, 20, post_tested ? 0u : 0x3f000000u);
+    AppendVMovLiteral(&code, 21, post_tested ? 0u : 0x3f000000u);
     size_t loop = 0, exit = 0, skip = 0;
-    if (packed) {
+    if (post_tested) {
+      // Captured 5f3fdf61a7ca4a20: load row before incrementing and testing next < 6.
+      code.push_back(EncodeSMovB32(20, InlineU32(0)));
+      loop = code.size();
+      code.push_back(EncodeSop2(0x1e, 23, 20, InlineU32(5)));
+    } else if (packed) {
       code.insert(code.end(), {EncodeSop2(0x26, 23, 44, InlineU32(60)),
           EncodeSop2(0x02, 23, 23, 255), 5008u,
           EncodeSmem0(0x00, 24), EncodeSmem1(0, 23),
@@ -37432,9 +37438,13 @@ void CheckPointerImageTable(VulkanHarness &vulkan) {
     }
     code.insert(code.end(), {EncodeSop2(0x02, 23, 23, 255), table_offset,
         EncodeSmem0(0x03, 8), EncodeSmem1(0, 23),
-        EncodeMimg0(0x27, 1), EncodeMimg1(4, 20, 2, 10),
+        EncodeMimg0(post_tested ? 0x00 : 0x27, 1), EncodeMimg1(4, 20, 2, 10),
         EncodeVop2(0x03, 0, Vgpr(4), 0)});
-    if (!packed) {
+    if (post_tested) {
+      code.insert(code.end(), {EncodeSop2(0x02, 20, 20, InlineU32(1)),
+                              EncodeSopc(0x04, 20, InlineU32(count))});
+      code.push_back(EncodeSopp(0x05, loop - code.size() - 1u));
+    } else if (!packed) {
       code[skip] = EncodeSopp(0x04, code.size() - skip - 1u);
       code.push_back(EncodeSop2(0x02, 20, 20, InlineU32(1)));
       code.push_back(EncodeSopp(0x02, loop - code.size() - 1u));
@@ -37444,10 +37454,13 @@ void CheckPointerImageTable(VulkanHarness &vulkan) {
     code.push_back(EncodeVop1(0x01, 30, 25));
     AppendBufferStoreDword(&code, 0, 30);
     AppendEnd(&code);
-    test.opcodes = {O::S_LOAD_DWORD, O::S_MUL_I32, O::S_ADD_I32, O::S_LSHL_B32,
-        O::S_LOAD_DWORDX8, O::IMAGE_SAMPLE, O::V_ADD_F32, O::V_MOV_B32,
+    test.opcodes = {O::S_ADD_I32, O::S_LSHL_B32,
+        O::S_LOAD_DWORDX8, post_tested ? O::IMAGE_LOAD : O::IMAGE_SAMPLE, O::V_ADD_F32, O::V_MOV_B32,
         O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-    if (packed) test.opcodes.insert(test.opcodes.end(), {O::S_LSHR_B32, O::S_AND_B32});
+    if (!post_tested) test.opcodes.insert(test.opcodes.end(), {O::S_LOAD_DWORD, O::S_MUL_I32});
+    if (post_tested) test.opcodes.insert(test.opcodes.end(), {O::S_MOV_B32, O::S_CMP_LT_I32,
+                                                           O::S_CBRANCH_SCC1});
+    else if (packed) test.opcodes.insert(test.opcodes.end(), {O::S_LSHR_B32, O::S_AND_B32});
     else test.opcodes.insert(test.opcodes.end(), {O::S_MOV_B32, O::S_CMP_LT_U32,
         O::S_CMP_GE_I32, O::S_CBRANCH_SCC0, O::S_BRANCH});
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
@@ -37462,15 +37475,15 @@ void CheckPointerImageTable(VulkanHarness &vulkan) {
           {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
           vk::ImageLayout::eShaderReadOnlyOptimal));
     auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
-    auto sampler = vulkan.CreateSampler(test.name, 1);
+    auto sampler = post_tested ? vk::Sampler{} : vulkan.CreateSampler(test.name, 1);
     vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, sampler, images);
-    std::vector<u32> expected(test.dispatch_x, std::bit_cast<u32>(count == 0u ? 0.0f : 34.0f));
+    std::vector<u32> expected(test.dispatch_x, std::bit_cast<u32>(post_tested ? float(count * (count + 1u) / 2u) : count == 0u ? 0.0f : 34.0f));
     if (packed) for (u32 row = 0; row < fields.size(); ++row)
       expected[row] = std::bit_cast<u32>(static_cast<float>(fields[row] + 1u));
     CompareWords(test, "bounded pointer selectors and packed fields", expected,
                  vulkan.ReadBuffer(test.name, buffer, expected.size()));
     vulkan.DestroyBuffer(&buffer);
-    vulkan.Device().destroySampler(sampler);
+    if (sampler) vulkan.Device().destroySampler(sampler);
     for (auto &image : images) vulkan.DestroyImage(&image);
     std::printf("[compute] %s wave=%u count=%u ok\n", test.name, wave, count);
   }
