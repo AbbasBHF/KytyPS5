@@ -37,6 +37,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include <vulkan/vulkan_format_traits.hpp>
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -2009,7 +2010,6 @@ public:
     u32 height = 0;
     u32 layers = 1;
     u32 mip_levels = 1;
-    u32 dwords_per_pixel = 0;
   };
 
   [[nodiscard]] vk::Device Device() const { return m_device; }
@@ -15749,11 +15749,12 @@ public:
     return std::max(value, 1u);
   }
 
-  static size_t ImageMipDwordCount(u32 width, u32 height, u32 dwords_per_pixel,
+  static size_t ImageMipDwordCount(u32 width, u32 height, vk::Format format,
                                    u32 level, u32 layers = 1) {
-    return static_cast<size_t>(MipExtent(width, level)) *
-           static_cast<size_t>(MipExtent(height, level)) * layers *
-           dwords_per_pixel;
+    const auto block = vk::blockExtent(format);
+    const auto blocks_x = (MipExtent(width, level) + block[0] - 1u) / block[0];
+    const auto blocks_y = (MipExtent(height, level) + block[1] - 1u) / block[1];
+    return (size_t{blocks_x} * blocks_y * layers * vk::blockSize(format) + 3u) / 4u;
   }
 
   Image CreateImageMips(const char *shader_name, u32 width, u32 height,
@@ -15772,7 +15773,8 @@ public:
     ret.height = height;
     ret.layers = layers;
     ret.mip_levels = std::max<u32>(static_cast<u32>(initial_mips.size()), 1u);
-    ret.dwords_per_pixel = dwords_per_pixel;
+    Require(shader_name, "image format size", dwords_per_pixel == (vk::blockSize(format) + 3u) / 4u,
+            "image fixture word size disagrees with its native format");
 
     vk::ImageCreateInfo image_info{};
     image_info.sType = vk::StructureType::eImageCreateInfo;
@@ -15845,13 +15847,13 @@ public:
       size_t total_dwords = 0;
       for (u32 level = 0; level < ret.mip_levels; level++) {
         total_dwords +=
-            ImageMipDwordCount(width, height, dwords_per_pixel, level, layers);
+            ImageMipDwordCount(width, height, format, level, layers);
       }
       std::vector<u32> contents(total_dwords, 0);
       size_t offset = 0;
       for (u32 level = 0; level < ret.mip_levels; level++) {
         const auto level_dwords =
-            ImageMipDwordCount(width, height, dwords_per_pixel, level, layers);
+            ImageMipDwordCount(width, height, format, level, layers);
         const auto &src = initial_mips[level];
         for (size_t i = 0; i < src.size() && i < level_dwords; i++) {
           contents[offset + i] = src[i];
@@ -15891,9 +15893,8 @@ public:
   }
 
   std::vector<u32> ReadImage(const char *shader_name, Image *image) {
-    const auto dword_count = static_cast<size_t>(image->width) *
-                             static_cast<size_t>(image->height) *
-                             image->layers * image->dwords_per_pixel;
+    const auto dword_count = ImageMipDwordCount(image->width, image->height,
+                                               image->format, 0, image->layers);
     auto staging = CreateHostBuffer(shader_name, dword_count * sizeof(u32),
                                    vk::BufferUsageFlagBits::eTransferDst, {});
 
@@ -19549,7 +19550,7 @@ private:
       copies.push_back(copy);
       offset += static_cast<vk::DeviceSize>(
           ImageMipDwordCount(image->width, image->height,
-                             image->dwords_per_pixel, level, image->layers) *
+                             image->format, level, image->layers) *
           sizeof(u32));
     }
     cmd.copyBufferToImage(staging, image->image,
@@ -31882,23 +31883,23 @@ TestCase TBufferLoadFormatXSintSignExtendsSubDword() {
 
 TestCase TBufferStoreFormatXSintWritesSubDword() {
   using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  AppendVMovU32(&code, 20, 0);
-  AppendVMovLiteral(&code, 0, 0xffffff80u);
-  code.push_back(EncodeMtbuf0(0x04, 6, 0));
-  code.push_back(EncodeMtbuf1(0x04, 0, 0, 20));
-  AppendVMovU32(&code, 20, 4);
-  AppendVMovLiteral(&code, 1, 0xffff8001u);
-  code.push_back(EncodeMtbuf0(0x04, 12, 0));
-  code.push_back(EncodeMtbuf1(0x04, 1, 0, 20));
-  AppendEnd(&code);
-
-  return {"TBufferStoreFormatXSintWritesSubDword",
-          code,
-          {0x11223344u, 0x55667788u},
-          {0x11223380u, 0x55668001u},
-          {O::V_MOV_B32, O::TBUFFER_STORE_FORMAT_X, O::S_ENDPGM}};
+  TestCase test;
+  test.name = "TBufferStoreFormatXSintWritesSubDword";
+  constexpr std::array<u32, 6> inputs{0xffffff80u, 0xffffff7fu, 128u,
+                                     0xffff8001u, 0xffff7fffu, 32768u};
+  constexpr std::array<u32, 6> encoded{0x80u, 0x80u, 0x7fu, 0x8001u, 0x8000u, 0x7fffu};
+  test.initial.assign(inputs.size(), 0x11223344u);
+  test.expected = test.initial;
+  for (u32 index = 0; index < inputs.size(); ++index) {
+    AppendVMovU32(&test.code, 20, index * 4u);
+    AppendVMovLiteral(&test.code, 0, inputs[index]);
+    test.code.push_back(EncodeMtbuf0(0x04, index < 3u ? 6u : 12u, 0));
+    test.code.push_back(EncodeMtbuf1(0x04, 0, 0, 20));
+    test.expected[index] = (test.expected[index] & (index < 3u ? 0xffffff00u : 0xffff0000u)) | encoded[index];
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::TBUFFER_STORE_FORMAT_X, O::S_ENDPGM};
+  return test;
 }
 
 TestCase TBufferLoadFormatXy88IntegerComponents() {
@@ -38290,6 +38291,82 @@ TestCase ImageStoreR32FloatUsesFormatlessStorageImage() {
   test.forbidden_spirv = {"OpCapability StorageImageReadWithoutFormat",
                           "Rgba32f", "OpTypeSampler", "OpTypeSampledImage"};
   return test;
+}
+
+void CheckSigned16ImageStore(VulkanHarness &vulkan) {
+  constexpr std::array<int32_t, 8> values{INT32_MIN, -32769, -32768, -1, 0, 32767, 32768, INT32_MAX};
+  const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
+                            .limits.minStorageBufferOffsetAlignment;
+  for (const u32 wave : {32u, 64u}) {
+    for (const bool d16 : {false, true}) {
+      for (const u32 component : {0u, 2u}) {
+        TestCase test;
+        test.name = "Signed16ImageAndBufferStore";
+        const u32 width = wave - 2u;
+        const u32 output = (wave * 4u + alignment - 1u) / alignment * alignment;
+        test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k16SInt);
+        test.user_data[1] |= ((width - 1u) & 3u) << 30u;
+        test.user_data[2] = ((width - 1u) >> 2u) | (1u << 14u);
+        test.has_user_data = test.has_compute_info = true;
+        test.image_descriptor_swizzle = component == 0u ? DstSel(4, 0, 0, 1) : DstSel(0, 0, 4, 1);
+        const std::array<u32, 8> descriptors{0x1000u, 4u << 16u, wave, 0x5204u,
+            0x2000u, 2u << 16u, wave, (u32(Prospero::BufferFormat::k16SInt) << 12u) | 4u};
+        std::copy(descriptors.begin(), descriptors.end(), test.user_data.begin() + 8u);
+        test.storage_buffer_ranges = {{0u, wave * 4u}, {output, wave * 2u}};
+        test.compute_info.wave_size = wave;
+        test.compute_info.threads_num[0] = wave;
+        test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+        test.compute_info.thread_ids_num = 1u;
+        test.compute_info.lds_size_dwords = 0u;
+        test.initial.assign(output / 4u + wave / 2u, 0xdeadbeefu);
+        for (u32 lane = 0; lane < wave; ++lane)
+          test.initial[lane] = d16 ? 0x7a5b0000u | (u32(values[lane % values.size()]) & 0xffffu)
+                                   : u32(values[lane % values.size()]);
+        test.expected = test.initial;
+        std::vector<u32> pixels(width, 0x13571357u), expected = pixels;
+        for (u32 lane = 0; lane < wave; ++lane) {
+          const auto input = values[lane % values.size()];
+          const auto value = d16 ? int32_t(std::bit_cast<int16_t>(uint16_t(input))) : input;
+          const u32 encoded = uint16_t(std::clamp(value, -32768, 32767));
+          const auto set_half = [&](std::vector<u32> &words, u32 index) {
+            const auto shift = (index & 1u) * 16u;
+            words[index / 2u] = (words[index / 2u] & ~(0xffffu << shift)) | (encoded << shift);
+          };
+          set_half(test.expected, output / 2u + lane);
+          if (lane < width) {
+            set_half(expected, lane);
+            if (lane & 1u) set_half(expected, width + lane);
+          }
+        }
+        auto &code = test.code;
+        code = {EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(4, 2, 0),
+                EncodeSopp(0x0c, 0), EncodeMubuf0(d16 ? 0x84 : 0x04, 0, true, false),
+                EncodeMubuf1(4, 3, 0), EncodeVop1(0x01, 20, Vgpr(0))};
+        AppendVMovU32(&code, 21, 0u);
+        code.insert(code.end(), {EncodeMimg0(0x08, 1u << component),
+                                 EncodeMimg1(4, 20, 0, 0, false, d16)});
+        AppendVMovU32(&code, 21, 1u);
+        AppendSMovLiteral(&code, 126, 0xaaaaaaaau);
+        AppendSMovLiteral(&code, 127, wave == 64u ? 0xaaaaaaaau : 0u);
+        code.insert(code.end(), {EncodeMimg0(0x08, 1u << component),
+                                 EncodeMimg1(4, 20, 0, 0, false, d16)});
+        AppendEnd(&code);
+        test.opcodes = {ShaderOpcode::IMAGE_STORE};
+        const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+        auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+        auto image = vulkan.CreateImage2D(test.name, width, 2u, vk::Format::eR16Sint,
+            vk::ImageUsageFlagBits::eStorage, pixels, 1u, vk::ImageLayout::eGeneral, vk::Format::eR16Uint);
+        vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, &image);
+        CompareWords(test, "signed image saturation, sparse channels, masked lanes and OOB", expected,
+                     vulkan.ReadImage(test.name, &image));
+        CompareWords(test, "shared buffer conversion and adjacent halfwords", test.expected,
+                     vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
+        vulkan.DestroyImage(&image);
+        vulkan.DestroyBuffer(&buffer);
+      }
+    }
+  }
+  std::printf("[compute] %-32s ok\n", "Signed16ImageAndBufferStore");
 }
 
 TestCase ImageStoreR32SintUsesRawUintView() {
@@ -45517,6 +45594,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferStoreFormatXRejectsPartialRecord());
     RunCase(&vulkan, BufferStoreFormatXyRejectsPartialRecord());
     RunCase(&vulkan, BufferFormatStoreVariants());
+    RunCase(&vulkan, TBufferStoreFormatXSintWritesSubDword());
     RunCase(&vulkan, BufferStoreByteD16Hi(false));
     RunCase(&vulkan, BufferStoreByteD16Hi(true));
     return 0;
@@ -45634,6 +45712,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--packed-texture-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckPackedTextureComponents();
+    CheckSigned16ImageStore(vulkan);
     vulkan.CheckBgra16Readback();
     RunCase(&vulkan, ImageLoadPackedUintUnpacksAndSwizzles());
     RunCase(&vulkan, ImageLoadPackedUnorm<false, false>());
@@ -46414,6 +46493,7 @@ int main(int argc, char **argv) {
   CheckTessellationPrograms();
   CheckPixelParameterAliases();
   CheckRectListShaders();
+  CheckSigned16ImageStore(vulkan);
   CheckBoundedFormattedBufferCopy(vulkan);
   CheckIndirectBufferStore(vulkan);
   CheckBoundedRecordBufferAccess(vulkan);
