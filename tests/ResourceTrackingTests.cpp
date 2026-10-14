@@ -561,6 +561,201 @@ void TestWaterfallImageTable() {
              "waterfall without all descriptor equality witnesses was accepted");
 }
 
+void TestNestedPointerImageTable() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  const auto make = [](uint32_t variant = 0u) {
+    auto fixture = std::make_unique<Fixture>();
+    std::array<Value, 4> table_words, key_words;
+    for (uint32_t word = 0; word < 4u; ++word) {
+      table_words[word] = fixture->UserData(word);
+      key_words[word] = fixture->UserData(word + 4u);
+    }
+    const auto table = fixture->Buffer(table_words);
+    const auto keys = fixture->Buffer(key_words);
+    Inst* carried = nullptr;
+    auto* entry = fixture->block;
+    if (variant == 6u) {
+      auto* loop = fixture->AddBlock();
+      auto* exit = fixture->AddBlock();
+      entry->AddBranch(loop);
+      entry->terminator = {.kind = CFG::TerminatorKind::Branch,
+                           .true_block = loop};
+      loop->AddBranch(loop);
+      loop->AddBranch(exit);
+      loop->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                          .true_block = loop, .false_block = exit};
+      exit->terminator.kind = CFG::TerminatorKind::Return;
+      fixture->block = loop;
+      carried = &loop->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    }
+    const auto active = fixture->Emit(ValueOpcode::INotEqual32,
+        {fixture->Emit(ValueOpcode::LaneId), Value(0u)});
+    MemoryInfo key_memory;
+    key_memory.kind = ResourceKind::Buffer;
+    key_memory.offen = true;
+    auto key = fixture->Emit(ValueOpcode::LoadBufferU32,
+        {keys, Value(0u), fixture->Emit(ValueOpcode::LaneId), Value(0u), Value(true)},
+        fixture->AddMemory(key_memory, 0x100u));
+    if (carried != nullptr) {
+      carried->AddPhiOperand(entry, Value(0u));
+      carried->AddPhiOperand(fixture->block,
+          fixture->Emit(ValueOpcode::SelectU32, {active, key, Value(carried)}));
+      fixture->block->condition = active;
+      key = Value(carried);
+    }
+    const auto unbounded_key = key;
+    if (variant != 1u)
+      key = fixture->Emit(ValueOpcode::ShiftRightLogical32, {key, Value(variant == 4u ? 15u : 16u)});
+    if (variant == 5u || variant == 6u)
+      key = fixture->Emit(ValueOpcode::SelectU32,
+          {active, key, variant == 5u ? unbounded_key : Value(0u)});
+    key = fixture->Emit(ValueOpcode::ReadLane, {key, Value(0u)});
+    const auto offset = fixture->Emit(ValueOpcode::IMul32, {key, Value(592u)});
+    std::array<Value, 2> pointer;
+    for (uint32_t word = 0; word < 2u; ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarBuffer;
+      memory.offset = word * (variant == 2u ? 8u : 4u);
+      pointer[word] = fixture->Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+                                    fixture->AddMemory(memory, 0x1f4u));
+    }
+    const auto address = fixture->Address(pointer[0], pointer[1]);
+    const auto load = [&](uint32_t first, uint32_t width) {
+      if (width == 8u && variant >= 7u && variant <= 9u)
+        first = variant == 7u ? 0x4000u : variant == 8u ? 0x3ff0u : 0x3fe0u;
+      if (width == 4u && variant >= 9u) first = variant == 9u ? 0x3ff0u : 0x4000u;
+      std::array<Value, 8> words;
+      for (uint32_t word = 0; word < width; ++word) {
+        MemoryInfo memory;
+        memory.kind = ResourceKind::ScalarAddress;
+        memory.offset = first + word * 4u;
+        if (variant == 3u && width == 8u && word == 7u) memory.offset += 4u;
+        words[word] = fixture->Emit(ValueOpcode::LoadAddressU32,
+            {address, Value(0u), Value(0u), Value(true)},
+            fixture->AddMemory(memory, first == 0x3d0u ? 0x1110u : 0x1118u));
+      }
+      return words;
+    };
+    const auto image = fixture->Image(load(0x3d0u, 8u));
+    const auto sampler_words = load(0x3f8u, 4u);
+    const auto sampler = fixture->Sampler(
+        {sampler_words[0], sampler_words[1], sampler_words[2], sampler_words[3]});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture->Emit(ValueOpcode::ImageSampleRaw,
+        {image, sampler, fixture->ImageAddress(), variant == 5u ? active : Value(true)},
+        fixture->AddMemory(memory, 0x1128u));
+    return fixture;
+  };
+  auto fixture = make();
+  fixture->PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  Check(plan.info.images.size() == 1u && plan.info.samplers.size() == 1u,
+        "nested pointer descriptors were expanded before their runtime table was available");
+  for (const auto source : {plan.info.images[0].source, plan.info.samplers[0].source}) {
+    const auto& descriptor = plan.descriptor_sources[source];
+    const auto& indirect = descriptor.indirect_descriptor;
+    Check(indirect && !indirect->selector && indirect->pointer_table &&
+              indirect->pointer_table->maximum == 65535u && indirect->table_stride == 592u &&
+              indirect->pointer_table->offset == (descriptor.dword_count == 8u ? 0x3d0u : 0x3f8u),
+          "nested pointer descriptors lost their row geometry or captured the GPU selector payload");
+  }
+
+  constexpr uint32_t table = 0x2000u, objects = 0x4000u, stride = 592u, count = 6u;
+  LinearTestMemory memory;
+  memory.words.resize((objects + count * 0x430u - memory.base) / 4u);
+  memory.fail_address = 0x1800u; // The GPU selector's contents are unavailable to the CPU.
+  const auto at = [&](uint32_t address) { return memory.words.begin() + (address - memory.base) / 4u; };
+  for (uint32_t row = 0; row < count; ++row) {
+    const auto object = objects + row * 0x430u;
+    *at(table + row * stride) = object;
+    const std::array<uint32_t, 8> image{10u + row,
+        uint32_t(Libs::Graphics::Prospero::BufferFormat::k32Float) << 20u, 0u,
+        Libs::Graphics::DstSel(4, 0, 0, 1) | (9u << 28u), 0u, 0u, 0u, 0u};
+    std::copy(image.begin(), image.end(), at(object + 0x3d0u));
+    const std::array<uint32_t, 4> sampler{row, 0x00fff000u, 0u, 0u};
+    std::copy(sampler.begin(), sampler.end(), at(object + 0x3f8u));
+  }
+  std::array<uint32_t, 8> user_data{table, stride << 16u, count, 0x5204u,
+                                 0x1800u, 0u, 4u, 0x30005204u};
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                           .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == count + 1u && snapshot.samplers.size() == count + 1u,
+        "bounded nested pointer table lost image/sampler candidates or read the GPU selector");
+  for (uint32_t row = 0; row < count; ++row)
+    Check(snapshot.images[row + 1u].dwords[0] == 10u + row &&
+              snapshot.samplers[row + 1u].dwords[0] == row,
+          "nested pointer table mixed rows or pointee members");
+  const auto populated = specialization;
+  const auto reads = memory.reads;
+  user_data[2] = 0u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 1u && snapshot.samplers.size() == 1u &&
+            memory.reads == reads && specialization != populated,
+        "empty nested pointer table retained candidates or read an unavailable row");
+  user_data[2] = count;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            specialization == populated,
+        "empty-to-positive pointer table refresh did not restore its specialization");
+  *at(table) = objects + 0x430u;
+  *at(objects + 0x430u + 0x3d0u) = 42u;
+  *at(objects + 0x430u + 0x3f8u) = 7u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == count && snapshot.samplers.size() == count &&
+            snapshot.images[1].dwords[0] == 42u && snapshot.samplers[1].dwords[0] == 7u,
+        "nested descriptor refresh retained stale pointers or failed to deduplicate new pointees");
+  *at(table) = objects;
+
+  // A final low DWORD is in bounds; the high pointer DWORD is independently zero-filled.
+  user_data[1] = 1u << 16u;
+  user_data[2] = count * stride + 4u;
+  memory.watched_address = table + count * stride;
+  *at(static_cast<uint32_t>(memory.watched_address)) = objects;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            memory.watched_reads != 0u && memory.watched_dwords == 1u &&
+            snapshot.images.size() == count + 1u && snapshot.samplers.size() == count + 1u,
+        "partial pointer row was skipped or read beyond its scalar buffer bounds");
+  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  Check(snapshot.flattened_srt[mapping] == count + 1u &&
+            snapshot.flattened_srt[mapping + count + 1u] == 1u,
+        "partial pointer row lost its low-word pointee or dense key mapping");
+  user_data[1] = stride << 16u;
+  user_data[2] = count;
+  memory.fail_address = objects + 0x3d0u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "failed nested image pointee read was treated as a null descriptor");
+  memory.fail_address = 0x1800u;
+  *at(table) = 0u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "unreadable null pointer row bypassed the strict pointee reader");
+  *at(table) = objects;
+
+  auto capped = make(4u);
+  capped->PlanAndTrack();
+  const auto capped_plan = ExtractResourcePlan(capped->program);
+  user_data[2] = 65537u;
+  const auto before_cap = memory.reads;
+  Check(!MaterializeResources(capped_plan, runtime, snapshot, specialization) &&
+            memory.reads == before_cap,
+        "oversized nested pointer table performed reads before enforcing its candidate cap");
+  user_data[2] = count;
+  auto cyclic = make(6u);
+  cyclic->PlanAndTrack();
+  Check(MaterializeResources(ExtractResourcePlan(cyclic->program), runtime, snapshot, specialization),
+        "context-free shift bound rejected a cyclic source or a bounded Select arm");
+  auto boundary = make(9u);
+  boundary->PlanAndTrack(); // Both descriptor spans end exactly at the unmappable first-page boundary.
+  for (const uint32_t variant : {1u, 2u, 3u, 5u, 7u, 8u, 10u}) {
+    auto invalid = make(variant);
+    CheckFatal([&] { invalid->PlanAndTrack(); }, "not a valid runtime value",
+        "nested pointer planning accepted wrapping keys, mismatched words, lane-local bounds or mappable null-pointee bytes");
+  }
+}
+
 void TestGuardedDirectImageTable() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Guard {
@@ -6248,6 +6443,7 @@ int main() {
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
     Run("waterfall image table", TestWaterfallImageTable);
+    Run("nested pointer image table", TestNestedPointerImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
