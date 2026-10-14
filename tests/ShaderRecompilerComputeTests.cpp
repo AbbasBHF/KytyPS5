@@ -31393,39 +31393,87 @@ std::vector<TestCase> BufferLoadFormatD16XyzwCases() {
   return cases;
 }
 
-std::vector<TestCase> BufferStoreFormatD16XCases() {
+std::vector<TestCase> BufferStoreFormatD16Cases() {
   using F = Prospero::BufferFormat;
   using O = ShaderOpcode;
   struct StoreCase {
     const char *name;
     F format;
-    u32 input;
-    u32 expected;
+    std::array<u32, 2> input;
+    std::array<u32, 4> expected;
+    u32 words = 1;
+    bool wide = false;
   };
   constexpr StoreCase inputs[] = {
-      {"BufferStoreFormatD16XFloat16", F::k16Float, 0x7e63c000u, 0xffffc000u},
-      {"BufferStoreFormatD16XFloat32", F::k32Float, 0x7e633800u, 0x3f000000u},
-      {"BufferStoreFormatD16XUint32", F::k32UInt, 0x7e63fffeu, 0x0000fffeu},
-      {"BufferStoreFormatD16XSint32", F::k32SInt, 0x7e63fffeu, 0xfffffffeu},
-      {"BufferStoreFormatD16XUnorm8", F::k8UNorm, 0x7e633800u, 0xffffff80u},
-      {"BufferStoreFormatD16XSnorm16", F::k16SNorm, 0x7e63b800u, 0xffffc000u},
-      {"BufferStoreFormatD16XZeroFill", F::k16_16Float, 0x7e633800u, 0x00003800u},
+      {"BufferStoreFormatD16XFloat16", F::k16Float, {0x7e63c000u}, {0xffffc000u}},
+      {"BufferStoreFormatD16XFloat32", F::k32Float, {0x7e633800u}, {0x3f000000u}},
+      {"BufferStoreFormatD16XUint32", F::k32UInt, {0x7e63fffeu}, {0x0000fffeu}},
+      {"BufferStoreFormatD16XSint32", F::k32SInt, {0x7e63fffeu}, {0xfffffffeu}},
+      {"BufferStoreFormatD16XUnorm8", F::k8UNorm, {0x7e633800u}, {0xffffff80u}},
+      {"BufferStoreFormatD16XSnorm16", F::k16SNorm, {0x7e63b800u}, {0xffffc000u}},
+      {"BufferStoreFormatD16XZeroFill", F::k16_16Float, {0x7e633800u}, {0x00003800u}},
+      {"BufferStoreFormatD16XyzwFloat16", F::k16_16_16_16Float,
+       {0xc0003c00u, 0x34003800u}, {0xc0003c00u, 0x34003800u}, 2, true},
+      {"BufferStoreFormatD16XyzwFloat32", F::k32_32_32_32Float,
+       {0xc0003c00u, 0x34003800u}, {0x3f800000u, 0xc0000000u, 0x3f000000u, 0x3e800000u}, 4, true},
+      {"BufferStoreFormatD16XyzwUint32", F::k32_32_32_32UInt,
+       {0xffff0001u, 0x80007fffu}, {1u, 0xffffu, 0x7fffu, 0x8000u}, 4, true},
+      {"BufferStoreFormatD16XyzwSint32", F::k32_32_32_32SInt,
+       {0x8000ffffu, 0x7fff0001u}, {0xffffffffu, 0xffff8000u, 1u, 0x7fffu}, 4, true},
+      {"BufferStoreFormatD16XyzwSint8", F::k8_8_8_8SInt,
+       {0xff80ff7fu, 0x0080007fu}, {0x7f7f8080u}, 1, true},
+      {"BufferStoreFormatD16XyzwUnorm8", F::k8_8_8_8UNorm,
+       {0x3800c000u, 0x40003c00u}, {0xffff8000u}, 1, true},
   };
   std::vector<TestCase> cases;
-  for (const auto &input : inputs) {
+  for (const auto &input : inputs)
+  for (const u32 wave : {32u, 64u}) {
+    if (!input.wide && wave == 64u) continue;
     TestCase test;
     test.name = input.name;
-    AppendVMovLiteral(&test.code, 66, input.input);
-    AppendVMovU32(&test.code, 65, 1);
-    // Match the captured CS824586f35db5c80d instruction at pc 0x484.
-    test.code.push_back(EncodeMubuf0(0x84u, 0, true, false));
-    test.code.push_back(EncodeMubuf1(66, 0, 65));
+    AppendVMovLiteral(&test.code, 66, input.input[0]);
+    if (input.wide) {
+      AppendVMovLiteral(&test.code, 67, input.input[1]);
+      test.code.push_back(EncodeVop2(0x25, 65, InlineU32(1), 0));
+      AppendSMovLiteral(&test.code, 126, 0x55555555u);
+      AppendSMovLiteral(&test.code, 127, wave == 64u ? 0x55555555u : 0u);
+    } else AppendVMovU32(&test.code, 65, 1);
+    const auto store = [&] {
+      // XYZW matches captured e21c6000/8002000e with v66:67/v65 and s0:3.
+      test.code.push_back(EncodeMubuf0(input.wide ? 0x87u : 0x84u, 0, true, false, input.wide));
+      test.code.push_back(EncodeMubuf1(66, 0, 65));
+    };
+    store();
+    if (input.wide) {
+      AppendVMovU32(&test.code, 65, wave + 1u);
+      store(); // Active lanes must not write beyond the descriptor range.
+      AppendVMovU32(&test.code, 65, 0u);
+      test.code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+      store(); // EXEC-zero must preserve the leading record.
+    }
     AppendEnd(&test.code);
-    test.initial = {0xdeadbeefu, 0xffffffffu, 0xcafef00du};
-    test.expected = {0xdeadbeefu, input.expected, 0xcafef00du};
-    test.user_data = MakeStructuredStorageBufferData(4, 3, false, BufferFormat(input.format));
+    if (input.wide) {
+      test.initial.assign((wave + 2u) * input.words, 0xdeadbeefu);
+      test.expected = test.initial;
+      for (u32 lane = 0; lane + 2u < wave; lane += 2u)
+        std::copy_n(input.expected.begin(), input.words,
+                    test.expected.begin() + (lane + 1u) * input.words);
+      test.storage_buffer_range_bytes = wave * input.words * 4u - 1u;
+      test.has_compute_info = true;
+      test.compute_info.wave_size = wave;
+      test.compute_info.threads_num[0] = wave;
+      test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+      test.compute_info.thread_ids_num = 1u;
+      test.required_spirv = {"Volatile"};
+    } else {
+      test.initial = {0xdeadbeefu, 0xffffffffu, 0xcafef00du};
+      test.expected = {0xdeadbeefu, input.expected[0], 0xcafef00du};
+    }
+    test.user_data = MakeStructuredStorageBufferData(input.words * 4u, input.wide ? wave : 3u,
+                                                    false, BufferFormat(input.format));
     test.has_user_data = true;
-    test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_D16_X, O::S_ENDPGM};
+    test.opcodes = {O::V_MOV_B32, input.wide ? O::BUFFER_STORE_FORMAT_D16_XYZW :
+                                            O::BUFFER_STORE_FORMAT_D16_X, O::S_ENDPGM};
     cases.push_back(std::move(test));
   }
   return cases;
@@ -40597,7 +40645,7 @@ std::vector<TestCase> MakeCases() {
   for (auto &test : BufferLoadFormatD16XyzwCases()) {
     cases.push_back(std::move(test));
   }
-  for (auto &test : BufferStoreFormatD16XCases()) {
+  for (auto &test : BufferStoreFormatD16Cases()) {
     cases.push_back(std::move(test));
   }
   for (auto &test : FormattedStoreConversionCases()) {
@@ -46271,7 +46319,7 @@ int main(int argc, char **argv) {
     for (const auto &test : BufferLoadFormatD16XyzwCases()) {
       RunCase(&vulkan, test);
     }
-    for (const auto &test : BufferStoreFormatD16XCases()) {
+    for (const auto &test : BufferStoreFormatD16Cases()) {
       RunCase(&vulkan, test);
     }
     for (const auto &test : FormattedStoreConversionCases()) {

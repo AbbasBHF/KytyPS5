@@ -15407,6 +15407,24 @@ void TestCapturedBufferLoadUbyteD16Decode() {
         "captured BUFFER_LOAD_UBYTE_D16 lost its preserved half, address, or coherence flags");
 }
 
+void TestCapturedBufferStoreD16XyzwDecode() {
+  namespace Decoder = ShaderRecompiler::Decoder;
+  const uint32_t code[] = {0xe21c6000u, 0x8002000eu};
+  Decoder::Instruction inst;
+  Decoder::DecodeInstruction(code, 0, inst);
+  Check(inst.opcode == Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZW &&
+            inst.word_count == 2 && inst.data_dwords == 2 && inst.data_bits == 16 &&
+            inst.data_components == 4 && inst.formatted && !inst.typed,
+        "captured D16 XYZW store lost its four components in two packed VGPRs");
+  Check(inst.dst.kind == Decoder::OperandKind::Vgpr && inst.dst.reg == 0 &&
+            inst.dst.sdwa_sel == 6 &&
+            inst.src0.kind == Decoder::OperandKind::Vgpr && inst.src0.reg == 14 &&
+            inst.src1.kind == Decoder::OperandKind::Sgpr && inst.src1.reg == 8 &&
+            inst.src2.kind == Decoder::OperandKind::IntegerInlineConstant && inst.src2.value == 0 &&
+            inst.idxen && !inst.offen && inst.offset == 0 && inst.glc && !inst.dlc && !inst.slc,
+        "captured D16 XYZW store lost its full source VGPRs, index, or coherence flags");
+}
+
 void TestNewShaderRecompilerUnsupportedMemoryDecode() {
   const uint32_t mubuf_unknown[] = {EncodeMubuf0(0x7b), EncodeMubuf1(0, 0, 1),
                                     0xbf810000u};
@@ -16092,6 +16110,7 @@ int main() {
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();
   TestCapturedBufferLoadUbyteD16Decode();
+  TestCapturedBufferStoreD16XyzwDecode();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
 
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
