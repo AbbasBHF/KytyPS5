@@ -4393,13 +4393,26 @@ void TestBoundedFormattedBufferStore() {
                "finite store accepted an unproved induction or indexed byte offset");
 }
 
-void TestBoundedBufferRecords() {
+std::unique_ptr<Fixture> MakeBufferRecordFixture(uint32_t step = 1u, bool bypass = false,
+                                                  bool gpu_selected = false, uint32_t bias = 0u,
+                                                  bool split_offsets = false) {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  namespace Prospero = Libs::Graphics::Prospero;
-  using Libs::Graphics::DstSel;
-  const auto make = [](uint32_t step = 1u, bool bypass = false) {
-    auto fixture = std::make_unique<Fixture>();
-    auto& f = *fixture;
+  auto fixture = std::make_unique<Fixture>();
+  auto& f = *fixture;
+  std::array<Value, 4> table_words;
+  for (uint32_t word = 0; word < 4u; ++word) table_words[word] = f.UserData(word);
+  const auto table = f.Buffer(table_words);
+  const auto lane = f.Emit(ValueOpcode::LaneId);
+  Value key;
+  if (gpu_selected) {
+    std::array<Value, 4> selector_words;
+    for (uint32_t word = 0; word < 4u; ++word) selector_words[word] = f.UserData(4u + word);
+    const auto group = f.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)});
+    key = f.Emit(ValueOpcode::ReadConstBuffer,
+        {f.Buffer(selector_words), f.Emit(ValueOpcode::IMul32, {group, Value(12u)})},
+        f.AddMemory({.kind = ResourceKind::ScalarBuffer}, 0x1bcu));
+  } else {
     auto* entry = f.block;
     auto* header = f.AddBlock();
     auto* body = f.AddBlock();
@@ -4417,46 +4430,52 @@ void TestBoundedBufferRecords() {
     header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
                          .true_block = body, .false_block = bypass ? latch : exit};
     exit->terminator.kind = CFG::TerminatorKind::Return;
-    std::array<Value, 4> table_words;
-    for (uint32_t word = 0; word < 4u; ++word) table_words[word] = f.UserData(word);
-    const auto table = f.Buffer(table_words);
     const auto count = f.Emit(ValueOpcode::LoadAddressU32,
         {f.Address(f.UserData(4u), f.UserData(5u)), Value(0u), Value(0u), Value(true)},
         f.AddMemory({.kind = ResourceKind::ScalarAddress}, 0x424u));
-    const auto lane = f.Emit(ValueOpcode::LaneId);
     auto& phi = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
     phi.AddPhiOperand(entry, Value(0u));
     phi.AddPhiOperand(latch, f.Emit(ValueOpcode::IAdd32, {Value(&phi), Value(step)}, 0, latch));
     header->condition = f.Emit(ValueOpcode::SLessThan32, {Value(&phi), count}, 0, header);
     f.block = body;
-    const auto offset = f.Emit(ValueOpcode::IMul32, {Value(&phi), Value(192u)});
-    for (const bool formatted : {true, false}) {
-      std::array<Value, 4> words;
-      for (uint32_t word = 0; word < 4u; ++word)
-        words[word] = f.Emit(ValueOpcode::ReadConstBuffer, {table, offset},
-            f.AddMemory({.kind = ResourceKind::ScalarBuffer,
-                         .offset = (formatted ? 160u : 176u) + word * 4u,
-                         .component_index = word, .component_count = 4u}, 0x1808u));
-      for (uint32_t use = 0; use < (formatted ? 112u : 16u); ++use) {
-        const auto handle = f.Buffer(words);
-        if (formatted) {
-          const auto loaded = f.Emit(ValueOpcode::LoadBufferU32x2,
-              {handle, lane, Value(0u), Value(0u), Value(true)},
-              f.AddMemory({.kind = ResourceKind::Buffer, .data_dwords = 2u, .data_bits = 16u,
-                           .component_count = 4u, .formatted = true, .idxen = true}, 0x1914u));
-          f.Emit(ValueOpcode::ReferenceU32,
-              {f.Emit(ValueOpcode::CompositeExtractU32x2, {loaded, Value(0u)})});
-        } else {
-          f.Emit(ValueOpcode::StoreBufferU8,
-              {handle, lane, Value(0u), Value(0u), Value(uint8_t{42u}), Value(true)},
-              f.AddMemory({.kind = ResourceKind::Buffer, .data_bits = 8u, .idxen = true}, 0x190cu));
-        }
+    key = Value(&phi);
+  }
+  auto offset = f.Emit(ValueOpcode::IMul32, {key, Value(192u)});
+  if (bias != 0u) offset = f.Emit(ValueOpcode::IAdd32, {offset, Value(bias)});
+  for (const bool formatted : {true, false}) {
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < 4u; ++word) {
+      const auto dynamic = split_offsets
+          ? f.Emit(ValueOpcode::IAdd32, {offset, Value(word * 4u)}) : offset;
+      words[word] = f.Emit(ValueOpcode::ReadConstBuffer, {table, dynamic},
+          f.AddMemory({.kind = ResourceKind::ScalarBuffer,
+                       .offset = (formatted ? 160u : 176u) + (split_offsets ? 0u : word * 4u),
+                       .component_index = word, .component_count = 4u}, 0x1808u));
+    }
+    for (uint32_t use = 0; use < (gpu_selected ? 2u : formatted ? 112u : 16u); ++use) {
+      const auto handle = f.Buffer(words);
+      if (formatted) {
+        const auto loaded = f.Emit(ValueOpcode::LoadBufferU32x2,
+            {handle, lane, Value(0u), Value(0u), Value(true)},
+            f.AddMemory({.kind = ResourceKind::Buffer, .data_dwords = 2u, .data_bits = 16u,
+                         .component_count = 4u, .formatted = true, .idxen = true}, 0x1914u));
+        f.Emit(ValueOpcode::ReferenceU32,
+            {f.Emit(ValueOpcode::CompositeExtractU32x2, {loaded, Value(0u)})});
+      } else {
+        f.Emit(ValueOpcode::StoreBufferU8,
+            {handle, lane, Value(0u), Value(0u), Value(uint8_t{42u}), Value(true)},
+            f.AddMemory({.kind = ResourceKind::Buffer, .data_bits = 8u, .idxen = true}, 0x190cu));
       }
     }
-    f.PlanAndTrack();
-    return fixture;
-  };
-  auto fixture = make();
+  }
+  f.PlanAndTrack();
+  return fixture;
+}
+
+void TestBoundedBufferRecords() {
+  namespace Prospero = Libs::Graphics::Prospero;
+  using Libs::Graphics::DstSel;
+  auto fixture = MakeBufferRecordFixture();
   const auto plan = ExtractResourcePlan(fixture->program);
   Check(plan.info.buffers.size() == 2u, "record descriptors did not share their resource roots");
   uint32_t selections = 0u;
@@ -4557,9 +4576,129 @@ void TestBoundedBufferRecords() {
   }
   memory.words[0] = MaxIndirectDescriptorProbes + 1u;
   Check(!materialize(), "record table accepted an unbounded candidate count");
-  for (const auto [step, bypass] : {std::pair{2u, false}, std::pair{1u, true}})
-    CheckFatal([&] { make(step, bypass); }, "not a valid runtime value",
-               "record table accepted an unproved loop bound");
+  for (const auto [step, bypass] : {std::pair{2u, false}, std::pair{1u, true}}) {
+    const auto unbounded = MakeBufferRecordFixture(step, bypass);
+    for (const auto& buffer : unbounded->program.info.buffers) {
+      const auto& source = unbounded->program.descriptor_sources[buffer.source];
+      if (source.indirect_descriptor)
+        Check(source.indirect_descriptor->table_scalar && source.indirect_descriptor->key_count.IsEmpty(),
+              "unproved loop did not use the bounded descriptor table");
+    }
+  }
+}
+
+void TestGpuSelectedBufferRecords() {
+  namespace Prospero = Libs::Graphics::Prospero;
+  using Libs::Graphics::DstSel;
+  for (const uint32_t bias : {0u, 7u}) {
+    auto fixture = MakeBufferRecordFixture(1u, false, true, bias);
+    const auto plan = ExtractResourcePlan(fixture->program);
+    std::vector<uint32_t> roots;
+    std::vector<const Inst*> selections(plan.info.buffers.size());
+    for (uint32_t resource = 0; resource < plan.info.buffers.size(); ++resource) {
+      const auto& source = plan.descriptor_sources[plan.info.buffers[resource].source];
+      if (!source.indirect_descriptor) continue;
+      const auto& indirect = *source.indirect_descriptor;
+      Check(indirect.table_scalar && indirect.table_stride == 192u &&
+                indirect.table_offset == bias && indirect.key_count.IsEmpty() && !indirect.selector,
+            "GPU record selector became a CPU key-list read or lost its affine geometry");
+      roots.push_back(resource);
+    }
+    Check(roots.size() == 2u, "GPU record accesses lost their two descriptor roots");
+    uint32_t selection_count = 0;
+    for (const auto* block : fixture->program.blocks)
+      for (const auto& inst : *block)
+        if (inst.GetOpcode() == ValueOpcode::GetBufferResourceIndex) {
+          selections[inst.Flags<uint32_t>()] = &inst;
+          ++selection_count;
+        }
+    Check(selection_count == 2u, "GPU descriptor uses duplicated mapping searches");
+    const auto evaluate_key = [&](auto&& self, Value value, uint32_t key) -> uint32_t {
+      value = value.Resolve();
+      if (value.IsImmediate()) return value.U32();
+      const auto& inst = *value.Instruction();
+      if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer) return key;
+      const auto a = self(self, inst.Arg(0), key);
+      const auto b = self(self, inst.Arg(1), key);
+      switch (inst.GetOpcode()) {
+        case ValueOpcode::IMul32: return a * b;
+        case ValueOpcode::IAdd32: return a + b;
+        case ValueOpcode::ShiftRightLogical32: return a >> b;
+        default: throw std::runtime_error("unexpected GPU descriptor key expression");
+      }
+    };
+    LinearTestMemory memory;
+    constexpr uint32_t table_offset = 256u;
+    memory.fail_address = memory.base + 0x2000u;
+    const auto aligned_bias = bias & ~3u;
+    for (uint32_t slot = 0; slot < 4u; ++slot) {
+      for (uint32_t member = 0; member < 2u; ++member) {
+        const auto first = (table_offset + aligned_bias + 160u + member * 16u + slot * 64u) / 4u;
+        memory.words[first] = 0x100000u + member * 0x10000u + slot * 0x1000u;
+        memory.words[first + 1u] = (member == 0u ? 8u : 3u) << 16u;
+        memory.words[first + 2u] = 16u;
+        memory.words[first + 3u] = member == 0u
+            ? (static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16Float) << 12u) |
+                  DstSel(4, 5, 6, 1) : 0x5204u;
+      }
+    }
+    // SMEM aligns the base and dynamic offset independently; its V# format is ignored.
+    std::array<uint32_t, 8> user_data{uint32_t(memory.base) + table_offset + 3u, 0u, 0u, 0u,
+        uint32_t(memory.fail_address), 12u << 16u, 129600u, 0x5204u};
+    SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+        .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const auto materialize = [&] { return MaterializeResources(plan, runtime, snapshot, specialization); };
+    for (const uint32_t size : {0u, 384u + aligned_bias, 0u, 384u + aligned_bias}) {
+      user_data[2] = size;
+      memory.reads = 0u;
+      Check(materialize() && memory.reads == (size == 0u ? 0u : 8u) &&
+                snapshot.buffers.size() == plan.info.buffers.size() + (size == 0u ? 0u : 8u),
+            "affine table refresh read GPU selector bytes, unrelated fields or stale candidates");
+    }
+    for (uint32_t member = 0; member < 2u; ++member) {
+      const auto root = roots[member];
+      const auto mapping = specialization.buffers[root].indirect_mapping_offset;
+      Check(specialization.buffers[root].indirect_search_iterations == 0u &&
+                snapshot.flattened_srt[mapping] == 4u,
+            "affine descriptor table lost its compact dense mapping");
+      // These keys land at byte offsets 0,64,128,192 after U32 multiplication by192.
+      for (const auto [key, slot] : {std::pair{0u, 0u}, std::pair{44739243u, 1u},
+                                    std::pair{22369622u, 2u}, std::pair{1u, 3u}}) {
+        const auto index = evaluate_key(evaluate_key, selections[root]->Arg(0), key) >> 2u;
+        Check(index == slot && snapshot.flattened_srt[mapping + 1u + index] == slot + 1u,
+              "wrapped GPU record key selected the wrong physical descriptor");
+        const auto candidate = plan.info.buffers.size() + member * 4u + slot;
+        Check(snapshot.buffers[candidate].dwords[0] == 0x100000u + member * 0x10000u + slot * 0x1000u,
+              "affine table read a stride192 row instead of a reachable stride64 member");
+        Check(std::ranges::find(snapshot.specialization_reads,
+                  std::pair{memory.base + table_offset + aligned_bias + 160u + member * 16u + slot * 64u,
+                            uint64_t{16u}}) != snapshot.specialization_reads.end(),
+              "affine descriptor read escaped writable-alias capture");
+      }
+    }
+    // The trailing V# has only three readable DWORDs; its missing format word is zero.
+    const auto tail = (table_offset + aligned_bias + 416u) / 4u;
+    memory.words[tail] = 0x300000u;
+    memory.words[tail + 1u] = 8u << 16u;
+    memory.words[tail + 2u] = 16u;
+    memory.words[tail + 3u] = 0x5204u;
+    user_data[2] = 428u + aligned_bias;
+    memory.reads = 0u;
+    Check(materialize() && memory.reads == 9u &&
+              snapshot.buffers.size() == plan.info.buffers.size() + 8u &&
+              std::ranges::find(snapshot.specialization_reads,
+                  std::pair{memory.base + table_offset + aligned_bias + 416u, uint64_t{12u}}) !=
+                  snapshot.specialization_reads.end(),
+          "partial descriptor did not zero-fill and capture only in-bounds DWORDs");
+    user_data[2] = aligned_bias + 160u + MaxIndirectDescriptorProbes * 64u + 4u;
+    memory.reads = 0u;
+    Check(!materialize() && memory.reads == 0u,
+          "oversized affine table was read before its candidate cap was checked");
+  }
+  CheckFatal([] { MakeBufferRecordFixture(1u, false, true, 0u, true); },
+             "not a valid runtime value", "split dynamic descriptor offsets lost independent U32 wrapping");
 }
 
 void TestFiniteBufferSelection() {
@@ -6058,6 +6197,7 @@ int main() {
     Run("writable descriptor phi", TestWritableDescriptorPhi);
     Run("bounded formatted buffer store", TestBoundedFormattedBufferStore);
     Run("bounded buffer records", TestBoundedBufferRecords);
+    Run("GPU-selected buffer records", TestGpuSelectedBufferRecords);
     Run("finite buffer selection", TestFiniteBufferSelection);
     Run("packed scalar buffer selection", TestPackedScalarBufferSelection);
     Run("conditional sampler phi", TestConditionalSamplerPhi);

@@ -36766,6 +36766,105 @@ void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", "BoundedRecordBufferAccess");
 }
 
+void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
+  const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
+                            .limits.minStorageBufferOffsetAlignment;
+  const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
+  constexpr u32 selectors = 256u, table = 512u;
+  // Multiplication by 192 wraps: these keys reach congruence slots 1,4,0,3,2,1,OOB,7,5.
+  constexpr std::array keys{0u, 1u, 0x15555555u, 0x15555556u, 0x2aaaaaabu,
+                            0x40000000u, UINT32_MAX, 2u, 0x2aaaaaacu};
+  for (const u32 wave : {32u, 64u}) {
+    for (const u32 table_bytes : {0u, 536u, 544u}) {
+      TestCase test;
+      test.name = wave == 32u ? "GpuSelectedRecordBufferAccess32" : "GpuSelectedRecordBufferAccess64";
+      test.initial.assign((slot * 13u + keys.size() * wave * 8u) / 4u, 0xdeadbeefu);
+      test.has_user_data = test.has_compute_info = true;
+      const std::array<u32, 8> descriptors{selectors, 12u << 16u, keys.size(), 0x5204u,
+                                           table, 0u, table_bytes, 0x5204u};
+      std::copy(descriptors.begin(), descriptors.end(), test.user_data.begin());
+      const std::array<u32, 4> output{slot * 13u, 8u << 16u, u32(keys.size()) * wave, 0x5204u};
+      std::copy(output.begin(), output.end(), test.user_data.begin() + 16u);
+      test.compute_info.wave_size = wave;
+      test.compute_info.threads_num[0] = wave;
+      test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+      test.compute_info.thread_ids_num = 1;
+      test.compute_info.group_id[0] = true;
+      test.compute_info.workgroup_register = 24u;
+      test.compute_info.lds_size_dwords = 0;
+      test.dispatch_x = keys.size();
+      auto &code = test.code;
+      code.insert(code.end(), {EncodeSop2(0x26, 32, 24, InlineU32(12)),
+          EncodeSmem0(0x08, 32, 0), EncodeSmem1(0u, 32), EncodeSopp(0x0c, 0),
+          EncodeSop2(0x26, 33, 32, 255), 192u,
+          EncodeSop2(0x02, 33, 33, 255), 96u,
+          EncodeSmem0(0x0a, 8, 2), EncodeSmem1(160u, 33),
+          EncodeSmem0(0x0a, 12, 2), EncodeSmem1(176u, 33), EncodeSopp(0x0c, 0),
+          EncodeMubuf0(0x83, 0, true, false), EncodeMubuf1(4, 2, 0),
+          EncodeSopp(0x0c, 0), EncodeSop2(0x1e, 34, 24, InlineU32(std::countr_zero(wave))),
+          EncodeVop2(0x25, 20, 34, 0),
+          EncodeMubuf0(0x1d, 0, true, false), EncodeMubuf1(4, 4, 20)});
+      AppendVMovLiteral(&code, 10, 0xa5c39b72u);
+      AppendSMovLiteral(&code, 126, 0x55555555u);
+      AppendSMovLiteral(&code, 127, wave == 64u ? 0x55555555u : 0u);
+      code.insert(code.end(), {EncodeMubuf0(0x19, 0, true, false, true), EncodeMubuf1(10, 3, 20)});
+      AppendEnd(&code);
+      for (u32 row = 0; row < 6u; ++row) {
+        const std::array<u32, 8> record{slot * (row + 1u), 8u << 16u, 1u,
+            static_cast<u32>(Prospero::BufferFormat::k16_16_16_16Float) << 12u | DstSel(4, 5, 6, 7),
+            slot * (row + 7u), 1u << 16u, u32(keys.size()) * wave, 0x5204u};
+        std::copy(record.begin(), record.end(), test.initial.begin() + (table + 192u + row * 64u) / 4u);
+        test.initial[slot * (row + 1u) / 4u] = ((0x3800u + row) << 16u) | (0x3c00u + row);
+        test.initial[slot * (row + 1u) / 4u + 1u] = ((0xc000u + row) << 16u) | (0x4000u + row);
+      }
+      // Compile against poison selectors. A separate GPU dispatch writes the actual keys.
+      auto compiled = CompileCase(test, vulkan.SubgroupSize());
+      for (const auto &descriptor : compiled.resources.buffers) {
+        ShaderBufferResource resource{};
+        std::copy_n(descriptor.dwords.begin(), 4u, resource.fields);
+        test.storage_buffer_ranges.emplace_back(resource.Base48(), std::max(4u, u32(resource.GetSize())));
+      }
+      TestCase producer;
+      producer.name = "GpuRecordSelectorProducer";
+      producer.initial = test.initial;
+      producer.has_compute_info = true;
+      producer.compute_info.threads_num[0] = producer.compute_info.threads_num[1] =
+          producer.compute_info.threads_num[2] = 1u;
+      producer.compute_info.wave_size = 32u;
+      producer.compute_info.lds_size_dwords = 0;
+      for (u32 group = 0; group < keys.size(); ++group) {
+        AppendVMovLiteral(&producer.code, 1, keys[group]);
+        AppendVMovLiteral(&producer.code, 2, selectors + group * 12u);
+        AppendBufferStoreDword(&producer.code, 1, 2);
+      }
+      AppendEnd(&producer.code);
+      const auto producer_shader = CompileCase(producer, vulkan.SubgroupSize());
+      test.expected = test.initial;
+      auto bytes = std::as_writable_bytes(std::span(test.expected));
+      for (u32 group = 0; group < keys.size(); ++group) {
+        test.expected[selectors / 4u + group * 3u] = keys[group];
+        const u32 dynamic = keys[group] * 192u + 96u;
+        const u32 row = dynamic / 64u;
+        for (u32 lane = 0; lane < wave; ++lane) {
+          const u32 out = slot * 13u / 4u + (group * wave + lane) * 2u;
+          const bool source = uint64_t{dynamic} + 160u + 16u <= table_bytes && lane == 0u;
+          test.expected[out] = source ? test.initial[slot * (row + 1u) / 4u] : 0u;
+          test.expected[out + 1u] = source ? test.initial[slot * (row + 1u) / 4u + 1u] : 0u;
+          if (uint64_t{dynamic} + 176u + 16u <= table_bytes && (lane & 1u) == 0u)
+            bytes[slot * (row + 7u) + group * wave + lane] = std::byte{0xc3};
+        }
+      }
+      auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+      vulkan.Dispatch(producer, producer_shader, buffer);
+      vulkan.Dispatch(test, compiled, buffer);
+      CompareWords(test, "GPU selectors, wrapped offsets, partial descriptors, OOB and masked byte stores",
+                   test.expected, vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
+      vulkan.DestroyBuffer(&buffer);
+    }
+  }
+  std::printf("[compute] %-32s ok\n", "GpuSelectedRecordBufferAccess");
+}
+
 void CheckFiniteBufferSelection(VulkanHarness &vulkan) {
   for (const u32 wave : {32u, 64u}) {
     TestCase test;
@@ -45574,6 +45673,7 @@ int main(int argc, char **argv) {
     CheckFiniteBufferSelection(vulkan);
     CheckIndirectBufferStore(vulkan);
     CheckBoundedRecordBufferAccess(vulkan);
+    CheckGpuSelectedRecordBufferAccess(vulkan);
     CheckRuntimeBufferRecords(vulkan);
     RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadDwordGpuSelectedDescriptors());
@@ -46278,6 +46378,7 @@ int main(int argc, char **argv) {
   CheckBoundedFormattedBufferCopy(vulkan);
   CheckIndirectBufferStore(vulkan);
   CheckBoundedRecordBufferAccess(vulkan);
+  CheckGpuSelectedRecordBufferAccess(vulkan);
   CheckFiniteBufferSelection(vulkan);
   CheckRuntimeBufferRecords(vulkan);
   CheckComputeThreadDimensions(vulkan);
