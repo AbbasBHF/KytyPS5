@@ -60,6 +60,15 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 	return descriptor.dwords[0] == 0 && (descriptor.dwords[1] & 0xffu) == 0;
 }
 
+bool NullBufferDescriptor(Value value) {
+	const auto* handle = value.Resolve().TryInstruction();
+	if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+	    handle->NumArgs() != 4u) return false;
+	for (size_t index = 0; index < 4u; ++index)
+		if (handle->Arg(index).Resolve() != Value(0u)) return false;
+	return true;
+}
+
 bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) {
 	const auto& words = descriptor.dwords;
 	// Reject texture descriptors with nonzero reserved bits.
@@ -1378,6 +1387,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		    base.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
 		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
+		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 	}
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
@@ -1543,6 +1553,17 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	}
 
 	auto& memory_info = program.memory_info;
+	// Resolve empty scalar-table words before folding the indirect descriptors that use them.
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			if (inst.GetOpcode() != ValueOpcode::ReadConstBuffer) continue;
+			const auto& memory = memory_info[inst.Flags<MemoryFlags>().index];
+			if (memory.kind == ResourceKind::ScalarBuffer &&
+			    specialization.buffers[memory.resource].scalar_empty &&
+			    buffers[memory.resource].indirect_root == BufferResource::NoIndirectBuffer)
+				inst.ReplaceUsesWith(Value(0u));
+		}
+	}
 	const ImageRemap image_remap(specialization);
 	for (auto* block: program.blocks) {
 		for (auto it = block->begin(); it != block->end(); ++it) {
@@ -1563,14 +1584,17 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			}
 			if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::Read) {
 				const auto& memory = memory_info[inst.Flags<MemoryFlags>().index];
-				if (memory.kind == ResourceKind::Buffer &&
+				const bool native_oob = memory.kind == ResourceKind::Buffer &&
 				    specialization.buffers[memory.resource].zero_stride_oob &&
-				    buffers[memory.resource].indirect_root == BufferResource::NoIndirectBuffer) {
+				    buffers[memory.resource].indirect_root == BufferResource::NoIndirectBuffer;
+				const bool null_indirect = memory.kind == ResourceKind::IndirectBuffer &&
+				    NullBufferDescriptor(inst.Arg(0));
+				if (native_oob || null_indirect) {
 					// Bounds mode 0 checks offset >= stride, so zero stride
-					// makes every vector read out of bounds regardless of its address.
+					// makes every vector read out of bounds. An all-zero V# is unbound.
 					const auto count = BufferComponentCount(inst.GetOpcode());
 					std::array<Value, 4> values {Value(0u), Value(0u), Value(0u), Value(0u)};
-					if (memory.formatted && !memory.typed) {
+					if (native_oob && memory.formatted && !memory.typed) {
 						const auto& buffer = buffers[memory.resource];
 						const auto format = Format::GetFormatInfo(buffer.descriptor_format);
 						const bool d16 = memory.data_bits == 16u;

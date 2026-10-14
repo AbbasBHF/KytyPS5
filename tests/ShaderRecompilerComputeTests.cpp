@@ -36778,12 +36778,12 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
     for (const u32 table_bytes : {0u, 536u, 544u}) {
       TestCase test;
       test.name = wave == 32u ? "GpuSelectedRecordBufferAccess32" : "GpuSelectedRecordBufferAccess64";
-      test.initial.assign((slot * 13u + keys.size() * wave * 8u) / 4u, 0xdeadbeefu);
+      test.initial.assign((slot * 13u + keys.size() * wave * 16u) / 4u, 0xdeadbeefu);
       test.has_user_data = test.has_compute_info = true;
       const std::array<u32, 8> descriptors{selectors, 12u << 16u, keys.size(), 0x5204u,
                                            table, 0u, table_bytes, 0x5204u};
       std::copy(descriptors.begin(), descriptors.end(), test.user_data.begin());
-      const std::array<u32, 4> output{slot * 13u, 8u << 16u, u32(keys.size()) * wave, 0x5204u};
+      const std::array<u32, 4> output{slot * 13u, 16u << 16u, u32(keys.size()) * wave, 0x5204u};
       std::copy(output.begin(), output.end(), test.user_data.begin() + 16u);
       test.compute_info.wave_size = wave;
       test.compute_info.threads_num[0] = wave;
@@ -36793,17 +36793,21 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
       test.compute_info.workgroup_register = 24u;
       test.compute_info.lds_size_dwords = 0;
       test.dispatch_x = keys.size();
+      test.bda_mappings = {{0u, 0u}};
       auto &code = test.code;
       code.insert(code.end(), {EncodeSop2(0x26, 32, 24, InlineU32(12)),
           EncodeSmem0(0x08, 32, 0), EncodeSmem1(0u, 32), EncodeSopp(0x0c, 0),
           EncodeSop2(0x26, 33, 32, 255), 192u,
           EncodeSop2(0x02, 33, 33, 255), 96u,
+          EncodeSmem0(0x0a, 36, 2), EncodeSmem1(144u, 33),
           EncodeSmem0(0x0a, 8, 2), EncodeSmem1(160u, 33),
           EncodeSmem0(0x0a, 12, 2), EncodeSmem1(176u, 33), EncodeSopp(0x0c, 0),
           EncodeMubuf0(0x83, 0, true, false), EncodeMubuf1(4, 2, 0),
+          EncodeMubuf0(0x0a, 0, true, false), EncodeMubuf1(6, 9, 0),
+          EncodeMubuf0(0x00, 0, true, false), EncodeMubuf1(7, 9, 0),
           EncodeSopp(0x0c, 0), EncodeSop2(0x1e, 34, 24, InlineU32(std::countr_zero(wave))),
           EncodeVop2(0x25, 20, 34, 0),
-          EncodeMubuf0(0x1d, 0, true, false), EncodeMubuf1(4, 4, 20)});
+          EncodeMubuf0(0x1e, 0, true, false), EncodeMubuf1(4, 4, 20)});
       AppendVMovLiteral(&code, 10, 0xa5c39b72u);
       AppendSMovLiteral(&code, 126, 0x55555555u);
       AppendSMovLiteral(&code, 127, wave == 64u ? 0x55555555u : 0u);
@@ -36814,11 +36818,30 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
             static_cast<u32>(Prospero::BufferFormat::k16_16_16_16Float) << 12u | DstSel(4, 5, 6, 7),
             slot * (row + 7u), 1u << 16u, u32(keys.size()) * wave, 0x5204u};
         std::copy(record.begin(), record.end(), test.initial.begin() + (table + 192u + row * 64u) / 4u);
+        // BDA loads use a separate tuple, as the captured shader's record members do.
+        std::copy_n(record.begin(), 4u, test.initial.begin() + (table + 176u + row * 64u) / 4u);
         test.initial[slot * (row + 1u) / 4u] = ((0x3800u + row) << 16u) | (0x3c00u + row);
         test.initial[slot * (row + 1u) / 4u + 1u] = ((0xc000u + row) << 16u) | (0x4000u + row);
       }
       // Compile against poison selectors. A separate GPU dispatch writes the actual keys.
       auto compiled = CompileCase(test, vulkan.SubgroupSize());
+      if (table_bytes == 0u)
+        test.forbidden_spirv = {"convert_indirect_buffer_format"};
+      else
+        test.required_spirv = {"get_bda_pointer", "convert_indirect_buffer_format"};
+      CheckSpirvEmission(test, compiled.spirv);
+      u32 bda_function = 0, bda_calls = 0;
+      for (size_t offset = 5; offset < compiled.spirv.size();) {
+        const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
+        const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+        if (opcode == spv::OpName &&
+            std::string_view(reinterpret_cast<const char *>(words.data() + 2)) == "get_bda_pointer")
+          bda_function = words[1];
+        if (opcode == spv::OpFunctionCall && words[3] == bda_function) ++bda_calls;
+        offset += words.size();
+      }
+      Require(test.name, "empty descriptor table specialization", (bda_calls == 0u) == (table_bytes == 0u),
+              "empty table retained BDA reads or nonempty table lost GPU descriptor loads");
       for (const auto &descriptor : compiled.resources.buffers) {
         ShaderBufferResource resource{};
         std::copy_n(descriptor.dwords.begin(), 4u, resource.fields);
@@ -36846,15 +36869,18 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
         const u32 dynamic = keys[group] * 192u + 96u;
         const u32 row = dynamic / 64u;
         for (u32 lane = 0; lane < wave; ++lane) {
-          const u32 out = slot * 13u / 4u + (group * wave + lane) * 2u;
+          const u32 out = slot * 13u / 4u + (group * wave + lane) * 4u;
           const bool source = uint64_t{dynamic} + 160u + 16u <= table_bytes && lane == 0u;
           test.expected[out] = source ? test.initial[slot * (row + 1u) / 4u] : 0u;
           test.expected[out + 1u] = source ? test.initial[slot * (row + 1u) / 4u + 1u] : 0u;
+          const bool bda_source = uint64_t{dynamic} + 144u + 16u <= table_bytes && lane == 0u;
+          test.expected[out + 2u] = bda_source ? 0x3c00u + row : 0u;
+          test.expected[out + 3u] = bda_source ? 0x3f800000u + (row << 13u) : 0u;
           if (uint64_t{dynamic} + 176u + 16u <= table_bytes && (lane & 1u) == 0u)
             bytes[slot * (row + 7u) + group * wave + lane] = std::byte{0xc3};
         }
       }
-      auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+      auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
       vulkan.Dispatch(producer, producer_shader, buffer);
       vulkan.Dispatch(test, compiled, buffer);
       CompareWords(test, "GPU selectors, wrapped offsets, partial descriptors, OOB and masked byte stores",
