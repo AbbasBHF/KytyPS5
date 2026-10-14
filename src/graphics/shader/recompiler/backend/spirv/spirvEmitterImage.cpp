@@ -674,8 +674,8 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 }
 
 template <typename Emit>
-uint32_t EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t result_type,
-                         const Emit& emit) {
+auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t result_type,
+                     const Emit& emit) {
 	auto& state = ctx.state;
 	const auto& mem = ctx.Memory(inst);
 	const auto& image = state.program.info.images.at(mem.resource);
@@ -931,16 +931,18 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return;
 	}
 	if (op == IR::ValueOpcode::ImageWrite) {
-		const bool uint_image = image.numeric_class == Prospero::TextureNumericClass::Uint;
-		const auto dimension  = image.dimension;
 		EmitIfCondition(state, ctx.Arg(inst, 3), [&]() {
-			const auto mip_lod =
-			    state.program.info.images[mem.resource].mip_mode == IR::ImageMipMode::Dynamic
-			        ? LodU32(ctx, mem, *address, dimension)
-			        : 0u;
-			const auto coord = CoordU32(ctx, mem, *address, dimension);
-			const auto texel = StoreTexel(ctx, mem, ctx.Arg(inst, 2), uint_image);
-			EmitStorageImageWrite(state, mem.resource, mip_lod, coord, texel);
+			EmitImageAccess(ctx, inst, 0u, [&](uint32_t resource, uint32_t array_index) {
+				const auto& candidate = state.program.info.images[resource];
+				auto selected = mem;
+				selected.resource = resource;
+				const auto mip_lod = candidate.mip_mode == IR::ImageMipMode::Dynamic
+				    ? LodU32(ctx, mem, *address, mem.image_dimension) : 0u;
+				const auto coord = CoordU32(ctx, mem, *address, candidate.dimension);
+				const auto texel = StoreTexel(ctx, selected, ctx.Arg(inst, 2),
+				    candidate.numeric_class == Prospero::TextureNumericClass::Uint);
+				EmitStorageImageWrite(state, resource, mip_lod, coord, texel, array_index);
+			});
 		});
 		return;
 	}

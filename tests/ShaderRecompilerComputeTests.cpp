@@ -46,6 +46,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
@@ -16063,7 +16064,7 @@ public:
                 const Image *storage_image = nullptr,
                 const Image *storage_image_uint = nullptr,
                 vk::Sampler sampler = nullptr,
-                std::span<const Image> sampled_resources = {},
+                std::span<const Image> image_resources = {},
                 std::span<const vk::Sampler> sampler_resources = {}) {
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto &layout = compiled.program.bindings;
@@ -16332,19 +16333,19 @@ public:
       write.pBufferInfo = &gds_info;
       writes.push_back(write);
     }
-    Require(test.name, "dispatch", sampled_resources.empty() ||
-                sampled_resources.size() == compiled.program.info.images.size(),
-            "sampled resources must match the logical images");
+    Require(test.name, "dispatch", image_resources.empty() ||
+                image_resources.size() == compiled.program.info.images.size(),
+            "image resources must match the logical images");
     for (u32 resource = 0; resource < compiled.program.info.images.size(); ++resource) {
       const auto &image = compiled.program.info.images[resource];
       const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(image);
       auto &infos = image_infos[ShaderRecompiler::IR::ImageBindingIndex(kind)];
       infos.resize(Count(kind));
       const bool sampled = image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
-      const auto *source_image = sampled
-          ? (sampled_resources.empty() ? sampled_image : &sampled_resources[resource])
-          : (image.numeric_class == Prospero::TextureNumericClass::Float
-                 ? storage_image : storage_image_uint);
+      const auto *source_image = !image_resources.empty() ? &image_resources[resource]
+          : sampled ? sampled_image
+          : image.numeric_class == Prospero::TextureNumericClass::Float
+              ? storage_image : storage_image_uint;
       Require(test.name, "dispatch", source_image != nullptr,
               "image descriptor requested but no matching image was provided");
       for (u32 mip_index = 0; mip_index < image.mip_count; ++mip_index) {
@@ -19286,6 +19287,7 @@ private:
               features12.shaderOutputViewportIndex != true ||
               features12.shaderBufferInt64Atomics != true ||
               features12.shaderSampledImageArrayNonUniformIndexing != true ||
+              features12.shaderStorageImageArrayNonUniformIndexing != true ||
               features12.shaderStorageBufferArrayNonUniformIndexing != true ||
               features12.shaderSharedInt64Atomics != true ||
               image_atomic64.shaderImageInt64Atomics != true ||
@@ -19377,6 +19379,9 @@ private:
     Require("VulkanHarness", "dispatch",
             available_features12.shaderStorageBufferArrayNonUniformIndexing == true,
             "nonuniform storage buffer indexing is not supported");
+    Require("VulkanHarness", "dispatch",
+            available_features12.shaderStorageImageArrayNonUniformIndexing == true,
+            "nonuniform storage image indexing is not supported");
     Require("VulkanHarness", "dispatch", available_min_lod.minLod == true,
             "image view minimum LOD is not supported");
     Require("VulkanHarness", "dispatch", available_maintenance8.maintenance8 == true,
@@ -38135,20 +38140,24 @@ void CheckGuardedRecordImageTable(VulkanHarness &vulkan) {
             rows == 0u ? sampled_count <= members : sampled_count == rows * members,
             "the runtime count lost a row or probed record padding");
     std::vector<VulkanHarness::Image> images(compiled.program.info.images.size());
+    u32 storage_index = 0;
     for (u32 resource = 0; resource < images.size(); ++resource) {
-      if (compiled.program.info.images[resource].resource_class !=
-          ShaderRecompiler::IR::ImageResourceClass::Sampled) continue;
+      if (compiled.program.info.images[resource].resource_class ==
+          ShaderRecompiler::IR::ImageResourceClass::Storage) {
+        storage_index = resource;
+        images[resource] = vulkan.CreateImage2D(test.name, 4u * lanes, 1, vk::Format::eR32Sfloat,
+            vk::ImageUsageFlagBits::eStorage, std::vector<u32>(4u * lanes, 0xdeadbeefu), 1,
+            vk::ImageLayout::eGeneral);
+        continue;
+      }
       const auto value = static_cast<float>(compiled.resources.images[resource].dwords[0]);
       images[resource] = vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
           vk::ImageUsageFlagBits::eSampled, {std::bit_cast<u32>(value)}, 1,
           vk::ImageLayout::eShaderReadOnlyOptimal);
     }
-    auto storage = vulkan.CreateImage2D(test.name, 4u * lanes, 1, vk::Format::eR32Sfloat,
-        vk::ImageUsageFlagBits::eStorage, std::vector<u32>(4u * lanes, 0xdeadbeefu), 1,
-        vk::ImageLayout::eGeneral);
     auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
     auto sampler = vulkan.CreateSampler(test.name, 1);
-    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, &storage, nullptr, sampler, images);
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, sampler, images);
     std::vector<u32> expected(4u * lanes, 0u);
     if (count != 0u) {
       expected[0] = std::bit_cast<u32>(bitset ? (count == 3 ? 8.0f : 2.0f)
@@ -38157,9 +38166,8 @@ void CheckGuardedRecordImageTable(VulkanHarness &vulkan) {
       expected[2u * lanes] = std::bit_cast<u32>(bitset ? 2.0f : 11.0f);
     }
     CompareWords(test, "GPU worklist, guarded count and image writes", expected,
-                 vulkan.ReadImage(test.name, &storage));
+                 vulkan.ReadImage(test.name, &images[storage_index]));
     vulkan.DestroyBuffer(&buffer);
-    vulkan.DestroyImage(&storage);
     vulkan.Device().destroySampler(sampler);
     for (auto &image : images) if (image.image != nullptr) vulkan.DestroyImage(&image);
     std::printf("[compute] %s count=%u ok\n", test.name, count);
@@ -38573,6 +38581,78 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   }
   vulkan.Device().destroySampler(native_sampler);
   for (auto &texture : textures) vulkan.DestroyImage(&texture);
+  textures.clear();
+
+  // Reuse the GPU key map, including the separated root slot and unmapped suffix,
+  // for storage writes. Every lane has a distinct texel address.
+  test.name = "IndirectImageStoreHomogeneous";
+  store.Invalidate();
+  for (auto &inst : *block)
+    if (inst.GetOpcode() == ValueOpcode::ReferenceU32) inst.Invalidate();
+  compiled.program.info.buffers.clear();
+  compiled.program.memory_info.resize(1);
+  auto &store_memory = compiled.program.memory_info[0];
+  store_memory.image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  store_memory.image_address_components = 2;
+  store_memory.image_has_mip = false;
+  address.SetArg(0, Value(&key));
+  address.SetArg(3, Value(0u));
+  for (auto &resource : compiled.program.info.images) {
+    resource.resource_class = ImageResourceClass::Storage;
+    resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    resource.cube = false;
+    resource.read = false;
+    resource.written = true;
+  }
+  auto &written_x = block->AppendNewInst(ValueOpcode::IAdd32,
+      {Value(&key), Value(0x3f800000u)});
+  auto &texel = block->AppendNewInst(ValueOpcode::CompositeConstructU32x4,
+      {Value(&written_x), Value(0x40000000u), Value(0x40400000u), Value(0x40800000u)});
+  auto &write_exec = block->AppendNewInst(ValueOpcode::INotEqual32,
+      {Value(&key), Value(2u)});
+  block->AppendNewInst(ValueOpcode::ImageWrite,
+      {Value(&image), Value(&address), Value(&texel), Value(&write_exec)}, memory_flag_bits);
+  EliminateDeadCode(compiled.program.blocks);
+  compiled.program.shader_info_complete = false;
+  CollectShaderInfo(compiled.program, {.compute = &compute});
+  for (const u32 wave_size : {32u, 64u}) {
+    compute.wave_size = wave_size;
+    compute.threads_num[0] = wave_size;
+    compiled.program.wave_size = wave_size;
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
+    compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
+    ValidateSpirv(test.name, compiled.spirv);
+    const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
+    Require(test.name, "one native array write per wave half",
+            tools.Disassemble(compiled.spirv, &text) && CountText(text, "OpImageWrite") == halves &&
+                text.find("OpSwitch") == std::string::npos &&
+                text.find("StorageImageArrayNonUniformIndexing") != std::string::npos,
+            "homogeneous storage candidates lost their native array selection");
+    std::vector<std::vector<u32>> expected_images;
+    for (u32 resource = 0; resource < compiled.program.info.images.size(); ++resource) {
+      expected_images.emplace_back((wave_size + 2u) * 4u, 0x41000000u + resource);
+      textures.push_back(vulkan.CreateImage2D(test.name, wave_size + 2u, 1,
+          vk::Format::eR32G32B32A32Sfloat, vk::ImageUsageFlagBits::eStorage,
+          expected_images.back(), 4u, vk::ImageLayout::eGeneral));
+    }
+    test.initial = {0xdeadbeefu};
+    for (u32 lane = 0; lane < wave_size; ++lane) {
+      const auto resource = root.indirect_resources[lane < ordinals.size() ? ordinals[lane] : 0u];
+      if (lane == 2u) continue;
+      const std::array written{0x3f800000u + lane, 0x40000000u, 0x40400000u, 0x40800000u};
+      std::copy(written.begin(), written.end(), expected_images[resource].begin() + lane * 4u);
+    }
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, nullptr, textures);
+    for (u32 resource = 0; resource < textures.size(); ++resource) {
+      CompareWords(test, "selected writes, inactive lane and neighboring texels",
+                   expected_images[resource], vulkan.ReadImage(test.name, &textures[resource]));
+      vulkan.DestroyImage(&textures[resource]);
+    }
+    textures.clear();
+    vulkan.DestroyBuffer(&buffer);
+    std::printf("[compute] %s wave=%u ok\n", test.name, wave_size);
+  }
 }
 
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
