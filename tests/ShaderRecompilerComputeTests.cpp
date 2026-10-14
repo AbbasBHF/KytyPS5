@@ -30527,6 +30527,42 @@ TestCase BufferStoreVariants() {
            O::BUFFER_STORE_DWORDX4, O::S_ENDPGM}};
 }
 
+TestCase BufferStoreByteD16Hi(bool masked) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = masked ? "BufferStoreByteD16HiMasked" : "BufferStoreByteD16HiAdjacentLanes";
+  AppendVMovLiteral(&test.code, 4, 0xa5c39b72u);
+  test.code.push_back(EncodeVop2(0x25, 25, InlineU32(4), 0));
+  if (masked) {
+    AppendSMovLiteral(&test.code, 126, 0x55555555u);
+    AppendSMovLiteral(&test.code, 127, 0xaaaaaaaau);
+  }
+  // Captured b21e373811f28e31 pc 0x1b8c: e0646000 80020419.
+  test.code.push_back(EncodeMubuf0(0x19u, 0, true, false, true));
+  test.code.push_back(EncodeMubuf1(4, 2, 25));
+  AppendEnd(&test.code);
+  test.initial = std::vector<u32>(20, 0x11223344u);
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < 60; lane++) {
+    const u32 mask = !masked ? 0xffffffffu : lane < 32 ? 0x55555555u : 0xaaaaaaaau;
+    if (((mask >> (lane % 32)) & 1u) == 0) continue;
+    const u32 byte = lane + 4, shift = (byte % 4) * 8;
+    test.expected[byte / 4] = (test.expected[byte / 4] & ~(0xffu << shift)) | (0xc3u << shift);
+  }
+  const auto descriptor = MakeStructuredStorageBufferData(1, 64);
+  std::copy_n(descriptor.begin(), 4, test.user_data.begin() + 8);
+  test.has_user_data = true;
+  test.storage_buffer_range_bytes = 64;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.has_compute_info = true;
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::BUFFER_STORE_BYTE_D16_HI, O::S_ENDPGM};
+  test.forbidden_spirv = {"OpAtomicLoad", "OpAtomicCompareExchange"};
+  return test;
+}
+
 TestCase BufferFormatVariants() {
   using O = ShaderOpcode;
 
@@ -39383,6 +39419,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadFormatXyRejectsPartialRecord);
   AddCase(BufferStoreFormatXyRejectsPartialRecord);
   AddCase(BufferStoreVariants);
+  cases.push_back(BufferStoreByteD16Hi(false));
+  cases.push_back(BufferStoreByteD16Hi(true));
   AddCase(BufferFormatVariants);
   AddCase(BufferLoadFormatXyzwSnapshotsOverlappingAddress);
   AddCase(BufferLoadFormatXyzwResource32_32FloatAppliesXy01);
@@ -45086,6 +45124,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferStoreFormatXRejectsPartialRecord());
     RunCase(&vulkan, BufferStoreFormatXyRejectsPartialRecord());
     RunCase(&vulkan, BufferFormatStoreVariants());
+    RunCase(&vulkan, BufferStoreByteD16Hi(false));
+    RunCase(&vulkan, BufferStoreByteD16Hi(true));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-float16-store-only") == 0) {
