@@ -16083,11 +16083,11 @@ public:
     };
     for (const auto &image : compiled.program.info.images) {
       bool supported =
+          image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
           image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
           image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
       if (image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
         supported = supported ||
-                    image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
                     image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
       }
       Require(test.name, "dispatch", supported,
@@ -38429,11 +38429,11 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
         resource == 4u ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D, layers));
   }
   const auto native_sampler = vulkan.CreateSampler(test.name);
-  enum class Access { Sample, Gather, GatherHomogeneous, Fetch };
+  enum class Access { Sample, Gather, GatherHomogeneous, Fetch, Fetch1D };
   auto *access = &sample;
   for (const auto mode : {Access::Sample, Access::Gather,
-                          Access::GatherHomogeneous, Access::Fetch}) {
-    const bool fetch = mode == Access::Fetch;
+                          Access::GatherHomogeneous, Access::Fetch, Access::Fetch1D}) {
+    const bool fetch = mode == Access::Fetch || mode == Access::Fetch1D;
     const bool gather = mode == Access::Gather || mode == Access::GatherHomogeneous;
     const bool homogeneous = mode == Access::GatherHomogeneous;
     if (mode == Access::Gather) {
@@ -38472,6 +38472,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
           position, ValueOpcode::ImageRead,
           {Value(&image), Value(&address), Value(true)}, memory_flag_bits);
       access->ReplaceUsesWith(Value(&read), false);
+      access = &read;
       sampler.Invalidate();
       compiled.program.info.samplers.clear();
       compiled.program.info.sampled_pairs.clear();
@@ -38483,6 +38484,27 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
         address.SetArg(component, Value(0u));
       // Native DIM=2DArray places LOD after the layer, even for a 2D candidate.
       address.SetArg(3, Value(1u));
+      if (mode == Access::Fetch1D) {
+        test.name = "IndirectImageFetch1D2D";
+        compiled.program.memory_info[0].image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+        compiled.program.memory_info[0].image_address_components = 3;
+        address.SetArg(2, Value(1u));
+        address.SetArg(3, Value(0u));
+        for (const u32 resource : {3u, 4u}) {
+          const bool one_d = resource == 3u;
+          compiled.program.info.images[resource].dimension = one_d
+              ? ShaderRecompiler::Decoder::ImageDimension::Dim1D
+              : ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+          vulkan.DestroyImage(&textures[resource]);
+          textures[resource] = vulkan.CreateImageMips(test.name, 2, 1, vk::Format::eR32G32B32A32Sfloat,
+              vk::ImageUsageFlagBits::eSampled,
+              {std::vector<u32>(8u, std::bit_cast<u32>(float(resource))),
+               std::vector<u32>(4u, std::bit_cast<u32>(float(resource + 10u)))},
+              4u, vk::ImageLayout::eShaderReadOnlyOptimal,
+              one_d ? vk::ImageType::e1D : vk::ImageType::e2D,
+              one_d ? vk::ImageViewType::e1D : vk::ImageViewType::e2D, 1u);
+        }
+      }
     }
     compiled.program.shader_info_complete = false;
     CollectShaderInfo(compiled.program, {.compute = &compute});
@@ -38568,7 +38590,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
         }
         Require(test.name, "mixed numeric image result", raw_join &&
                     tools.Disassemble(mixed_spirv, &text) &&
-                    CountText(text, image_opcode) == 4u * halves &&
+                    CountText(text, image_opcode) == (mode == Access::Fetch1D ? 3u : 4u) * halves &&
                     CountText(text, "OpConvertUToF") == coordinate_conversions,
                 "mixed image classes lost raw result bits or expanded per image");
         typed.numeric_class = Prospero::TextureNumericClass::Float;
@@ -38585,7 +38607,6 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
 
   // Reuse the GPU key map, including the separated root slot and unmapped suffix,
   // for storage writes. Every lane has a distinct texel address.
-  test.name = "IndirectImageStoreHomogeneous";
   store.Invalidate();
   for (auto &inst : *block)
     if (inst.GetOpcode() == ValueOpcode::ReferenceU32) inst.Invalidate();
@@ -38596,6 +38617,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   store_memory.image_address_components = 2;
   store_memory.image_has_mip = false;
   address.SetArg(0, Value(&key));
+  address.SetArg(2, Value(0u));
   address.SetArg(3, Value(0u));
   for (auto &resource : compiled.program.info.images) {
     resource.resource_class = ImageResourceClass::Storage;
@@ -38613,45 +38635,61 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   block->AppendNewInst(ValueOpcode::ImageWrite,
       {Value(&image), Value(&address), Value(&texel), Value(&write_exec)}, memory_flag_bits);
   EliminateDeadCode(compiled.program.blocks);
-  compiled.program.shader_info_complete = false;
-  CollectShaderInfo(compiled.program, {.compute = &compute});
-  for (const u32 wave_size : {32u, 64u}) {
-    compute.wave_size = wave_size;
-    compute.threads_num[0] = wave_size;
-    compiled.program.wave_size = wave_size;
-    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
-    compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
-    ValidateSpirv(test.name, compiled.spirv);
-    const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
-    Require(test.name, "one native array write per wave half",
-            tools.Disassemble(compiled.spirv, &text) && CountText(text, "OpImageWrite") == halves &&
-                text.find("OpSwitch") == std::string::npos &&
-                text.find("StorageImageArrayNonUniformIndexing") != std::string::npos,
-            "homogeneous storage candidates lost their native array selection");
-    std::vector<std::vector<u32>> expected_images;
-    for (u32 resource = 0; resource < compiled.program.info.images.size(); ++resource) {
-      expected_images.emplace_back((wave_size + 2u) * 4u, 0x41000000u + resource);
-      textures.push_back(vulkan.CreateImage2D(test.name, wave_size + 2u, 1,
-          vk::Format::eR32G32B32A32Sfloat, vk::ImageUsageFlagBits::eStorage,
-          expected_images.back(), 4u, vk::ImageLayout::eGeneral));
+  for (const bool mixed : {false, true}) {
+    test.name = mixed ? "IndirectImageStoreMixed" : "IndirectImageStoreHomogeneous";
+    compiled.program.info.images[3].dimension = mixed
+        ? ShaderRecompiler::Decoder::ImageDimension::Dim1D
+        : ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    compiled.program.info.images[5].shader_swizzle = mixed ? DstSel(5, 4, 6, 7)
+                                                         : ShaderImageIdentitySwizzle;
+    compiled.program.info.images[6].shader_swizzle = mixed ? 0u : ShaderImageIdentitySwizzle;
+    compiled.program.shader_info_complete = false;
+    CollectShaderInfo(compiled.program, {.compute = &compute});
+    for (const u32 wave_size : {32u, 64u}) {
+      compute.wave_size = wave_size;
+      compute.threads_num[0] = wave_size;
+      compiled.program.wave_size = wave_size;
+      compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
+      compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
+      ValidateSpirv(test.name, compiled.spirv);
+      const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
+      Require(test.name, "native array writes per dimension and swizzle run",
+              tools.Disassemble(compiled.spirv, &text) &&
+                  CountText(text, "OpImageWrite") == (mixed ? 5u : 1u) * halves &&
+                  (mixed || text.find("OpSwitch") == std::string::npos) &&
+                  text.find("StorageImageArrayNonUniformIndexing") != std::string::npos,
+              "storage candidates lost their typed native array runs");
+      std::vector<std::vector<u32>> expected_images;
+      for (u32 resource = 0; resource < compiled.program.info.images.size(); ++resource) {
+        expected_images.emplace_back((wave_size + 2u) * 4u, 0x41000000u + resource);
+        const bool one_d = compiled.program.info.images[resource].dimension ==
+            ShaderRecompiler::Decoder::ImageDimension::Dim1D;
+        textures.push_back(vulkan.CreateImageMips(test.name, wave_size + 2u, 1,
+            vk::Format::eR32G32B32A32Sfloat, vk::ImageUsageFlagBits::eStorage,
+            {expected_images.back()}, 4u, vk::ImageLayout::eGeneral,
+            one_d ? vk::ImageType::e1D : vk::ImageType::e2D,
+            one_d ? vk::ImageViewType::e1D : vk::ImageViewType::e2D, 1u));
+      }
+      test.initial = {0xdeadbeefu};
+      for (u32 lane = 0; lane < wave_size; ++lane) {
+        const auto resource = root.indirect_resources[lane < ordinals.size() ? ordinals[lane] : 0u];
+        if (lane == 2u) continue;
+        std::array written{0x3f800000u + lane, 0x40000000u, 0x40400000u, 0x40800000u};
+        if (mixed && resource == 5u) std::swap(written[0], written[1]);
+        if (mixed && resource == 6u) written.fill(0u);
+        std::copy(written.begin(), written.end(), expected_images[resource].begin() + lane * 4u);
+      }
+      auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+      vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, nullptr, textures);
+      for (u32 resource = 0; resource < textures.size(); ++resource) {
+        CompareWords(test, "selected writes, inactive lane and neighboring texels",
+                     expected_images[resource], vulkan.ReadImage(test.name, &textures[resource]));
+        vulkan.DestroyImage(&textures[resource]);
+      }
+      textures.clear();
+      vulkan.DestroyBuffer(&buffer);
+      std::printf("[compute] %s wave=%u ok\n", test.name, wave_size);
     }
-    test.initial = {0xdeadbeefu};
-    for (u32 lane = 0; lane < wave_size; ++lane) {
-      const auto resource = root.indirect_resources[lane < ordinals.size() ? ordinals[lane] : 0u];
-      if (lane == 2u) continue;
-      const std::array written{0x3f800000u + lane, 0x40000000u, 0x40400000u, 0x40800000u};
-      std::copy(written.begin(), written.end(), expected_images[resource].begin() + lane * 4u);
-    }
-    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
-    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, nullptr, textures);
-    for (u32 resource = 0; resource < textures.size(); ++resource) {
-      CompareWords(test, "selected writes, inactive lane and neighboring texels",
-                   expected_images[resource], vulkan.ReadImage(test.name, &textures[resource]));
-      vulkan.DestroyImage(&textures[resource]);
-    }
-    textures.clear();
-    vulkan.DestroyBuffer(&buffer);
-    std::printf("[compute] %s wave=%u ok\n", test.name, wave_size);
   }
 }
 

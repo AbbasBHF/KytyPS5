@@ -206,7 +206,8 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> 
 
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t table_offset = 0,
-                         uint32_t table_shader_offset = 0, bool nested = false) {
+                         uint32_t table_shader_offset = 0, bool nested = false,
+                         ValueOpcode access = ValueOpcode::ImageSampleRaw, bool finite_key = false) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -215,12 +216,14 @@ MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t ta
     heap_words[dword] = fixture->UserData(dword + 4u);
   }
   const auto material = fixture->Buffer(material_words, 0x10d8);
-  const auto heap = fixture->Buffer(heap_words, 0x10d8);
+  const auto heap = finite_key ? fixture->Address(heap_words[0], heap_words[1], 0x10d8)
+                               : fixture->Buffer(heap_words, 0x10d8);
   const auto invocation = fixture->Emit(
       ValueOpcode::GetBuiltin,
-      {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
-  const auto selector = fixture->Emit(ValueOpcode::ReadFirstLane,
-                                      {invocation, Value(true)});
+      {Value(static_cast<uint32_t>(finite_key ? StageInputKind::WorkgroupId
+                                              : StageInputKind::GlobalInvocationId)), Value(0u)});
+  const auto selector = finite_key ? invocation
+      : fixture->Emit(ValueOpcode::ReadFirstLane, {invocation, Value(true)});
   Value member;
   if (nested) {
     std::array<Value, 4> root_words;
@@ -240,24 +243,27 @@ MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t ta
   MemoryInfo material_scalar;
   material_scalar.kind = ResourceKind::ScalarBuffer;
   material_scalar.offset = 4u;
-  const auto key =
-      fixture->Emit(ValueOpcode::ReadConstBuffer, {material, member},
-                    fixture->AddMemory(material_scalar, 0x10d8));
+  auto key = fixture->Emit(ValueOpcode::ReadConstBuffer, {material, member},
+                           fixture->AddMemory(material_scalar, 0x10d8));
+  if (finite_key) key = fixture->Emit(ValueOpcode::BitFieldUExtract,
+                                     {key, Value(16u), Value(5u)});
   auto heap_offset = fixture->Emit(ValueOpcode::IMul32, {key, Value(table_stride)});
   if (table_shader_offset != 0u)
     heap_offset = fixture->Emit(ValueOpcode::IAdd32, {heap_offset, Value(table_shader_offset)});
   std::array<Value, 8> image_words;
   MemoryInfo heap_scalar;
-  heap_scalar.kind = ResourceKind::ScalarBuffer;
+  heap_scalar.kind = finite_key ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer;
   for (uint32_t dword = 0; dword < image_words.size(); dword++) {
     auto component = heap_scalar;
     component.offset = table_offset + dword * sizeof(uint32_t);
     if (malformed && dword == image_words.size() - 1u) {
       component.offset += sizeof(uint32_t);
     }
-    image_words[dword] =
-        fixture->Emit(ValueOpcode::ReadConstBuffer, {heap, heap_offset},
-                      fixture->AddMemory(component, 0x10d8));
+    const auto flags = fixture->AddMemory(component, 0x10d8);
+    image_words[dword] = finite_key
+        ? fixture->Emit(ValueOpcode::LoadAddressU32,
+                        {heap, heap_offset, Value(0u), Value(true)}, flags)
+        : fixture->Emit(ValueOpcode::ReadConstBuffer, {heap, heap_offset}, flags);
   }
   if (nested) {
     const auto field = fixture->Emit(ValueOpcode::BitwiseAnd32, {image_words[4], Value(7u)});
@@ -269,12 +275,27 @@ MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t ta
   MemoryInfo sample;
   sample.kind = ResourceKind::Image;
   sample.image_dimension = Decoder::ImageDimension::Dim2D;
-  const auto sampled = fixture->Emit(ValueOpcode::ImageSampleRaw,
-                                     {image, sampler, fixture->ImageAddress(), Value(true)},
-                                     fixture->AddMemory(sample, 0x10f0));
-  const auto sampled_x =
-      fixture->Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
-  fixture->Emit(ValueOpcode::ReferenceU32, {sampled_x});
+  const auto address = fixture->ImageAddress();
+  const auto flags = fixture->AddMemory(sample, 0x10f0);
+  Value result;
+  if (access == ValueOpcode::ImageWrite) {
+    const auto texel = fixture->Emit(ValueOpcode::CompositeConstructU32x4,
+                                    {Value(1u), Value(2u), Value(3u), Value(4u)});
+    fixture->Emit(access, {image, address, texel, Value(true)}, flags);
+  } else if (access == ValueOpcode::ImageRead) {
+    result = fixture->Emit(access, {image, address, Value(true)}, flags);
+  } else if (access == ValueOpcode::ImageQueryDimensions) {
+    result = fixture->Emit(access, {image, address}, flags);
+  } else if (access == ValueOpcode::ImageAtomicIAdd32) {
+    result = fixture->Emit(access, {image, address, Value(1u), Value(true)}, flags);
+  } else {
+    result = fixture->Emit(access, {image, sampler, address, Value(true)}, flags);
+  }
+  if (!result.IsEmpty()) {
+    if (result.GetType() == Type::U32x4)
+      result = fixture->Emit(ValueOpcode::CompositeExtractU32x4, {result, Value(0u)});
+    fixture->Emit(ValueOpcode::ReferenceU32, {result});
+  }
   return fixture;
 }
 
@@ -439,6 +460,113 @@ void TestBoundedImageViewEligibility() {
   plan.descriptor_sources[image_source].indirect_descriptor->sources = std::move(selected);
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "explicitly selected incompatible descriptor was silently normalized to null");
+}
+
+void TestExactUnfilteredImageCandidates() {
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  using T = Libs::Graphics::Prospero::ImageType;
+  constexpr std::array<uint32_t, 8> placeholder{
+      0x50091c00u, 0x03800000u, 0u, 0x80000000u, 0u, 0x00700000u, 0u, 0u};
+  for (const auto access : {ValueOpcode::ImageRead, ValueOpcode::ImageWrite,
+                           ValueOpcode::ImageSampleRaw, ValueOpcode::ImageQueryDimensions,
+                           ValueOpcode::ImageAtomicIAdd32}) {
+    auto fixture = MakeIndirectImageFixture(false, 32u, 0u, 0u, false, access, true);
+    fixture->PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture->program);
+    const bool unfiltered = access == ValueOpcode::ImageRead || access == ValueOpcode::ImageWrite;
+    Check(plan.info.images[0].unfiltered_access_only == unfiltered,
+          "image access classification admitted a sample, query or atomic");
+    const auto &source = *plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
+    Check(source.key_count.Resolve() == Value(32u),
+          "five-bit image selector did not preserve its exact 32-row domain");
+    LinearTestMemory memory;
+    memory.fail_address = 0x3000u; // Selector payload stays on the GPU.
+    auto first = placeholder;
+    first[0] += 1u;
+    first[3] = Libs::Graphics::DstSel(4, 5, 6, 7) | (uint32_t(T::kColor2D) << 28u);
+    auto second = placeholder;
+    if (access == ValueOpcode::ImageAtomicIAdd32) {
+      first[1] = second[1] = uint32_t(F::k32UInt) << 20u;
+      second[3] |= Libs::Graphics::DstSel(4, 5, 6, 7);
+    }
+    const auto fill = [&] {
+      for (uint32_t row = 0; row < 32u; ++row) {
+        const auto &words = row == 31u ? second : first;
+        std::copy(words.begin(), words.end(), memory.words.begin() + 0x1000u / 4u + row * 8u);
+      }
+    };
+    fill();
+    std::array<uint32_t, 8> data{0x3000u, 4u << 16u, 32u, 0u,
+                                0x2000u, 0u, 0u, 0u};
+    const SrtRuntime runtime{.user_data = data, .userdata = &memory,
+                             .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) == unfiltered,
+          "mixed 1D/2D candidates violated the all-uses access guard");
+    if (!unfiltered) continue;
+    Check(snapshot.images.size() == 2u && snapshot.images[1].dwords == placeholder &&
+              specialization.images[0].dimension == Decoder::ImageDimension::Dim2D &&
+              specialization.images[1].dimension == Decoder::ImageDimension::Dim1D,
+          "a real 1D zero-swizzle descriptor was filtered, nulled or retyped");
+    if (access == ValueOpcode::ImageWrite)
+      Check(specialization.images[1].shader_swizzle == 0u,
+            "storage placeholder lost its descriptor swizzle");
+    const auto operation = std::ranges::find_if(*fixture->block, [&](const Inst &inst) {
+      return inst.GetOpcode() == access;
+    });
+    const auto key = operation->Arg(0).ResolveInstruction()->Arg(0);
+    ApplyResourceSpecialization(fixture->program, specialization);
+    const auto &images = fixture->program.info.images;
+    const auto &selected = fixture->program.memory_info[operation->Flags<MemoryFlags>().index];
+    Check(images.size() == 2u && selected.resource == 0u &&
+              selected.image_dimension == Decoder::ImageDimension::Dim2D &&
+              images[0].indirect_resources == std::vector<uint32_t>({0u, 1u}) &&
+              images[1].indirect_root == 0u &&
+              images[1].dimension == Decoder::ImageDimension::Dim1D &&
+              images[1].unfiltered_access_only &&
+              operation->Arg(0).ResolveInstruction()->Arg(0) == key &&
+              (access != ValueOpcode::ImageWrite || images[1].shader_swizzle == 0u),
+          "applying mixed candidates lost GPU selection, typed child or storage swizzle");
+    second[0] += 2u;
+    fill();
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images[1].dwords[0] == second[0],
+          "mixed-dimension materialization reused a stale descriptor");
+    plan.info.images[0].dimension = Decoder::ImageDimension::Dim1D;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "encoded 1D payload was treated as having a second coordinate");
+    plan.info.images[0].dimension = Decoder::ImageDimension::Dim2D;
+    second[1] = uint32_t(F::k11_11_10UInt) << 20u;
+    fill();
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "mixed-dimension acceptance discarded conversion compatibility");
+    if (access == ValueOpcode::ImageRead) {
+      first[1] = second[1];
+      fill();
+      Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+            "sampled converted candidates accepted different shader swizzles");
+      first[1] = placeholder[1];
+    }
+    second[1] = placeholder[1];
+    second[3] |= 1u << 16u;
+    fill();
+    plan.info.images[0].mip_mode = ImageMipMode::Dynamic;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "mixed-dimension acceptance discarded mip-count compatibility");
+  }
+  // The same image may be merged from several uses; one query keeps the guard strict.
+  auto merged = MakeIndirectImageFixture(false, 32u, 0u, 0u, false, ValueOpcode::ImageRead, true);
+  const auto handle = std::ranges::find_if(*merged->block, [](const Inst &inst) {
+    return inst.GetOpcode() == ValueOpcode::GetImageResource;
+  });
+  merged->Emit(ValueOpcode::ImageQueryDimensions, {Value(&*handle), merged->ImageAddress()},
+      merged->AddMemory({.kind = ResourceKind::Image,
+                         .image_dimension = Decoder::ImageDimension::Dim2D}, 0x1100));
+  merged->PlanAndTrack();
+  Check(merged->program.info.images.size() == 1u &&
+            !merged->program.info.images[0].unfiltered_access_only,
+        "a later merged query left the unfiltered-use proof intact");
 }
 
 void TestWaterfallImageTable() {
@@ -6757,6 +6885,7 @@ int main() {
     Run("invariant indirect images", [] { TestInvariantIndirectImageMaterialization(true); });
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
+    Run("exact unfiltered image candidates", TestExactUnfilteredImageCandidates);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("nested pointer image table", TestNestedPointerImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
