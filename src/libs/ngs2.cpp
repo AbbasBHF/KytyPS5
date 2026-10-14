@@ -1931,16 +1931,7 @@ static bool Ngs2FourCcEquals(const uint8_t* data, const char* four_cc) {
 
 static bool Ngs2GetAtrac9CodecInfo(const std::array<uint8_t, ATRAC9_CONFIG_DATA_SIZE>& config,
                                    Atrac9CodecInfo& codec) {
-	void* decoder = Atrac9GetHandle();
-	const bool valid = decoder != nullptr && Ajm::AjmAt9InitDecoder(decoder, config.data()) == 0 &&
-	                   Atrac9GetCodecInfo(decoder, &codec) == 0 && codec.channels > 0 &&
-	                   codec.samplingRate > 0 && codec.superframeSize > 0 &&
-	                   codec.framesInSuperframe > 0 && codec.frameSamples > 0 &&
-	                   codec.superframeSize % codec.framesInSuperframe == 0;
-	if (decoder != nullptr) {
-		Atrac9ReleaseHandle(decoder);
-	}
-	return valid;
+	return Ajm::AjmAt9GetCodecInfo(config.data(), codec);
 }
 
 static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformInfo* info) {
