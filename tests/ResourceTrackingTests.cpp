@@ -4393,6 +4393,80 @@ void TestBoundedFormattedBufferStore() {
                "finite store accepted an unproved induction or indexed byte offset");
 }
 
+void TestFiniteBufferSelection() {
+  enum class Variant { Valid, WiderExec, Unbounded, Cycle, TooMany };
+  const auto make = [](Variant variant) {
+    auto fixture = std::make_unique<Fixture>();
+    auto& f = *fixture;
+    auto* entry = f.block;
+    auto* left = f.AddBlock();
+    auto* right = f.AddBlock();
+    auto* merge = f.AddBlock();
+    entry->AddBranch(left);
+    (variant == Variant::Cycle ? merge : entry)->AddBranch(right);
+    left->AddBranch(merge);
+    right->AddBranch(merge);
+    const auto table = f.Address(f.UserData(0u), f.UserData(1u));
+    const auto lane = f.Emit(ValueOpcode::LaneId);
+    const auto active = f.Emit(ValueOpcode::ULessThan32, {lane, Value(16u)});
+    auto selected = Value(0u);
+    for (uint32_t key = 1; key < 5u; ++key) {
+      const auto match = f.Emit(ValueOpcode::IEqual32, {lane, Value(key)}, 0, right);
+      selected = f.Emit(ValueOpcode::SelectU32, {match, Value(key), selected}, 0, right);
+    }
+    auto& phi = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    phi.AddPhiOperand(left, Value(0u));
+    phi.AddPhiOperand(right, variant == Variant::Cycle
+        ? f.Emit(ValueOpcode::IAdd32, {Value(&phi), Value(1u)}, 0, right)
+        : variant == Variant::TooMany ? Value(MaxIndirectDescriptorProbes) : selected);
+    f.block = merge;
+    const auto stale = f.Emit(ValueOpcode::UndefU32);
+    const auto masked = f.Emit(ValueOpcode::SelectU32,
+        {active, variant == Variant::Unbounded ? lane : Value(&phi), stale});
+    const auto key = f.Emit(ValueOpcode::ReadFirstLane, {masked, active});
+    const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(4u)});
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < words.size(); ++word)
+      words[word] = f.Emit(ValueOpcode::LoadAddressU32,
+          {table, offset, Value(0u), Value(true)},
+          f.AddMemory({.kind = ResourceKind::ScalarAddress, .offset = 32u + word * 4u,
+                       .component_index = word, .component_count = 4u}, 0x50cu));
+    f.Emit(ValueOpcode::StoreBufferU32,
+        {f.Buffer(words), lane, Value(0u), Value(0u), Value(42u),
+         variant == Variant::WiderExec ? Value(true) : active},
+        f.AddMemory({.kind = ResourceKind::Buffer, .idxen = true, .coherent = true}, 0x530u));
+    return fixture;
+  };
+  auto fixture = make(Variant::Valid);
+  fixture->PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  const auto& source = plan.descriptor_sources[plan.info.buffers[0].source];
+  Check(source.indirect_descriptor && source.indirect_descriptor->key_count == Value(5u),
+        "masked finite selection did not retain all five descriptor candidates");
+  EliminateDeadCode(fixture->program.blocks);
+  LinearTestMemory memory;
+  for (uint32_t key = 0; key < 5u; ++key) {
+    const auto word = 8u + key * 4u;
+    memory.words[word] = 0x100000u + key * 0x10000u;
+    memory.words[word + 1u] = 4u << 16u;
+    memory.words[word + 2u] = 64u;
+    memory.words[word + 3u] = 0x5204u;
+  }
+  memory.fail_address = memory.base + 32u + 5u * 16u;
+  const std::array<uint32_t, 2> user_data{static_cast<uint32_t>(memory.base), 0u};
+  SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+                     .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.buffers.size() == 5u,
+        "finite buffer selection lost table roots after DCE or probed outside its domain");
+  for (const auto variant : {Variant::WiderExec, Variant::Unbounded, Variant::Cycle, Variant::TooMany}) {
+    auto invalid = make(variant);
+    CheckFatal([&] { invalid->PlanAndTrack(); }, "not a valid runtime value",
+               "finite buffer selection accepted an unproved EXEC or selector domain");
+  }
+}
+
 void TestPackedScalarBufferSelection() {
   const auto make = [](uint32_t shift_mask = 24u, bool cycle = false, uint32_t store_offset = 0u,
                        bool byte_store = false) {
@@ -5814,6 +5888,7 @@ int main() {
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("writable descriptor phi", TestWritableDescriptorPhi);
     Run("bounded formatted buffer store", TestBoundedFormattedBufferStore);
+    Run("finite buffer selection", TestFiniteBufferSelection);
     Run("packed scalar buffer selection", TestPackedScalarBufferSelection);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
     Run("finite image phi cycle", TestFiniteImagePhiCycle);

@@ -36368,6 +36368,70 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", "BoundedFormattedBufferCopy");
 }
 
+void CheckFiniteBufferSelection(VulkanHarness &vulkan) {
+  for (const u32 wave : {32u, 64u}) {
+    TestCase test;
+    test.name = wave == 32 ? "FiniteBufferSelection32" : "FiniteBufferSelection64";
+    const u32 first_lane = wave == 32 ? 1u : 33u;
+    // Water Lighting's masked V_CNDMASK -> READFIRSTLANE -> S_LOAD_DWORDX4 -> store.
+    test.code = {EncodeSMovB32(126, InlineU32(wave == 32 ? 6u : 0u)),
+                 EncodeSMovB32(127, InlineU32(wave == 64 ? 6u : 0u)),
+                 EncodeMubuf0(0x0cu, 0, true, false), EncodeMubuf1(20, 2, 0),
+                 EncodeSopp(0x0cu, 0)};
+    AppendVMovU32(&test.code, 4, 0);
+    test.code.push_back(EncodeSopc(0x0au, 2, InlineU32(1)));
+    const auto skip = test.code.size();
+    test.code.push_back(0);
+    for (u32 key = 1; key < 5u; ++key) {
+      AppendVMovU32(&test.code, 22, key);
+      test.code.push_back(EncodeVopc(0xc2u, InlineU32(key), 20));
+      test.code.push_back(EncodeVop2(0x01u, 4, Vgpr(4), 22));
+    }
+    test.code[skip] = EncodeSopp(0x05u, static_cast<u32>(test.code.size() - skip - 1u));
+    test.code.insert(test.code.end(), {
+        EncodeVop1(0x02u, 3, Vgpr(4)), EncodeSop2(0x31u, 12, 3, InlineU32(32)),
+        EncodeSmem0(0x02u, 4), EncodeSmem1(0, 12), EncodeSopp(0x0cu, 0),
+        EncodeVop2(0x25u, 1, 0xffu, 0), 0x1000u,
+        EncodeMubuf0(0x1cu, 0, true, false, true), EncodeMubuf1(1, 1, 0)});
+    AppendEnd(&test.code);
+    constexpr u32 table = 256u, input = 512u, output = 1024u, slot = 512u;
+    test.initial.assign((output + 5u * slot) / 4u, 0xdeadbeefu);
+    test.has_user_data = true;
+    test.user_data[0] = table;
+    test.user_data[2] = 1u;
+    const std::array<u32, 4> input_descriptor{input, 4u << 16u, wave, 0x5204u};
+    std::copy(input_descriptor.begin(), input_descriptor.end(), test.user_data.begin() + 8u);
+    for (u32 key = 0; key < 5u; ++key) {
+      const std::array<u32, 4> descriptor{output + key * slot, 4u << 16u, wave, 0x5204u};
+      std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + table / 4u + 8u + key * 4u);
+    }
+    test.has_compute_info = true;
+    test.compute_info.wave_size = wave;
+    test.compute_info.threads_num[0] = wave;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+    test.compute_info.lds_size_dwords = 0;
+    test.compute_info.thread_ids_num = 1;
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    Require(test.name, "finite destination count", compiled.resources.buffers.size() == 6u,
+            "selector lost a destination or retained a dynamic descriptor load");
+    for (const auto& descriptor : compiled.resources.buffers)
+      test.storage_buffer_ranges.emplace_back(descriptor.dwords[0], descriptor.dwords[2] * 4u);
+    for (u32 key = 0; key < 5u; ++key) {
+      for (u32 lane = 0; lane < wave; ++lane)
+        test.initial[input / 4u + lane] = lane == first_lane ? key : (key + 1u) % 5u;
+      test.expected = test.initial;
+      for (const auto lane : {first_lane, first_lane + 1u})
+        test.expected[(output + key * slot) / 4u + lane] = 0x1000u + lane;
+      auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+      vulkan.Dispatch(test, compiled, buffer);
+      const auto actual = vulkan.ReadBuffer(test.name, buffer, test.expected.size());
+      vulkan.DestroyBuffer(&buffer);
+      CompareWords(test, "first active lane, masked writes and destination canaries", test.expected, actual);
+    }
+    std::printf("[compute] %-32s ok\n", test.name);
+  }
+}
+
 void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   using namespace ShaderRecompiler::IR;
   TestCase test;
@@ -45083,6 +45147,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(32));
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(64));
     CheckBoundedFormattedBufferCopy(vulkan);
+    CheckFiniteBufferSelection(vulkan);
     CheckIndirectBufferStore(vulkan);
     CheckRuntimeBufferRecords(vulkan);
     RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());
@@ -45781,6 +45846,7 @@ int main(int argc, char **argv) {
   CheckRectListShaders();
   CheckBoundedFormattedBufferCopy(vulkan);
   CheckIndirectBufferStore(vulkan);
+  CheckFiniteBufferSelection(vulkan);
   CheckRuntimeBufferRecords(vulkan);
   CheckComputeThreadDimensions(vulkan);
   CheckCountedRowImageSelector(vulkan);
