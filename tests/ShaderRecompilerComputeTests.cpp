@@ -11103,6 +11103,114 @@ public:
         }
       }
 
+      // The captured material dispatch reaches 132 distinct writable records.
+      // Keep their null row and GPU-only keys on the native renderer/cache path.
+      constexpr u32 material_count = 132, material_rows = material_count + 1u;
+      constexpr u32 material_groups = material_rows + 1u, material_slot = 256;
+      constexpr auto material_keys = base;
+      constexpr auto material_table = base + 0x1000;
+      constexpr auto material_output = base + 0x20000;
+      const auto material_prefix = [](u32 row) { return row % 127u + 1u; };
+      std::vector<u32> material_producer;
+      AppendVop3(&material_producer, 0x346, 1, 4, InlineU32(6), Vgpr(0));
+      material_producer.insert(material_producer.end(), {
+          EncodeVop2(0x1a, 2, InlineU32(16), 1),
+          EncodeMubuf0(0x1c, 0, true, false), EncodeMubuf1(2, 0, 1)});
+      AppendEnd(&material_producer);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(material_producer.data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<u32>(material_producer.size() * sizeof(u32))});
+      for (const u32 wave : {32u, 64u}) {
+        Require(name, "large material fixture reset", context.InvalidateMemory(base, 0x50000),
+                "material fixtures escaped the existing mapped allocation");
+        std::vector<u32> records(material_rows * 592u / 4u);
+        std::vector<u32> expected(material_count * material_slot / 4u, sentinel);
+        auto expected_bytes = std::as_writable_bytes(std::span(expected));
+        for (u32 row = 1; row < material_rows; ++row) {
+          const auto target = material_output + (row - 1u) * material_slot + material_prefix(row);
+          const std::array<u32, 4> descriptor{static_cast<u32>(target),
+              static_cast<u32>(target >> 32u) | (1u << 16u), 20u,
+              (u32(Prospero::BufferFormat::k8SInt) << 12u) | DstSel(4, 0, 0, 0)};
+          std::copy(descriptor.begin(), descriptor.end(), records.begin() + (row * 592u + 448u) / 4u);
+          for (u32 lane = 0; lane < 20u; lane += 2u)
+            expected_bytes[(row - 1u) * material_slot + material_prefix(row) + lane] =
+                std::byte(u32(std::clamp(int32_t(lane * 32u) - 200, -128, 127)) & 255u);
+        }
+        const std::vector<u32> untouched(expected.size(), sentinel);
+        const std::vector<u32> stale_keys(material_groups, sentinel);
+        LibKernel::Memory::WriteBacking(material_keys, stale_keys.data(), stale_keys.size() * 4u);
+        LibKernel::Memory::WriteBacking(material_table, records.data(), records.size() * 4u);
+        LibKernel::Memory::WriteBacking(material_output, untouched.data(), untouched.size() * 4u);
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(material_producer.data()),
+                             .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
+        set_buffer(0, material_keys, material_groups, 4u);
+        processor.DispatchDirect(3, 1, 1, 0x41u);
+        std::vector<u32> cpu_keys(material_groups);
+        Require(name, "GPU-only material keys",
+                cache.HasGpuDirtyBytes(material_keys, stale_keys.size() * 4u) &&
+                    LibKernel::Memory::TryReadBacking(material_keys, cpu_keys.data(), cpu_keys.size() * 4u) &&
+                    cpu_keys == stale_keys,
+                "material selection did not remain GPU-owned before native compilation");
+
+        std::vector<u32> material_shader{
+            EncodeVop1(0x01, 2, 8),
+            EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(4, 0, 2), EncodeSopp(0x0c, 0),
+            EncodeVop2(0x16, 6, InlineU32(16), 4)};
+        AppendVop3(&material_shader, 0x360, 12, Vgpr(6), InlineU32(0));
+        material_shader.insert(material_shader.end(), {
+            EncodeSop2(0x26, 13, 12, 255), 592u,
+            EncodeSmem0(0x0a, 16, 2), EncodeSmem1(448, 13), EncodeSopp(0x0c, 0),
+            EncodeVop2(0x1a, 10, InlineU32(5), 0),
+            EncodeVop2(0x25, 10, 255, 10), u32(-200)});
+        AppendSMovLiteral(&material_shader, 126, 0x55555555u);
+        AppendSMovLiteral(&material_shader, 127, wave == 64u ? 0x55555555u : 0u);
+        material_shader.insert(material_shader.end(), {
+            EncodeMubuf0(0x04, 0, true, false, true), EncodeMubuf1(10, 4, 0)});
+        AppendEnd(&material_shader);
+        ShaderMapUserData(reinterpret_cast<uint64_t>(material_shader.data()),
+            {.type = Prospero::ShaderBinaryType::kCs,
+             .code_size_bytes = static_cast<u32>(material_shader.size() * sizeof(u32))});
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(material_shader.data()),
+                             .num_thread_x = wave, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = static_cast<uint8_t>(wave), .user_sgpr = 8, .tgid_x_en = true});
+        set_buffer(0, material_keys, material_groups, 4u);
+        set_buffer(4, material_table, material_rows, 592u);
+        ShaderComputeInputInfo input{};
+        input.workgroup_counts[0] = material_groups;
+        input.workgroup_counts[1] = input.workgroup_counts[2] = 1u;
+        (void)context.GetPipelineCache().GetComputeProgram(
+            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+        const auto &info = input.stage.program->info;
+        const auto root = std::ranges::find_if(info.buffers, [](const auto &buffer) {
+          return buffer.indirect_resources.size() == material_rows;
+        });
+        const auto &bindings = input.stage.program->bindings;
+        const auto native_count = bindings.descriptor_counts[
+            static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)];
+        Require(name, "native material descriptor array",
+                root != info.buffers.end() && native_count > 64u && root->packed_stride == 0u &&
+                    std::ranges::all_of(root->indirect_resources,
+                        [&](u32 index) { return info.buffers[index].live; }),
+                "material candidates were truncated, left unbound, or lost their null root");
+        Require(name, "large material shader-data buffer", !bindings.UsesPushData() &&
+                    bindings.descriptor_counts[static_cast<size_t>(
+                        ShaderRecompiler::IR::DescriptorBindingKind::ShaderData)] == 1u,
+                "large binding-prefix data did not use the existing shader-data buffer");
+        processor.DispatchDirect(material_groups, 1, 1, 0x41u |
+            (wave == 32u ? 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT : 0u));
+        for (u32 row = 1; row < material_rows; ++row)
+          Require(name, "every selected material becomes GPU-owned",
+                  cache.HasGpuDirtyBytes(material_output + (row - 1u) * material_slot + material_prefix(row), 20u),
+                  "a writable material beyond the original descriptor capacity was not tracked");
+        cache.ReadMemory(material_output, expected.size() * 4u);
+        std::vector<u32> actual(expected.size());
+        Require(name, "132 material writes, null/OOB keys, masks and byte canaries",
+                LibKernel::Memory::TryReadBacking(material_output, actual.data(), actual.size() * 4u) &&
+                    actual == expected,
+                "native material selection or per-binding byte offsets corrupted a target or neighboring byte");
+      }
+
       // Exchange values across two waves in the last 512 bytes of each
       // workgroup's 64-KiB LDS, on a host restricted to 48-KiB native shared memory.
       constexpr auto lds_output = base + 0xb0000;

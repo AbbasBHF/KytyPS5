@@ -7162,7 +7162,7 @@ void TestResourceLimitIsTransactional() {
   Fixture accepted;
   MemoryInfo accepted_memory;
   accepted_memory.kind = ResourceKind::Buffer;
-  for (uint32_t index = 0; index < ShaderInfo::MaxBuffers; index++) {
+  for (uint32_t index = 0; index < ShaderInfo::MaxBufferRoots; index++) {
     const auto handle = accepted.Buffer(
         {Value(index), Value(index + 1u), Value(index + 2u), Value(index + 3u)},
         index * 4u);
@@ -7184,7 +7184,7 @@ void TestResourceLimitIsTransactional() {
   Fixture fixture;
   MemoryInfo memory;
   memory.kind = ResourceKind::Buffer;
-  for (uint32_t index = 0; index <= ShaderInfo::MaxBuffers; index++) {
+  for (uint32_t index = 0; index <= ShaderInfo::MaxBufferRoots; index++) {
     const auto handle = fixture.Buffer(
         {Value(index), Value(index + 1u), Value(index + 2u), Value(index + 3u)},
         index * 4u);

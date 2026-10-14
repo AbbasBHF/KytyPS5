@@ -312,7 +312,7 @@ void Visit(Program& program, bool fsb, ShaderStageInputInfo input_info, InputUsa
 				info.uses_lds |= kind == ResourceKind::Lds;
 				info.uses_gds |= kind == ResourceKind::Gds;
 			} else if (kind == ResourceKind::Buffer || kind == ResourceKind::ScalarBuffer) {
-				if (memory.resource >= info.buffers.size() || memory.resource >= ShaderInfo::MaxBuffers) {
+				if (memory.resource >= info.buffers.size()) {
 					return Fail("buffer operation has invalid resource metadata");
 				}
 				info.buffers[memory.resource].live = true;
@@ -573,9 +573,6 @@ void CollectShaderInfo(Program& program, bool fsb, ShaderStageInputInfo input_in
 	}
 	ValidateOptions(program, input_info);
 	auto& info = program.info;
-	if (info.buffers.size() > ShaderInfo::MaxBuffers) {
-		return Fail("buffer resource limit exceeded");
-	}
 	info.inputs.clear();
 	info.outputs.clear();
 	info.user_data_registers.clear();
