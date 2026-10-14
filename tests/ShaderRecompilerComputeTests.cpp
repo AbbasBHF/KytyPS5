@@ -31762,7 +31762,7 @@ std::vector<TestCase> BufferStoreFormatD16Cases() {
     std::array<u32, 2> input;
     std::array<u32, 4> expected;
     u32 words = 1;
-    bool wide = false;
+    u32 opcode = 0x84u;
   };
   constexpr StoreCase inputs[] = {
       {"BufferStoreFormatD16XFloat16", F::k16Float, {0x7e63c000u}, {0xffffc000u}},
@@ -31772,39 +31772,53 @@ std::vector<TestCase> BufferStoreFormatD16Cases() {
       {"BufferStoreFormatD16XUnorm8", F::k8UNorm, {0x7e633800u}, {0xffffff80u}},
       {"BufferStoreFormatD16XSnorm16", F::k16SNorm, {0x7e63b800u}, {0xffffc000u}},
       {"BufferStoreFormatD16XZeroFill", F::k16_16Float, {0x7e633800u}, {0x00003800u}},
+      {"BufferStoreFormatD16HiXUint16", F::k16UInt, {0xfffe1234u}, {0xfffeu}, 1, 0x27u},
+      {"BufferStoreFormatD16HiXFloat16", F::k16Float, {0xc0003c00u}, {0xc000u}, 1, 0x27u},
+      {"BufferStoreFormatD16HiXFloat32", F::k32Float, {0x3800c000u}, {0x3f000000u}, 1, 0x27u},
+      {"BufferStoreFormatD16HiXSint32", F::k32SInt, {0xfffe1234u}, {0xfffffffeu}, 1, 0x27u},
+      {"BufferStoreFormatD16HiXUnorm8", F::k8UNorm, {0x38003c00u}, {0x80u}, 1, 0x27u},
+      {"BufferStoreFormatD16HiXZeroFill", F::k16_16Float, {0x38003c00u}, {0x00003800u}, 1, 0x27u},
       {"BufferStoreFormatD16XyzwFloat16", F::k16_16_16_16Float,
-       {0xc0003c00u, 0x34003800u}, {0xc0003c00u, 0x34003800u}, 2, true},
+       {0xc0003c00u, 0x34003800u}, {0xc0003c00u, 0x34003800u}, 2, 0x87u},
       {"BufferStoreFormatD16XyzwFloat32", F::k32_32_32_32Float,
-       {0xc0003c00u, 0x34003800u}, {0x3f800000u, 0xc0000000u, 0x3f000000u, 0x3e800000u}, 4, true},
+       {0xc0003c00u, 0x34003800u}, {0x3f800000u, 0xc0000000u, 0x3f000000u, 0x3e800000u}, 4, 0x87u},
       {"BufferStoreFormatD16XyzwUint32", F::k32_32_32_32UInt,
-       {0xffff0001u, 0x80007fffu}, {1u, 0xffffu, 0x7fffu, 0x8000u}, 4, true},
+       {0xffff0001u, 0x80007fffu}, {1u, 0xffffu, 0x7fffu, 0x8000u}, 4, 0x87u},
       {"BufferStoreFormatD16XyzwSint32", F::k32_32_32_32SInt,
-       {0x8000ffffu, 0x7fff0001u}, {0xffffffffu, 0xffff8000u, 1u, 0x7fffu}, 4, true},
+       {0x8000ffffu, 0x7fff0001u}, {0xffffffffu, 0xffff8000u, 1u, 0x7fffu}, 4, 0x87u},
       {"BufferStoreFormatD16XyzwSint8", F::k8_8_8_8SInt,
-       {0xff80ff7fu, 0x0080007fu}, {0x7f7f8080u}, 1, true},
+       {0xff80ff7fu, 0x0080007fu}, {0x7f7f8080u}, 1, 0x87u},
       {"BufferStoreFormatD16XyzwUnorm8", F::k8_8_8_8UNorm,
-       {0x3800c000u, 0x40003c00u}, {0xffff8000u}, 1, true},
+       {0x3800c000u, 0x40003c00u}, {0xffff8000u}, 1, 0x87u},
   };
   std::vector<TestCase> cases;
   for (const auto &input : inputs)
-  for (const u32 wave : {32u, 64u}) {
-    if (!input.wide && wave == 64u) continue;
+  for (const u32 wave : {32u, 64u})
+  for (u32 mask = 0; mask < (input.opcode == 0x27u ? 2u : 1u); ++mask) {
+    const bool wide = input.opcode == 0x87u;
+    const bool high = input.opcode == 0x27u;
+    const bool multi_lane = wide || high;
+    const bool masked = wide || mask != 0;
+    if (!multi_lane && wave == 64u) continue;
+    const u32 payload_bytes = Prospero::NumBytesPerElement(input.format);
+    const u32 stride = high ? payload_bytes : input.words * 4u;
     TestCase test;
     test.name = input.name;
     AppendVMovLiteral(&test.code, 66, input.input[0]);
-    if (input.wide) {
-      AppendVMovLiteral(&test.code, 67, input.input[1]);
+    if (wide) AppendVMovLiteral(&test.code, 67, input.input[1]);
+    if (multi_lane) {
       test.code.push_back(EncodeVop2(0x25, 65, InlineU32(1), 0));
+    } else AppendVMovU32(&test.code, 65, 1);
+    if (masked) {
       AppendSMovLiteral(&test.code, 126, 0x55555555u);
       AppendSMovLiteral(&test.code, 127, wave == 64u ? 0x55555555u : 0u);
-    } else AppendVMovU32(&test.code, 65, 1);
+    }
     const auto store = [&] {
-      // XYZW matches captured e21c6000/8002000e with v66:67/v65 and s0:3.
-      test.code.push_back(EncodeMubuf0(input.wide ? 0x87u : 0x84u, 0, true, false, input.wide));
+      test.code.push_back(EncodeMubuf0(input.opcode, 0, true, false, multi_lane));
       test.code.push_back(EncodeMubuf1(66, 0, 65));
     };
     store();
-    if (input.wide) {
+    if (multi_lane) {
       AppendVMovU32(&test.code, 65, wave + 1u);
       store(); // Active lanes must not write beyond the descriptor range.
       AppendVMovU32(&test.code, 65, 0u);
@@ -31812,13 +31826,15 @@ std::vector<TestCase> BufferStoreFormatD16Cases() {
       store(); // EXEC-zero must preserve the leading record.
     }
     AppendEnd(&test.code);
-    if (input.wide) {
-      test.initial.assign((wave + 2u) * input.words, 0xdeadbeefu);
+    if (multi_lane) {
+      test.initial.assign(((wave + 2u) * stride + 3u) / 4u, 0xdeadbeefu);
       test.expected = test.initial;
-      for (u32 lane = 0; lane + 2u < wave; lane += 2u)
-        std::copy_n(input.expected.begin(), input.words,
-                    test.expected.begin() + (lane + 1u) * input.words);
-      test.storage_buffer_range_bytes = wave * input.words * 4u - 1u;
+      auto expected_bytes = std::as_writable_bytes(std::span(test.expected));
+      const auto payload = std::as_bytes(std::span(input.expected));
+      for (u32 lane = 0; lane + 2u < wave; lane += masked ? 2u : 1u)
+        std::copy_n(payload.begin(), payload_bytes,
+                    expected_bytes.begin() + (lane + 1u) * stride);
+      test.storage_buffer_range_bytes = wave * stride - 1u;
       test.has_compute_info = true;
       test.compute_info.wave_size = wave;
       test.compute_info.threads_num[0] = wave;
@@ -31829,11 +31845,13 @@ std::vector<TestCase> BufferStoreFormatD16Cases() {
       test.initial = {0xdeadbeefu, 0xffffffffu, 0xcafef00du};
       test.expected = {0xdeadbeefu, input.expected[0], 0xcafef00du};
     }
-    test.user_data = MakeStructuredStorageBufferData(input.words * 4u, input.wide ? wave : 3u,
+    test.user_data = MakeStructuredStorageBufferData(stride, multi_lane ? wave : 3u,
                                                     false, BufferFormat(input.format));
     test.has_user_data = true;
-    test.opcodes = {O::V_MOV_B32, input.wide ? O::BUFFER_STORE_FORMAT_D16_XYZW :
-                                            O::BUFFER_STORE_FORMAT_D16_X, O::S_ENDPGM};
+    test.opcodes = {O::V_MOV_B32, high ? O::BUFFER_STORE_FORMAT_D16_HI_X :
+                                wide ? O::BUFFER_STORE_FORMAT_D16_XYZW :
+                                       O::BUFFER_STORE_FORMAT_D16_X, O::S_ENDPGM};
+    if (high) test.decoded_counts = {{"BUFFER_STORE_FORMAT_D16_HI_X", 3u}};
     cases.push_back(std::move(test));
   }
   return cases;

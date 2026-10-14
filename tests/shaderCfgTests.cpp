@@ -15464,6 +15464,24 @@ void TestCapturedBufferStoreShortD16HiDecode() {
         "captured BUFFER_STORE_SHORT_D16_HI lost its high half, address, or coherence flags");
 }
 
+void TestCapturedBufferStoreFormatD16HiXDecode() {
+  namespace Decoder = ShaderRecompiler::Decoder;
+  const uint32_t code[] = {0xe09c6000u, 0x80010007u};
+  Decoder::Instruction inst;
+  Decoder::DecodeInstruction(code, 0, inst);
+  Check(inst.opcode == Decoder::Opcode::BUFFER_STORE_FORMAT_D16_HI_X &&
+            inst.word_count == 2 && inst.data_dwords == 1 && inst.data_bits == 16 &&
+            inst.data_components == 0 && inst.formatted && !inst.typed,
+        "captured BUFFER_STORE_FORMAT_D16_HI_X lost its one formatted halfword");
+  Check(inst.dst.kind == Decoder::OperandKind::Vgpr && inst.dst.reg == 0 &&
+            inst.dst.sdwa_sel == 5 && !inst.dst.sdwa_sext &&
+            inst.src0.kind == Decoder::OperandKind::Vgpr && inst.src0.reg == 7 &&
+            inst.src1.kind == Decoder::OperandKind::Sgpr && inst.src1.reg == 4 &&
+            inst.src2.kind == Decoder::OperandKind::IntegerInlineConstant && inst.src2.value == 0 &&
+            inst.idxen && !inst.offen && inst.offset == 0 && inst.glc && !inst.dlc && !inst.slc,
+        "captured BUFFER_STORE_FORMAT_D16_HI_X lost its high half, index, or coherence flags");
+}
+
 void TestCapturedBufferStoreD16XyzwDecode() {
   namespace Decoder = ShaderRecompiler::Decoder;
   const uint32_t code[] = {0xe21c6000u, 0x8002000eu};
@@ -16168,6 +16186,7 @@ int main() {
   TestGraphicsPushConstantPlacement();
   TestCapturedBufferLoadUbyteD16Decode();
   TestCapturedBufferStoreShortD16HiDecode();
+  TestCapturedBufferStoreFormatD16HiXDecode();
   TestCapturedBufferStoreD16XyzwDecode();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
 
