@@ -5567,6 +5567,26 @@ void TestNewShaderRecompilerCubeSampleCoordinates() {
 
 void TestImageAddressOperands() {
   using namespace ShaderRecompiler;
+  // Captured at PC 0x10cc in compute shader 0041b6a03db7472d.
+  const uint32_t captured[] = {0xf130010au, 0x00a30013u, 0x00161a19u};
+  Decoder::Instruction gather;
+  Decoder::DecodeInstruction(captured, 0, gather);
+  Check(gather.opcode == Decoder::Opcode::IMAGE_GATHER4_C_L &&
+            gather.opcode_id == 0x4cu && gather.word_count == 3u &&
+            gather.image_dimension == Decoder::ImageDimension::Dim2D &&
+            gather.dmask == 1u && gather.data_components == 4u &&
+            gather.data_dwords == 4u && gather.data_bits == 32u &&
+            gather.image_sample_flags == (Decoder::ImageSampleFlagCompare |
+                                           Decoder::ImageSampleFlagLod) &&
+            gather.image_address_components == 4u && gather.image_nsa_dwords == 1u &&
+            gather.dst.reg == 0u && gather.src0.reg == 19u &&
+            gather.src1.reg == 12u && gather.src2.reg == 20u &&
+            gather.image_nsa_addr[0] == 25u && gather.image_nsa_addr[1] == 26u &&
+            gather.image_nsa_addr[2] == 22u && !gather.glc && !gather.slc &&
+            !gather.image_r128,
+        "captured IMAGE_GATHER4_C_L lost compare/LOD, NSA, or result metadata");
+  Check(Decoder::InstructionToString(gather).find("IMAGE_GATHER4_C_L") != std::string::npos,
+        "captured IMAGE_GATHER4_C_L is missing from the decoded dump");
   struct Case {
     uint32_t opcode;
     uint32_t dimension;
@@ -5581,6 +5601,7 @@ void TestImageAddressOperands() {
       Case{0x20, 1, true, false, 2, 1},  // packed xy
       Case{0x3d, 1, true, false, 5, 4},  // offset, half bias, full dref, packed xy
       Case{0x20, 2, true, true, 3, 2},   // packed xy/z in nonconsecutive VGPRs
+      Case{0x4c, 1, false, true, 4, 4},  // full dref, xy, and LOD in NSA VGPRs
       Case{0x0e, 1, false, false, 1, 1}, // resource query mip
   };
   for (const auto &test : cases) {
@@ -5602,6 +5623,12 @@ void TestImageAddressOperands() {
     options.stage = ShaderType::Compute;
     options.input_info.compute = &compute;
     auto program = Frontend::TranslateProgram(decoded, CFG::BuildGraph(decoded), options);
+    if (test.opcode == 0x4cu) {
+      Check(program.memory_info.size() == 1u &&
+                program.memory_info[0].image_sample_flags == gather.image_sample_flags &&
+                program.memory_info[0].data_dwords == 4u,
+            "IMAGE_GATHER4_C_L lost its shared compare/LOD metadata during translation");
+    }
     IR::RewriteToSsa(program.blocks);
     IR::ConstantPropagationPass(program.blocks);
     uint32_t addresses = 0;
