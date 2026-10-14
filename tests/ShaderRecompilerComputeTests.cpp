@@ -10456,7 +10456,8 @@ public:
                     MakeImageInfo(binding).imageView == nullptr &&
                     binding.layout == vk::ImageLayout::eGeneral;
               }), "an all-zero guest descriptor allocated or bound a backing image");
-          processor.DispatchDirect(1, 1, 1, 0x41u);
+          processor.DispatchDirect(1, 1, 1, 0x41u |
+              (wave_size == 32u ? 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT : 0u));
         }
         for (u32 phase : {0u, 2u}) {
           const auto address = output_address(phase);
