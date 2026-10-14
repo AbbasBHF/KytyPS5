@@ -13843,7 +13843,7 @@ void TestNewShaderRecompilerNativeBindingPlan() {
   using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
   const uint32_t shader[] = {
-      EncodeSmem0(0x08, 0, 4),
+      EncodeSmem0(0x08, 0, 16),
       0u, // s_buffer_load_dword s0
       EncodeVop1(0x01, 0, 0),
       EncodeMubuf0(0x1c, 8),
@@ -13861,6 +13861,13 @@ void TestNewShaderRecompilerNativeBindingPlan() {
 
   auto user_data = ImageTestUserData();
   SetImageTestFormat(&user_data, 6, Prospero::BufferFormat::k32UInt);
+  // Buffers have their own nonempty V# descriptors, disjoint from the T#/S# data.
+  for (const auto start : {4u, 32u}) {
+    user_data[start] = 0x1000u + start * 0x100u;
+    user_data[start + 1u] = 4u << 16u;
+    user_data[start + 2u] = 0x1000u;
+    user_data[start + 3u] = 3u << 28u;
+  }
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data;
