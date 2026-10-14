@@ -15722,6 +15722,67 @@ void TestSpirvRepeatedEmission() {
         "split-wave re-emission retained native-wave definitions");
 }
 
+void TestSpirvConditionVotes() {
+  using namespace ShaderRecompiler;
+  using K = CFG::BranchCondition;
+  for (const auto [wave, host] : {std::pair{32u, 32u}, std::pair{64u, 64u},
+                                  std::pair{64u, 32u}}) {
+    const uint32_t shader[] = {EncodeSopp(0x01)};
+    ShaderComputeInputInfo compute{};
+    compute.wave_size = wave;
+    compute.host_subgroup_size = host;
+    compute.threads_num[0] = wave;
+    compute.threads_num[1] = compute.threads_num[2] = 1;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.wave_size = wave;
+    options.input_info.compute = &compute;
+    auto compiled = RecompileForTest(shader, options);
+    IR::IREmitter emitter(compiled.program.blocks.front());
+    const auto lane = emitter.Emit(IR::ValueOpcode::LaneId, {});
+    const auto predicate = emitter.Emit(IR::ValueOpcode::IEqual32, {lane, IR::Value(33u)});
+    std::vector<IR::Inst *> references;
+    std::vector<IR::Inst *> conditions;
+    for (const auto kind : {K::ExecZero, K::VccZero, K::SccZero,
+                            K::ExecNonZero, K::VccNonZero, K::SccNonZero}) {
+      const auto condition = emitter.Emit(IR::ValueOpcode::ConditionRef, {predicate}, kind);
+      conditions.push_back(condition.TryInstruction());
+      references.push_back(&compiled.program.blocks.front()->AppendNewInst(
+          IR::ValueOpcode::Reference, {condition}));
+    }
+    const auto scalar = emitter.Emit(IR::ValueOpcode::ConditionRef, {predicate}, K::ScalarInstruction);
+    emitter.Emit(IR::ValueOpcode::Reference, {scalar});
+    compiled.program.shader_info_complete = false;
+    IR::CollectShaderInfo(compiled.program, options.input_info);
+    const auto binary = Spirv::EmitProgram(compiled.program, options.input_info);
+    CheckSpirvBinaryValidates(binary);
+    Check(compiled.program.info.subgroup_vote && !compiled.program.info.subgroup_ballot &&
+              SpirvContainsCapability(binary, spv::CapabilityGroupNonUniformVote) &&
+              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAll) == 3 &&
+              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAny) == 3 &&
+              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformBallot) == 0,
+          "condition votes used ballots, duplicated halves, or lost their capability");
+    Check(scalar.TryInstruction()->Definition(0) == predicate.TryInstruction()->Definition(0),
+          "scalar instruction condition acquired a subgroup vote");
+    if (wave != host) {
+      Check(SpirvInstructionOpcodeCount(binary, spv::OpLogicalAnd) == 3 &&
+                SpirvInstructionOpcodeCount(binary, spv::OpLogicalOr) == 3 &&
+                std::ranges::all_of(conditions, [](const auto *inst) {
+                  return inst->Definition(0) == inst->Definition(1);
+                }) && scalar.TryInstruction()->Definition(0) == scalar.TryInstruction()->Definition(1),
+            "condition votes did not combine and reuse both virtual halves");
+    }
+    for (auto *reference : references) reference->Invalidate();
+    IR::EliminateDeadCode(compiled.program.blocks);
+    compiled.program.shader_info_complete = false;
+    IR::CollectShaderInfo(compiled.program, options.input_info);
+    const auto scalar_only = Spirv::EmitProgram(compiled.program, options.input_info);
+    CheckSpirvBinaryValidates(scalar_only);
+    Check(!compiled.program.info.subgroup_vote &&
+              !SpirvContainsCapability(scalar_only, spv::CapabilityGroupNonUniformVote),
+          "recollection retained the removed condition vote capability");
+  }
+}
+
 void TestRepeatedExportsHaveOneInterface() {
   const uint32_t shader[] = {EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3),
                              EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3),
@@ -16059,6 +16120,7 @@ int main() {
   TestDeferredSpirvPhiPatching();
   TestCompilerStageInputOwnership();
   TestSpirvRepeatedEmission();
+  TestSpirvConditionVotes();
   TestRepeatedExportsHaveOneInterface();
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();

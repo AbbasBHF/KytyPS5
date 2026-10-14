@@ -545,6 +545,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		subgroup_size_control.pNext = &graphics.mesh_shader_properties;
 	}
 	physical_device.getProperties2(&properties2);
+	EXIT_NOT_IMPLEMENTED(!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;

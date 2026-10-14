@@ -724,17 +724,22 @@ uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// Scalar branches include lanes disabled by EXEC, which the branch body may restore.
-	if (ctx.other_half != nullptr && ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
+	if (ctx.other_half != nullptr && ctx.half != 0) return ctx.other_half->Result(inst);
 	const auto kind = inst.Flags<CFG::BranchCondition>();
 	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 0);
 	const bool zero = kind == CFG::BranchCondition::ExecZero ||
 	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
-	const auto ballot = ctx.Ballot(inst.Arg(0));
-	const auto reference = zero ? ctx.Ballot(IR::Value(true))
-	                            : ConstantU32CompositeZero(ctx.state, 4);
-	const auto compare = Binary(ctx.state, zero ? spv::OpIEqual : spv::OpINotEqual,
-	                            TypeBoolVector(ctx.state, 4), ballot, reference);
-	return Unary(ctx.state, zero ? spv::OpAll : spv::OpAny, TypeBool(ctx.state), compare);
+	// Zero-kind predicates are already inverted by translation.
+	auto predicate = ctx.Arg(inst, 0);
+	if (ctx.other_half != nullptr) {
+		predicate = Binary(ctx.state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr,
+		                   TypeBool(ctx.state), predicate, ctx.HalfArg(inst, 0, 1));
+	}
+	const auto result = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction(zero ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,
+	                              TypeBool(ctx.state), result,
+	                              ConstantU32(ctx.state, spv::ScopeSubgroup), predicate);
+	return result;
 }
 
 uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {

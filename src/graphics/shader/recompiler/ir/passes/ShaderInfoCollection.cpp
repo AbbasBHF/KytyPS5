@@ -517,7 +517,7 @@ void Visit(Program& program, bool fsb, ShaderStageInputInfo input_info, InputUsa
 		case ValueOpcode::StoreCompletion: info.subgroup_barrier = true; break;
 		case ValueOpcode::BvhIntersect: info.bvh = true; break;
 		case ValueOpcode::ConditionRef:
-			info.subgroup_ballot |=
+			info.subgroup_vote |=
 			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
 			break;
 		case ValueOpcode::Ballot: info.subgroup_ballot = true; break;
@@ -579,7 +579,8 @@ void CollectShaderInfo(Program& program, bool fsb, ShaderStageInputInfo input_in
 	for (auto& buffer: info.buffers) buffer.live = false;
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
 	    info.uses_dispatch_threads = info.uses_swizzle = false;
-	info.bvh = info.subgroup_ballot = info.subgroup_barrier = info.subgroup_shuffle = info.subgroup_arithmetic =
+	info.bvh = info.subgroup_ballot = info.subgroup_vote = info.subgroup_barrier =
+	    info.subgroup_shuffle = info.subgroup_arithmetic =
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =
 	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 = false;
