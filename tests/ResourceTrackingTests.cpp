@@ -4640,14 +4640,14 @@ void TestBoundedFormattedBufferStore() {
   memory.fail_address = UINT64_MAX;
   Check(materialize(), "valid uniform descriptor table did not recover after a failed refresh");
   ApplyResourceSpecialization(fixture->program, specialization);
-  bool lowered = false;
+  bool formatted = false;
   for (auto* block : fixture->program.blocks)
     for (auto& inst : *block)
       if (inst.GetOpcode() == ValueOpcode::StoreBufferU32) {
         const auto& info = fixture->program.memory_info[inst.Flags<MemoryFlags>().index];
-        lowered = !info.formatted && info.idxen;
+        formatted = info.formatted && info.idxen;
       }
-  Check(lowered, "proven UInt32 formatted store did not reuse the raw DWORD store");
+  Check(formatted, "UInt32 candidate store lost the shared formatted store path");
   for (const auto [step, bypass, offset] :
        {std::tuple{2u, false, false}, std::tuple{1u, true, false}, std::tuple{1u, false, true}})
     CheckFatal([&] { make(step, bypass, offset); }, "not a valid runtime value",
@@ -4960,6 +4960,168 @@ void TestGpuSelectedBufferRecords() {
   }
   CheckFatal([] { MakeBufferRecordFixture(1u, false, true, 0u, true); },
              "not a valid runtime value", "split dynamic descriptor offsets lost independent U32 wrapping");
+}
+
+void TestGpuSelectedFormattedRecordStore() {
+  namespace Prospero = Libs::Graphics::Prospero;
+  const auto make = [](uint32_t stride = 592u, uint32_t shift = 16u, bool split = false) {
+    auto fixture = std::make_unique<Fixture>();
+    auto& f = *fixture;
+    std::array<Value, 4> table_words, selector_words;
+    for (uint32_t word = 0; word < 4u; ++word) {
+      table_words[word] = f.UserData(word);
+      selector_words[word] = f.UserData(4u + word);
+    }
+    const auto table = f.Buffer(table_words);
+    const auto lane = f.Emit(ValueOpcode::LaneId);
+    const auto packed = f.Emit(ValueOpcode::LoadBufferU32,
+        {f.Buffer(selector_words), lane, Value(0u), Value(0u), Value(true)},
+        f.AddMemory({.kind = ResourceKind::Buffer, .idxen = true}, 0x1bcu));
+    const auto key = f.Emit(ValueOpcode::ReadLane,
+        {f.Emit(ValueOpcode::ShiftRightLogical32, {packed, Value(shift)}), Value(0u)});
+    const auto offset = f.Emit(ValueOpcode::IMul32, {key, Value(stride)});
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < 4u; ++word) {
+      const auto dynamic = split ? f.Emit(ValueOpcode::IAdd32, {offset, Value(word * 4u)}) : offset;
+      words[word] = f.Emit(ValueOpcode::ReadConstBuffer, {table, dynamic},
+          f.AddMemory({.kind = ResourceKind::ScalarBuffer,
+                       .offset = 448u + (split ? 0u : word * 4u),
+                       .component_index = word, .component_count = 4u}, 0x2e8u));
+    }
+    f.Emit(ValueOpcode::LoadBufferU32,
+        {f.Buffer(words), lane, Value(0u), Value(0u), Value(true)},
+        f.AddMemory({.kind = ResourceKind::Buffer, .formatted = true, .idxen = true}, 0x2f8u));
+    for (uint32_t use = 0; use < 2u; ++use)
+      f.Emit(ValueOpcode::StoreBufferU32,
+          {f.Buffer(words), lane, Value(0u), Value(0u), Value(uint32_t(-127)), Value(true)},
+          f.AddMemory({.kind = ResourceKind::Buffer, .formatted = true,
+                       .idxen = true, .coherent = true}, 0x1618u + use * 8u));
+    f.PlanAndTrack();
+    return fixture;
+  };
+  auto fixture = make();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  uint32_t root = UINT32_MAX;
+  for (uint32_t resource = 0; resource < plan.info.buffers.size(); ++resource) {
+    const auto& indirect = plan.descriptor_sources[plan.info.buffers[resource].source].indirect_descriptor;
+    if (!indirect) continue;
+    Check(root == UINT32_MAX && indirect->table_scalar && indirect->table_maximum == 65535u &&
+              !indirect->pointer_offset && !indirect->selector && indirect->key_count.IsEmpty() &&
+              indirect->table_stride == 592u && indirect->table_immediate == 448u,
+          "formatted record store lost its exact rows or captured the GPU selector");
+    root = resource;
+  }
+  Check(root != UINT32_MAX, "formatted record store has no native candidate root");
+  const Inst* selection = nullptr;
+  uint32_t scalar_reads = 0u, bda_reads = 0u, stores = 0u;
+  for (const auto* block : fixture->program.blocks)
+    for (const auto& inst : *block) {
+      if (inst.GetOpcode() == ValueOpcode::GetBufferResourceIndex) {
+        Check(selection == nullptr && inst.Flags<uint32_t>() == root,
+              "formatted record stores duplicated selection searches");
+        selection = &inst;
+        const auto* encoded = inst.Arg(0).Resolve().TryInstruction();
+        Check(encoded && encoded->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+                  encoded->Arg(1) == Value(2u) &&
+                  encoded->Arg(0).ResolveInstruction()->GetOpcode() == ValueOpcode::ReadLane,
+              "exact record selection used an affine wrapped-byte ordinal");
+        bool defined = false;
+        for (const auto& prior : *block) {
+          if (&prior == &inst) break;
+          defined |= &prior == encoded;
+        }
+        Check(defined, "exact row key was defined after its resource selection");
+      }
+      if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer) {
+        const auto& memory = fixture->program.memory_info[inst.Flags<MemoryFlags>().index];
+        Check(memory.kind == ResourceKind::ScalarBuffer && !memory.planning_only,
+              "store planning consumed descriptor words still used by the BDA load");
+        ++scalar_reads;
+      }
+      if (inst.GetOpcode() == ValueOpcode::LoadBufferU32 && inst.Flags<MemoryFlags>().pc == 0x2f8u) {
+        const auto& memory = fixture->program.memory_info[inst.Flags<MemoryFlags>().index];
+        Check(memory.kind == ResourceKind::IndirectBuffer && memory.formatted,
+              "store planning replaced the existing unrestricted BDA formatted load");
+        ++bda_reads;
+      }
+      if (inst.GetOpcode() == ValueOpcode::StoreBufferU32) {
+        Check(selection && inst.Arg(0).ResolveInstruction()->Arg(0).ResolveInstruction() == selection,
+              "formatted store lost its dominating shared selection");
+        ++stores;
+      }
+    }
+  Check(selection && scalar_reads == 4u && bda_reads == 1u && stores == 2u,
+        "shared formatted record fixture lost an exercised descriptor consumer");
+  LinearTestMemory memory;
+  std::ranges::fill(memory.words, 0xdeadbeefu);
+  constexpr uint32_t table_offset = 256u;
+  constexpr uint32_t first = (table_offset + 448u) / 4u;
+  for (uint32_t row = 0; row < 6u; ++row) {
+    const auto word = first + row * 592u / 4u;
+    memory.words[word] = 0x100000u + row * 32u;
+    memory.words[word + 1u] = 1u << 16u;
+    memory.words[word + 2u] = 20u;
+    memory.words[word + 3u] = (uint32_t(Prospero::BufferFormat::k8SInt) << 12u) | 4u;
+  }
+  memory.fail_address = memory.base + 0x2000u;
+  std::array<uint32_t, 8> user_data{uint32_t(memory.base) + table_offset, 592u << 16u, 6u, 0x5204u,
+      uint32_t(memory.fail_address), 4u << 16u, 64u, 0x5204u};
+  SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+      .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto materialize = [&] { return MaterializeResources(plan, runtime, snapshot, specialization); };
+  for (const uint32_t count : {0u, 6u, 0u, 6u}) {
+    user_data[2] = count;
+    memory.reads = 0u;
+    Check(materialize() && memory.reads == count &&
+              snapshot.buffers.size() == plan.info.buffers.size() + count,
+          "exact formatted records read GPU selector bytes, row padding or stale candidates");
+  }
+  const auto mapping = specialization.buffers[root].indirect_mapping_offset;
+  Check(snapshot.flattened_srt[mapping] == 6u, "exact formatted records lost the dense row map");
+  for (uint32_t row = 0; row < 6u; ++row)
+    Check(snapshot.flattened_srt[mapping + 1u + row] == row + 1u &&
+              std::ranges::find(snapshot.specialization_reads,
+                  std::pair{memory.base + table_offset + row * 592u + 448u, uint64_t{16u}}) !=
+                  snapshot.specialization_reads.end(),
+          "exact row descriptor escaped selection mapping or writable-alias capture");
+  const auto original = specialization;
+  memory.words[first] += 1u;
+  Check(materialize() && specialization == original,
+        "signed byte destination refresh required alignment or needless specialization");
+  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 5>{{
+      {first + 1u, 2u << 16u}, {first + 1u, (1u << 16u) | (1u << 31u)},
+      {first + 3u, (uint32_t(Prospero::BufferFormat::k8UInt) << 12u) | 4u},
+      {first + 3u, memory.words[first + 3u] | (1u << 28u)},
+      {first + 3u, memory.words[first + 3u] | (4u << 3u)}}}) {
+    const auto saved = memory.words[word];
+    memory.words[word] = value;
+    Check(!materialize(), "signed byte candidate accepted an unproved format, stride or bounds");
+    memory.words[word] = saved;
+  }
+  user_data[1] = 0u;
+  user_data[2] = 5u * 592u + 448u + 12u;
+  memory.watched_address = memory.base + table_offset + 5u * 592u + 448u;
+  Check(materialize() && memory.watched_dwords == 3u &&
+            snapshot.flattened_srt[specialization.buffers[root].indirect_mapping_offset] == 5u &&
+            snapshot.buffers.size() == plan.info.buffers.size() + 5u,
+        "partial direct V# did not zero-fill its missing format DWORD");
+  user_data[1] = 592u << 16u;
+  user_data[2] = 6u;
+  Check(materialize(), "valid signed byte records did not recover after a partial tail");
+  ApplyResourceSpecialization(fixture->program, specialization);
+  for (const auto* block : fixture->program.blocks)
+    for (const auto& inst : *block)
+      if (inst.GetOpcode() == ValueOpcode::StoreBufferU32) {
+        const auto& info = fixture->program.memory_info[inst.Flags<MemoryFlags>().index];
+        Check(info.kind == ResourceKind::Buffer && info.formatted && info.coherent,
+              "signed byte store bypassed shared formatted conversion or GLC");
+      }
+  for (const auto [stride, shift, split] :
+       {std::tuple{592u, 0u, false}, std::tuple{65540u, 16u, false}, std::tuple{592u, 16u, true}})
+    CheckFatal([&] { make(stride, shift, split); }, "not a valid runtime value",
+               "exact record store accepted an unbounded, wrapping or split descriptor offset");
 }
 
 void TestFiniteBufferSelection() {
@@ -6460,6 +6622,7 @@ int main() {
     Run("bounded formatted buffer store", TestBoundedFormattedBufferStore);
     Run("bounded buffer records", TestBoundedBufferRecords);
     Run("GPU-selected buffer records", TestGpuSelectedBufferRecords);
+    Run("GPU-selected formatted record store", TestGpuSelectedFormattedRecordStore);
     Run("finite buffer selection", TestFiniteBufferSelection);
     Run("packed scalar buffer selection", TestPackedScalarBufferSelection);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
