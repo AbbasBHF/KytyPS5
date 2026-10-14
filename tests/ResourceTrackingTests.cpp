@@ -4791,7 +4791,8 @@ void TestBoundedFormattedBufferStore() {
 std::unique_ptr<Fixture> MakeBufferRecordFixture(uint32_t step = 1u, bool bypass = false,
                                                   bool gpu_selected = false, uint32_t bias = 0u,
                                                   bool split_offsets = false,
-                                                  bool workgroup_selected = false) {
+                                                  bool workgroup_selected = false,
+                                                  uint32_t d32_components = 0u) {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   auto fixture = std::make_unique<Fixture>();
   auto& f = *fixture;
@@ -4851,12 +4852,21 @@ std::unique_ptr<Fixture> MakeBufferRecordFixture(uint32_t step = 1u, bool bypass
     for (uint32_t use = 0; use < (gpu_selected ? 2u : formatted ? 112u : 16u); ++use) {
       const auto handle = f.Buffer(words);
       if (formatted) {
-        const auto loaded = f.Emit(ValueOpcode::LoadBufferU32x2,
+        const auto opcode = d32_components == 3u ? ValueOpcode::LoadBufferU32x3
+                          : d32_components == 4u ? ValueOpcode::LoadBufferU32x4
+                                                 : ValueOpcode::LoadBufferU32x2;
+        const auto extract = d32_components == 3u ? ValueOpcode::CompositeExtractU32x3
+                           : d32_components == 4u ? ValueOpcode::CompositeExtractU32x4
+                                                  : ValueOpcode::CompositeExtractU32x2;
+        const auto loaded = f.Emit(opcode,
             {handle, lane, Value(0u), Value(0u), Value(true)},
-            f.AddMemory({.kind = ResourceKind::Buffer, .data_dwords = 2u, .data_bits = 16u,
-                         .component_count = 4u, .formatted = true, .idxen = true}, 0x1914u));
+            f.AddMemory({.kind = ResourceKind::Buffer,
+                         .data_dwords = d32_components == 0u ? 2u : d32_components,
+                         .data_bits = d32_components == 0u ? 16u : 32u,
+                         .component_count = d32_components == 0u ? 4u : d32_components,
+                         .formatted = true, .idxen = true}, 0x1914u));
         f.Emit(ValueOpcode::ReferenceU32,
-            {f.Emit(ValueOpcode::CompositeExtractU32x2, {loaded, Value(0u)})});
+            {f.Emit(extract, {loaded, Value(0u)})});
       } else {
         f.Emit(ValueOpcode::StoreBufferU8,
             {handle, lane, Value(0u), Value(0u), Value(uint8_t{42u}), Value(true)},
@@ -4868,10 +4878,13 @@ std::unique_ptr<Fixture> MakeBufferRecordFixture(uint32_t step = 1u, bool bypass
   return fixture;
 }
 
-void TestBoundedBufferRecords() {
+void TestBoundedBufferRecords(uint32_t d32_components) {
   namespace Prospero = Libs::Graphics::Prospero;
   using Libs::Graphics::DstSel;
-  auto fixture = MakeBufferRecordFixture();
+  auto fixture = MakeBufferRecordFixture(1u, false, false, 0u, false, false, d32_components);
+  const auto load_opcode = d32_components == 3u ? ValueOpcode::LoadBufferU32x3
+                         : d32_components == 4u ? ValueOpcode::LoadBufferU32x4
+                                                : ValueOpcode::LoadBufferU32x2;
   const auto plan = ExtractResourcePlan(fixture->program);
   Check(plan.info.buffers.size() == 2u, "record descriptors did not share their resource roots");
   uint32_t selections = 0u;
@@ -4884,7 +4897,7 @@ void TestBoundedBufferRecords() {
               "record selection moved outside its loop or lost its buffer root");
         selected[inst.Flags<uint32_t>()] = &inst;
       }
-      if (inst.GetOpcode() == ValueOpcode::LoadBufferU32x2 || inst.GetOpcode() == ValueOpcode::StoreBufferU8) {
+      if (inst.GetOpcode() == load_opcode || inst.GetOpcode() == ValueOpcode::StoreBufferU8) {
         const auto root = fixture->program.memory_info[inst.Flags<MemoryFlags>().index].resource;
         Check(inst.Arg(0).Instruction()->Arg(0).Instruction() == selected[root],
               "record operation did not use its dominating shared selection");
@@ -4957,7 +4970,7 @@ void TestBoundedBufferRecords() {
   ApplyResourceSpecialization(fixture->program, specialization);
   uint32_t loads = 0u;
   for (const auto* block : fixture->program.blocks)
-    for (const auto& inst : *block) loads += inst.GetOpcode() == ValueOpcode::LoadBufferU32x2;
+    for (const auto& inst : *block) loads += inst.GetOpcode() == load_opcode;
   Check(loads == 112u, "empty root incorrectly folded nonempty formatted candidates");
   memory.words[first] = first_address;
   memory.words[first + 2u] = 16u;
@@ -4973,7 +4986,7 @@ void TestBoundedBufferRecords() {
   memory.words[0] = MaxIndirectDescriptorProbes + 1u;
   Check(!materialize(), "record table accepted an unbounded candidate count");
   for (const auto [step, bypass] : {std::pair{2u, false}, std::pair{1u, true}}) {
-    const auto unbounded = MakeBufferRecordFixture(step, bypass);
+    const auto unbounded = MakeBufferRecordFixture(step, bypass, false, 0u, false, false, d32_components);
     for (const auto& buffer : unbounded->program.info.buffers) {
       const auto& source = unbounded->program.descriptor_sources[buffer.source];
       if (source.indirect_descriptor)
@@ -7276,7 +7289,9 @@ int main() {
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("writable descriptor phi", TestWritableDescriptorPhi);
     Run("bounded formatted buffer store", TestBoundedFormattedBufferStore);
-    Run("bounded buffer records", TestBoundedBufferRecords);
+    Run("bounded buffer records", [] {
+      for (const uint32_t components : {0u, 2u, 3u, 4u}) TestBoundedBufferRecords(components);
+    });
     Run("GPU-selected buffer records", TestGpuSelectedBufferRecords);
     Run("workgroup-selected buffer records", TestWorkgroupSelectedBufferRecords);
     Run("GPU-selected formatted record store", TestGpuSelectedFormattedRecordStore);

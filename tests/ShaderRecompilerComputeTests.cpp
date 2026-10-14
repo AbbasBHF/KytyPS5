@@ -37380,6 +37380,7 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
   // Multiplication by 192 wraps: these keys reach congruence slots 1,4,0,3,2,1,OOB,7,5.
   constexpr std::array keys{0u, 1u, 0x15555555u, 0x15555556u, 0x2aaaaaabu,
                             0x40000000u, UINT32_MAX, 2u, 0x2aaaaaacu};
+  for (const u32 components : {0u, 2u, 3u, 4u})
   for (const u32 wave : {32u, 64u}) {
     for (const u32 table_bytes : {0u, 536u, 544u}) {
       TestCase test;
@@ -37406,13 +37407,24 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
           EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(3, 0, 2),
           EncodeSopp(0x0c, 0), EncodeVop1(0x02, 32, Vgpr(3)),
           EncodeSop2(0x26, 33, 32, 255), 192u,
-          EncodeSop2(0x02, 33, 33, 255), 96u,
-          EncodeSmem0(0x0a, 36, 2), EncodeSmem1(144u, 33),
+          EncodeSop2(0x02, 33, 33, 255), 96u});
+      if (components == 0u)
+        code.insert(code.end(), {EncodeSmem0(0x0a, 36, 2), EncodeSmem1(144u, 33)});
+      code.insert(code.end(), {
           EncodeSmem0(0x0a, 8, 2), EncodeSmem1(160u, 33),
-          EncodeSmem0(0x0a, 12, 2), EncodeSmem1(176u, 33), EncodeSopp(0x0c, 0),
+          EncodeSmem0(0x0a, 12, 2), EncodeSmem1(176u, 33), EncodeSopp(0x0c, 0)});
+      if (components == 0u) {
+        code.insert(code.end(), {
           EncodeMubuf0(0x83, 0, true, false), EncodeMubuf1(4, 2, 0),
           EncodeMubuf0(0x0a, 0, true, false), EncodeMubuf1(6, 9, 0),
-          EncodeMubuf0(0x00, 0, true, false), EncodeMubuf1(7, 9, 0),
+          EncodeMubuf0(0x00, 0, true, false), EncodeMubuf1(7, 9, 0)});
+      } else {
+        for (u32 component = components; component < 4u; ++component)
+          AppendVMovLiteral(&code, 4u + component, 0x13579bdfu);
+        code.insert(code.end(), {EncodeMubuf0(components - 1u, 0, true, false, true),
+                                 EncodeMubuf1(4, 2, 0)});
+      }
+      code.insert(code.end(), {
           EncodeSopp(0x0c, 0), EncodeSop2(0x1e, 34, 24, InlineU32(std::countr_zero(wave))),
           EncodeVop2(0x25, 20, 34, 0),
           EncodeMubuf0(0x1e, 0, true, false), EncodeMubuf1(4, 4, 20)});
@@ -37422,18 +37434,32 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
       code.insert(code.end(), {EncodeMubuf0(0x19, 0, true, false, true), EncodeMubuf1(10, 3, 20)});
       AppendEnd(&code);
       for (u32 row = 0; row < 6u; ++row) {
-        const std::array<u32, 8> record{slot * (row + 1u), 8u << 16u, 1u,
+        std::array<u32, 8> record{slot * (row + 1u), 8u << 16u, 1u,
             static_cast<u32>(Prospero::BufferFormat::k16_16_16_16Float) << 12u | DstSel(4, 5, 6, 7),
             slot * (row + 7u), 1u << 16u, u32(keys.size()) * wave, 0x5204u};
+        if (components != 0u) {
+          constexpr std::array formats{Prospero::BufferFormat::k16_16Float,
+              Prospero::BufferFormat::k16_16_16_16SNorm, Prospero::BufferFormat::k10_10_10_2SNorm};
+          const std::array swizzles{DstSel(4, 5, 0, 1), DstSel(7, 4, 1, 0), DstSel(5, 4, 7, 6)};
+          record[3] = (u32(formats[row % 3u]) << 12u) | swizzles[row % 3u];
+          if (row == 3u) std::fill_n(record.begin(), 4u, 0u);
+        }
         std::copy(record.begin(), record.end(), test.initial.begin() + (table + 192u + row * 64u) / 4u);
         // BDA loads use a separate tuple, as the captured shader's record members do.
-        std::copy_n(record.begin(), 4u, test.initial.begin() + (table + 176u + row * 64u) / 4u);
-        test.initial[slot * (row + 1u) / 4u] = ((0x3800u + row) << 16u) | (0x3c00u + row);
-        test.initial[slot * (row + 1u) / 4u + 1u] = ((0xc000u + row) << 16u) | (0x4000u + row);
+        if (components == 0u) {
+          std::copy_n(record.begin(), 4u, test.initial.begin() + (table + 176u + row * 64u) / 4u);
+          test.initial[slot * (row + 1u) / 4u] = ((0x3800u + row) << 16u) | (0x3c00u + row);
+          test.initial[slot * (row + 1u) / 4u + 1u] = ((0xc000u + row) << 16u) | (0x4000u + row);
+        } else {
+          constexpr std::array<std::array<u32, 2>, 3> payload{{
+              {0x3800bc00u, 0u}, {0x7fff8000u, 0x80010000u}, {0xc007fe00u, 0u}}};
+          std::copy(payload[row % 3u].begin(), payload[row % 3u].end(),
+                    test.initial.begin() + slot * (row + 1u) / 4u);
+        }
       }
       // Compile against poison selectors. A separate GPU dispatch writes the actual keys.
       auto compiled = CompileCase(test, vulkan.SubgroupSize());
-      if (table_bytes == 0u)
+      if (table_bytes == 0u || components != 0u)
         test.forbidden_spirv = {"convert_indirect_buffer_format"};
       else
         test.required_spirv = {"get_bda_pointer", "convert_indirect_buffer_format"};
@@ -37448,12 +37474,13 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
         if (opcode == spv::OpFunctionCall && words[3] == bda_function) ++bda_calls;
         offset += words.size();
       }
-      Require(test.name, "empty descriptor table specialization", (bda_calls == 0u) == (table_bytes == 0u),
+      Require(test.name, "empty descriptor table specialization", (bda_calls == 0u) == (table_bytes == 0u || components != 0u),
               "empty table retained BDA reads or nonempty table lost GPU descriptor loads");
       for (const auto &descriptor : compiled.resources.buffers) {
         ShaderBufferResource resource{};
         std::copy_n(descriptor.dwords.begin(), 4u, resource.fields);
-        test.storage_buffer_ranges.emplace_back(resource.Base48(), std::max(4u, u32(resource.GetSize())));
+        test.storage_buffer_ranges.emplace_back(resource.Base48(),
+            components != 0u && resource.Base48() == slot * 5u ? 6u : std::max(4u, u32(resource.GetSize())));
       }
       TestCase producer;
       producer.name = "GpuRecordSelectorProducer";
@@ -37479,11 +37506,24 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
         for (u32 lane = 0; lane < wave; ++lane) {
           const u32 out = slot * 13u / 4u + (group * wave + lane) * 4u;
           const bool source = uint64_t{dynamic} + 160u + 16u <= table_bytes && lane == 0u;
-          test.expected[out] = source ? test.initial[slot * (row + 1u) / 4u] : 0u;
-          test.expected[out + 1u] = source ? test.initial[slot * (row + 1u) / 4u + 1u] : 0u;
-          const bool bda_source = uint64_t{dynamic} + 144u + 16u <= table_bytes && lane == 0u;
-          test.expected[out + 2u] = bda_source ? 0x3c00u + row : 0u;
-          test.expected[out + 3u] = bda_source ? 0x3f800000u + (row << 13u) : 0u;
+          if (components == 0u) {
+            test.expected[out] = source ? test.initial[slot * (row + 1u) / 4u] : 0u;
+            test.expected[out + 1u] = source ? test.initial[slot * (row + 1u) / 4u + 1u] : 0u;
+            const bool bda_source = uint64_t{dynamic} + 144u + 16u <= table_bytes && lane == 0u;
+            test.expected[out + 2u] = bda_source ? 0x3c00u + row : 0u;
+            test.expected[out + 3u] = bda_source ? 0x3f800000u + (row << 13u) : 0u;
+          } else {
+            constexpr std::array<std::array<u32, 4>, 3> values{{
+                {0xbf800000u, 0x3f000000u, 0u, 0x3f800000u},
+                {0xbf800000u, 0xbf800000u, 0x3f800000u, 0u},
+                {0x3f800000u, 0xbf800000u, 0xbf800000u, 0u}}};
+            constexpr std::array<std::array<u32, 4>, 3> defaults{{
+                {0u, 0u, 0u, 0x3f800000u}, {0u, 0u, 0x3f800000u, 0u}, {0u, 0u, 0u, 0u}}};
+            const bool descriptor = uint64_t{dynamic} + 160u + 16u <= table_bytes && row != 3u;
+            for (u32 component = 0; component < 4u; ++component)
+              test.expected[out + component] = component >= components ? 0x13579bdfu :
+                  !descriptor ? 0u : source && row != 4u ? values[row % 3u][component] : defaults[row % 3u][component];
+          }
           if (uint64_t{dynamic} + 176u + 16u <= table_bytes && (lane & 1u) == 0u)
             bytes[slot * (row + 7u) + group * wave + lane] = std::byte{0xc3};
         }
