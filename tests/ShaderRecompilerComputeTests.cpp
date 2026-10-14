@@ -20209,6 +20209,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::BUFFER_STORE_FORMAT_XYZ:
   case Opcode::BUFFER_STORE_FORMAT_XYZW:
   case Opcode::BUFFER_LOAD_UBYTE:
+  case Opcode::BUFFER_LOAD_UBYTE_D16:
   case Opcode::BUFFER_LOAD_SBYTE:
   case Opcode::BUFFER_LOAD_USHORT:
   case Opcode::BUFFER_LOAD_SSHORT:
@@ -30020,12 +30021,17 @@ TestCase BufferLoadVariants() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
-TestCase BufferLoadShortD16Captured(bool high) {
+TestCase BufferLoadD16Captured(ShaderOpcode opcode, u32 wave_size = 32) {
+  const bool high = opcode == ShaderOpcode::BUFFER_LOAD_SHORT_D16_HI;
+  const bool byte = opcode == ShaderOpcode::BUFFER_LOAD_UBYTE_D16;
   TestCase test;
-  test.name = high ? "BufferLoadShortD16HiCaptured" : "BufferLoadShortD16Captured";
+  test.name = byte ? (wave_size == 64 ? "BufferLoadUbyteD16Captured64" : "BufferLoadUbyteD16Captured32")
+                  : high ? "BufferLoadShortD16HiCaptured" : "BufferLoadShortD16Captured";
   auto& code = test.code;
-  const u32 data_reg = high ? 20u : 1u, index_reg = high ? 21u : 15u;
-  const std::array<u32, 2> load = high ? std::array{0xe0942006u, 0x80021415u}
+  const u32 data_reg = byte ? 0u : high ? 20u : 1u;
+  const u32 index_reg = byte ? 3u : high ? 21u : 15u;
+  const std::array<u32, 2> load = byte ? std::array{0xe080e000u, 0x80040003u}
+                                : high ? std::array{0xe0942006u, 0x80021415u}
                                       : std::array{0xe090200eu, 0x8000010fu};
   AppendVMovU32(&code, index_reg, 1);
   AppendVMovLiteral(&code, data_reg, 0xabcd1234u);
@@ -30043,27 +30049,49 @@ TestCase BufferLoadShortD16Captured(bool high) {
   AppendVMovLiteral(&code, data_reg, 0xbeef5678u);
   code.insert(code.end(), load.begin(), load.end());
   AppendStoreVgpr(&code, data_reg, 2);
+  if (byte) {
+    AppendVMovU32(&code, index_reg, 1);
+    for (u32 offset = 1; offset <= 3; ++offset) {
+      AppendVMovLiteral(&code, data_reg, 0xa1b2ffffu);
+      code.insert(code.end(), {load[0] | offset, load[1]});
+      AppendStoreVgpr(&code, data_reg, 2 + offset);
+    }
+    code.insert(code.end(), {load[0], load[1] | (index_reg << 8u)});
+    AppendStoreVgpr(&code, index_reg, 6);
+  }
   AppendEnd(&code);
   const u32 stride = high ? 16u : 32u;
   test.initial.assign(high ? 12u : 20u, 0xa5a5a5a5u);
-  test.initial[high ? 5u : 11u] = 0x8001cafeu;
+  test.initial[byte ? 8u : high ? 5u : 11u] = byte ? 0xff007f80u : 0x8001cafeu;
   if (high) test.initial[7] = 0xcafefaceu;
   test.expected = test.initial;
-  test.expected[0] = high ? 0x8001cafeu : 0xabcd8001u;
+  test.expected[0] = byte ? 0xabcd0080u : high ? 0x8001cafeu : 0xabcd8001u;
   test.expected[1] = 0xdeaf4321u;
   test.expected[2] = high ? 0x00005678u : 0xbeef0000u;
   test.user_data = MakeStructuredStorageBufferData(stride, 2);
   if (high) std::copy_n(test.user_data.begin(), 4, test.user_data.begin() + 8);
+  if (byte) {
+    std::copy_n(test.user_data.begin(), 4, test.user_data.begin() + 16);
+    test.expected[3] = 0xa1b2007fu;
+    test.expected[4] = 0xa1b20000u;
+    test.expected[5] = 0xa1b200ffu;
+    test.expected[6] = 0x80u;
+    test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+        test.compute_info.threads_num[2] = 1;
+    test.compute_info.wave_size = static_cast<uint8_t>(wave_size);
+    test.has_compute_info = true;
+    test.required_spirv = {"Volatile"};
+  }
   test.user_data[50] = static_cast<u32>(test.initial.size() * sizeof(u32));
   test.user_data[51] = 3u << 28u;
   test.has_user_data = true;
   test.storage_buffer_range_bytes = stride * 2u;
   test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::S_MOV_B64,
-      ShaderOpcode::BUFFER_LOAD_SHORT_D16, ShaderOpcode::BUFFER_STORE_DWORD,
-      ShaderOpcode::S_ENDPGM};
-  if (high) test.opcodes.push_back(ShaderOpcode::BUFFER_LOAD_SHORT_D16_HI);
-  test.decoded_counts = {{high ? "BUFFER_LOAD_SHORT_D16_HI v20.sdwa(sel=5,sext=0)"
-                               : "BUFFER_LOAD_SHORT_D16 v1.sdwa(sel=4,sext=0)", 3}};
+      opcode, ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  if (high) test.opcodes.push_back(ShaderOpcode::BUFFER_LOAD_SHORT_D16);
+  test.decoded_counts = {{byte ? "BUFFER_LOAD_UBYTE_D16 v0.sdwa(sel=4,sext=0)"
+                       : high ? "BUFFER_LOAD_SHORT_D16_HI v20.sdwa(sel=5,sext=0)"
+                              : "BUFFER_LOAD_SHORT_D16 v1.sdwa(sel=4,sext=0)", byte ? 6u : 3u}};
   return test;
 }
 
@@ -40364,7 +40392,10 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(BufferOffsetsUsePackedWords(false));
   cases.push_back(BufferOffsetsUsePackedWords(true));
   AddCase(BufferLoadVariants);
-  for (const bool high : {false, true}) cases.push_back(BufferLoadShortD16Captured(high));
+  for (const auto opcode : {ShaderOpcode::BUFFER_LOAD_SHORT_D16, ShaderOpcode::BUFFER_LOAD_SHORT_D16_HI})
+    cases.push_back(BufferLoadD16Captured(opcode));
+  for (const u32 wave : {32u, 64u})
+    cases.push_back(BufferLoadD16Captured(ShaderOpcode::BUFFER_LOAD_UBYTE_D16, wave));
   for (const u32 component : {4u, 2u, 0u}) {
     cases.push_back(BufferSubwordLoadsAtHostOffset(2, component, false));
   }
@@ -46279,7 +46310,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--flat-d16-only") == 0) {
     VulkanHarness vulkan;
-    for (const bool high : {false, true}) RunCase(&vulkan, BufferLoadShortD16Captured(high));
+    for (const auto opcode : {ShaderOpcode::BUFFER_LOAD_SHORT_D16, ShaderOpcode::BUFFER_LOAD_SHORT_D16_HI})
+      RunCase(&vulkan, BufferLoadD16Captured(opcode));
+    for (const u32 wave : {32u, 64u})
+      RunCase(&vulkan, BufferLoadD16Captured(ShaderOpcode::BUFFER_LOAD_UBYTE_D16, wave));
     RunCase(&vulkan, FlatStoreSlcCaptured());
     RunCase(&vulkan, FlatLoadDlcCaptured(32));
     RunCase(&vulkan, FlatLoadDlcCaptured(64));

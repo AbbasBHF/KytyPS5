@@ -15389,6 +15389,24 @@ void TestGraphicsPushConstantPlacement() {
   CheckSpirvBinaryValidates(spill.spirv);
 }
 
+void TestCapturedBufferLoadUbyteD16Decode() {
+  namespace Decoder = ShaderRecompiler::Decoder;
+  const uint32_t code[] = {0xe080e000u, 0x80040003u};
+  Decoder::Instruction inst;
+  Decoder::DecodeInstruction(code, 0, inst);
+  Check(inst.opcode == Decoder::Opcode::BUFFER_LOAD_UBYTE_D16 &&
+            inst.word_count == 2 && inst.data_dwords == 1 && inst.data_bits == 8 &&
+            !inst.data_signed && !inst.formatted && !inst.typed,
+        "captured BUFFER_LOAD_UBYTE_D16 lost its unsigned byte payload");
+  Check(inst.dst.kind == Decoder::OperandKind::Vgpr && inst.dst.reg == 0 &&
+            inst.dst.sdwa_sel == 4 && inst.dst.sdwa_dst_unused == 2 &&
+            inst.src0.kind == Decoder::OperandKind::Vgpr && inst.src0.reg == 3 &&
+            inst.src1.kind == Decoder::OperandKind::Sgpr && inst.src1.reg == 16 &&
+            inst.src2.kind == Decoder::OperandKind::IntegerInlineConstant && inst.src2.value == 0 &&
+            inst.idxen && !inst.offen && inst.offset == 0 && inst.glc && inst.dlc && !inst.slc,
+        "captured BUFFER_LOAD_UBYTE_D16 lost its preserved half, address, or coherence flags");
+}
+
 void TestNewShaderRecompilerUnsupportedMemoryDecode() {
   const uint32_t mubuf_unknown[] = {EncodeMubuf0(0x7b), EncodeMubuf1(0, 0, 1),
                                     0xbf810000u};
@@ -16073,6 +16091,7 @@ int main() {
   TestComputeLdsAllocationIdentity();
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();
+  TestCapturedBufferLoadUbyteD16Decode();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
 
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();

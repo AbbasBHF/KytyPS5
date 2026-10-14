@@ -973,6 +973,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		}
 
 		case Decoder::Opcode::BUFFER_LOAD_UBYTE:
+		case Decoder::Opcode::BUFFER_LOAD_UBYTE_D16:
 		case Decoder::Opcode::BUFFER_LOAD_SBYTE:
 		case Decoder::Opcode::BUFFER_LOAD_USHORT:
 		case Decoder::Opcode::BUFFER_LOAD_SSHORT:
