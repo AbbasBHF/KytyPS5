@@ -30951,6 +30951,7 @@ std::vector<TestCase> BufferLoadFormatD16XCases() {
     u32 index = 0;
     bool active = true;
     bool overlap = false;
+    u32 stride = 4;
   };
   constexpr LoadCase inputs[] = {
       {"BufferLoadFormatD16XFloat16", F::k16Float, 0x7e63c000u, 0xabcdc000u},
@@ -30971,6 +30972,8 @@ std::vector<TestCase> BufferLoadFormatD16XCases() {
       {"BufferLoadFormatD16XOobFloatOne", F::k32Float, 0u, 0xabcd3c00u, 1, 4},
       {"BufferLoadFormatD16XOobUintOne", F::k32UInt, 0u, 0xabcd0001u, 1, 4},
       {"BufferLoadFormatD16XOobZero", F::k32Float, 0u, 0xabcd0000u, 4, 4},
+      {"BufferLoadFormatD16XZeroStrideFloatOne", F::k32Float, 0u, 0xabcd3c00u, 1, 0, true, false, 0},
+      {"BufferLoadFormatD16XZeroStrideUintOne", F::k32UInt, 0u, 0xabcd0001u, 1, 0, true, false, 0},
       {"BufferLoadFormatD16XInactive", F::k32Float, 0u, 0xabcd1234u, 4, 0, false},
       {"BufferLoadFormatD16XOverlappingAddress", F::k16UInt, 7u, 7u, 4, 0, true, true},
   };
@@ -30993,10 +30996,92 @@ std::vector<TestCase> BufferLoadFormatD16XCases() {
     AppendEnd(&test.code);
     test.initial = {input.input, 0xdeadbeefu, 0u, 0xcafef00du};
     test.expected = {input.input, 0xdeadbeefu, input.expected, 0xcafef00du};
-    test.user_data = MakeStructuredStorageBufferData(4, 4, false, BufferFormat(input.format));
-    test.user_data[3] = (test.user_data[3] & ~7u) | input.selector;
+    test.user_data = MakeStructuredStorageBufferData(input.stride, 4, false, BufferFormat(input.format));
+    test.user_data[3] = (test.user_data[3] & ~0x30000007u) | input.selector;
     test.has_user_data = true;
     test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_D16_X,
+                    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    cases.push_back(std::move(test));
+  }
+  return cases;
+}
+
+std::vector<TestCase> BufferLoadFormatD16XyzwCases() {
+  using F = Prospero::BufferFormat;
+  using O = ShaderOpcode;
+  struct LoadCase {
+    const char *name;
+    F format;
+    std::array<u32, 4> input;
+    std::array<u32, 2> expected;
+    u32 swizzle = DstSel(4, 5, 6, 7);
+    u32 stride = 16;
+    u32 index = 0;
+    bool active = true;
+    bool overlap = false;
+  };
+  constexpr LoadCase inputs[] = {
+      {"BufferLoadFormatD16XyzwFloat32", F::k32_32_32_32Float,
+       {0x3f800000u, 0x3f000000u, 0u, 0xc0000000u}, {0x38003c00u, 0xc0000000u}},
+      {"BufferLoadFormatD16XyzwFloat16", F::k16_16_16_16Float,
+       {0x38003c00u, 0xc0000000u}, {0x38003c00u, 0xc0000000u}},
+      {"BufferLoadFormatD16XyzwUintSaturates", F::k32_32_32_32UInt,
+       {0u, 0x10000u, 0xffffu, 7u}, {0xffff0000u, 0x0007ffffu}},
+      {"BufferLoadFormatD16XyzwSintSaturates", F::k32_32_32_32SInt,
+       {0xffff7fffu, 7u, 0x8000u, 0xffff8000u}, {0x00078000u, 0x80007fffu}},
+      {"BufferLoadFormatD16XyzwUnorm", F::k8_8_8_8UNorm,
+       {0xffff0000u}, {0u, 0x3c003c00u}},
+      {"BufferLoadFormatD16XyzwSwizzle", F::k32_32_32_32Float,
+       {0u, 0x3f800000u, 0xc0000000u, 0x3f000000u},
+       {0xc0003800u, 0x3c003c00u}, DstSel(7, 6, 5, 1)},
+      {"BufferLoadFormatD16XyzwPartialRecord", F::k32_32_32_32Float,
+       {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u},
+       {0u, 0u}, DstSel(4, 5, 6, 7), 12},
+      {"BufferLoadFormatD16XyzwOobOne", F::k32_32_32_32Float,
+       {}, {0x3c00u, 0x3c00u}, DstSel(1, 4, 1, 4), 16, 1},
+      {"BufferLoadFormatD16XyzwZeroStrideFloatOne", F::k32_32_32_32Float,
+       {}, {0x3c003c00u, 0x3c000000u}, DstSel(1, 1, 4, 1), 0},
+      {"BufferLoadFormatD16XyzwZeroStrideUintOne", F::k32_32_32_32UInt,
+       {}, {0x10000u, 1u}, DstSel(4, 1, 1, 4), 0},
+      {"BufferLoadFormatD16XyzwInactive", F::k32_32_32_32Float,
+       {}, {0xabcd1234u, 0xbeef5678u}, DstSel(4, 5, 6, 7), 16, 0, false},
+      {"BufferLoadFormatD16XyzwOverlappingAddress", F::k32_32_32_32Float,
+       {0x3f800000u, 0x3f000000u, 0u, 0xc0000000u},
+       {0x38003c00u, 0xc0000000u}, DstSel(4, 5, 6, 7), 16, 0, true, true},
+  };
+  std::vector<TestCase> cases;
+  for (const auto &input : inputs) {
+    TestCase test;
+    test.name = input.name;
+    AppendVMovLiteral(&test.code, 16, input.overlap ? input.index : 0xabcd1234u);
+    AppendVMovLiteral(&test.code, 17, 0xbeef5678u);
+    AppendVMovLiteral(&test.code, 18, 0xcafef00du);
+    AppendVMovU32(&test.code, 12, input.index);
+    if (!input.active) test.code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+    // Captured b21e373811f28e31 pc 0x1914: e20c2000 8001100c.
+    test.code.push_back(EncodeMubuf0(0x83u, 0, true, false));
+    test.code.push_back(EncodeMubuf1(16, 1, input.overlap ? 16 : 12));
+    if (!input.active) {
+      test.code.push_back(EncodeSMovB32(126, InlineU32(1)));
+      test.code.push_back(EncodeSMovB32(127, InlineU32(0)));
+    }
+    for (u32 word = 0; word < 3; word++) AppendStoreVgpr(&test.code, 16 + word, 4 + word);
+    AppendEnd(&test.code);
+    test.initial.assign(input.input.begin(), input.input.end());
+    test.initial.resize(8, 0xdeadbeefu);
+    test.expected = test.initial;
+    test.expected[4] = input.expected[0];
+    test.expected[5] = input.expected[1];
+    test.expected[6] = 0xcafef00du;
+    const auto descriptor = MakeStructuredStorageBufferData(
+        input.stride, 1, false, BufferFormat(input.format));
+    std::copy_n(descriptor.begin(), 4, test.user_data.begin() + 4);
+    test.user_data[7] = (test.user_data[7] & ~0x30000fffu) | input.swizzle;
+    test.has_user_data = true;
+    if (input.stride != 0 && input.active) {
+      test.storage_buffer_ranges = {{0, input.stride}, {0, 32}};
+    }
+    test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_D16_XYZW,
                     O::BUFFER_STORE_DWORD, O::S_ENDPGM};
     cases.push_back(std::move(test));
   }
@@ -39315,6 +39400,9 @@ std::vector<TestCase> MakeCases() {
   for (auto &test : BufferLoadFormatD16XCases()) {
     cases.push_back(std::move(test));
   }
+  for (auto &test : BufferLoadFormatD16XyzwCases()) {
+    cases.push_back(std::move(test));
+  }
   for (auto &test : BufferStoreFormatD16XCases()) {
     cases.push_back(std::move(test));
   }
@@ -44980,6 +45068,9 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferStoreFormatXyzwSnorm16CapturedSkinningVectors());
     RunCase(&vulkan, BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords());
     for (const auto &test : BufferLoadFormatD16XCases()) {
+      RunCase(&vulkan, test);
+    }
+    for (const auto &test : BufferLoadFormatD16XyzwCases()) {
       RunCase(&vulkan, test);
     }
     for (const auto &test : BufferStoreFormatD16XCases()) {

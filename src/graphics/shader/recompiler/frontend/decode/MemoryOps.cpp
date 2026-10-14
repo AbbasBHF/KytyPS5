@@ -66,6 +66,7 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x59u, Opcode::BUFFER_ATOMIC_AND_X2, 2, 32},
     {0x5au, Opcode::BUFFER_ATOMIC_OR_X2, 2, 32},
     {0x80u, Opcode::BUFFER_LOAD_FORMAT_D16_X, 1, 16, false, false, true},
+    {0x83u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZW, 2, 16, false, false, true},
     {0x84u, Opcode::BUFFER_STORE_FORMAT_D16_X, 1, 16, false, false, true},
 };
 
@@ -304,6 +305,9 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);
+	if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_XYZW) {
+		inst.data_components = 4u;
+	}
 	if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_X ||
 	    inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16 ||
 	    inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI) {
