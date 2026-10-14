@@ -650,6 +650,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_STORE_BYTE:
 		case Opcode::BUFFER_STORE_BYTE_D16_HI:
 		case Opcode::BUFFER_STORE_SHORT:
+		case Opcode::BUFFER_STORE_SHORT_D16_HI:
 		case Opcode::BUFFER_STORE_DWORD:
 		case Opcode::BUFFER_STORE_DWORDX2:
 		case Opcode::BUFFER_STORE_DWORDX3:
