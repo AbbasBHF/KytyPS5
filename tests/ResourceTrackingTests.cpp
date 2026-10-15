@@ -3360,9 +3360,10 @@ void TestCompactScalarImageTable() {
   constexpr uint32_t stride = 0x330u, image_offset = 0x98u, sampler_offset = 0x88u;
   enum class Domain { Unbounded, SharedPrefix, SeparatePrefix, SeparateMask };
   enum class Pairing { SameKey, DifferentKey, PairedFirst, UnpairedFirst, MixedUses };
+  enum class Sharing { None, SameBlock, Dominating, Sibling, Later, WrongMask, MixedMask };
   const auto make_plan = [&](bool compact, uint32_t invalid = 0u,
                              Domain domain = Domain::Unbounded, Pairing pairing = Pairing::SameKey,
-                             uint32_t member = 0x98u) {
+                             uint32_t member = 0x98u, Sharing sharing = Sharing::None) {
     Fixture fixture;
     const auto list = invalid == 1u
         ? fixture.Address(fixture.UserData(0), fixture.UserData(1))
@@ -3426,10 +3427,52 @@ void TestCompactScalarImageTable() {
       fixture.Emit(ValueOpcode::ImageRead, {unpaired, fixture.ImageAddress(), Value(true)},
                    fixture.AddMemory(sample, 0x580u));
     };
-    if (pairing == Pairing::UnpairedFirst) read_unpaired();
-    fixture.Emit(ValueOpcode::ImageSampleRaw,
-        {image, sampler, fixture.ImageAddress(), Value(true)}, fixture.AddMemory(sample, 0x59cu));
-    if (pairing == Pairing::PairedFirst || pairing == Pairing::MixedUses) read_unpaired();
+    if (sharing == Sharing::None) {
+      if (pairing == Pairing::UnpairedFirst) read_unpaired();
+      fixture.Emit(ValueOpcode::ImageSampleRaw,
+          {image, sampler, fixture.ImageAddress(), Value(true)}, fixture.AddMemory(sample, 0x59cu));
+      if (pairing == Pairing::PairedFirst || pairing == Pairing::MixedUses) read_unpaired();
+    } else {
+      const auto owner = make_image(key, image_offset);
+      const auto lane = fixture.Emit(ValueOpcode::LaneId);
+      const auto owner_active = fixture.Emit(ValueOpcode::UGreaterThanEqual32, {lane, Value(32u)});
+      const auto outside = fixture.Emit(ValueOpcode::LogicalNot, {owner_active});
+      const auto active = fixture.Emit(ValueOpcode::LogicalAnd, {owner_active,
+          fixture.Emit(ValueOpcode::IEqual32,
+              {fixture.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(1u)}), Value(0u)})});
+      auto *owner_block = fixture.block;
+      auto *target_block = fixture.block;
+      if (sharing == Sharing::Dominating || sharing == Sharing::Sibling) {
+        namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+        auto *entry = fixture.block;
+        if (sharing == Sharing::Sibling) {
+          owner_block = fixture.AddBlock();
+          entry->AddBranch(owner_block);
+          entry->condition = fixture.Emit(ValueOpcode::INotEqual32,
+                                          {fixture.UserData(8u), Value(0u)});
+        }
+        target_block = fixture.AddBlock();
+        entry->AddBranch(target_block);
+        entry->terminator = {.kind = sharing == Sharing::Sibling
+                ? CFG::TerminatorKind::ConditionalBranch : CFG::TerminatorKind::Branch,
+            .true_block = sharing == Sharing::Sibling ? owner_block : target_block,
+            .false_block = sharing == Sharing::Sibling ? target_block : nullptr};
+        if (sharing == Sharing::Sibling) owner_block->terminator.kind = CFG::TerminatorKind::Return;
+        target_block->terminator.kind = CFG::TerminatorKind::Return;
+      }
+      const auto read_target = [&](Value mask) {
+        fixture.block = target_block;
+        fixture.Emit(ValueOpcode::ImageRead, {image, fixture.ImageAddress(), mask},
+                     fixture.AddMemory(sample, 0x79cu));
+      };
+      if (sharing == Sharing::Later) read_target(active);
+      fixture.block = owner_block;
+      fixture.Emit(ValueOpcode::ImageSampleRaw,
+          {owner, sampler, fixture.ImageAddress(), owner_active}, fixture.AddMemory(sample, 0x59cu));
+      if (sharing != Sharing::Later)
+        read_target(sharing == Sharing::WrongMask ? outside : active);
+      if (sharing == Sharing::MixedMask) read_target(outside);
+    }
     if (domain != Domain::Unbounded) {
       // Distinct SSA expressions with equivalent runtime first values share a domain.
       const auto second_offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
@@ -3449,7 +3492,8 @@ void TestCompactScalarImageTable() {
           {image, sampler, fixture.ImageAddress(), Value(true)}, fixture.AddMemory(sample, 0x5a0u));
     }
     fixture.PlanAndTrack();
-    const auto &source = fixture.program.descriptor_sources[fixture.program.info.samplers[0].source];
+    const auto &source = fixture.program.descriptor_sources[fixture.program.info.samplers[
+        sampler.Instruction()->Flags<uint32_t>()].source];
     Check(source.indirect_descriptor && source.indirect_descriptor->selector &&
               source.indirect_descriptor->selector->stride == 4u &&
               (domain == Domain::Unbounded ? source.indirect_descriptor->selector_first.IsEmpty()
@@ -3462,10 +3506,11 @@ void TestCompactScalarImageTable() {
     if (domain == Domain::Unbounded) {
       const auto &image_source = fixture.program.descriptor_sources[
           fixture.program.info.images[image.Instruction()->Flags<uint32_t>()].source];
-      const bool paired = pairing != Pairing::DifferentKey && pairing != Pairing::MixedUses;
+      const bool paired = sharing == Sharing::None ? pairing != Pairing::DifferentKey
+          : sharing == Sharing::SameBlock || sharing == Sharing::Dominating;
       Check(image_source.indirect_descriptor &&
                 image_source.indirect_descriptor->selector.has_value() == paired,
-            "paired image selector proof ignored key identity or an unpaired handle use");
+            "required selector proof ignored key, use order, dominance or active lanes");
       if (!unpaired.IsEmpty() && unpaired != image) {
         const auto &other_source = fixture.program.descriptor_sources[
             fixture.program.info.images[unpaired.Instruction()->Flags<uint32_t>()].source];
@@ -3478,16 +3523,22 @@ void TestCompactScalarImageTable() {
     }
     return ExtractResourcePlan(fixture.program);
   };
-  struct Case { bool compact; uint32_t member; Pairing pairing; };
-  for (const auto [compact, member, pairing] : {
+  struct Case { bool compact; uint32_t member; Pairing pairing; Sharing sharing = Sharing::None; };
+  for (const auto [compact, member, pairing, sharing] : {
            Case{false, image_offset, Pairing::SameKey}, Case{true, image_offset, Pairing::SameKey},
            Case{true, 0x16cu, Pairing::SameKey}, Case{true, 0x16cu, Pairing::DifferentKey},
            Case{true, 0x16cu, Pairing::PairedFirst}, Case{true, 0x16cu, Pairing::UnpairedFirst},
-           Case{true, 0x16cu, Pairing::MixedUses}}) {
-    auto plan = make_plan(compact, 0u, Domain::Unbounded, pairing, member);
+           Case{true, 0x16cu, Pairing::MixedUses},
+           Case{true, 0x16cu, Pairing::SameKey, Sharing::SameBlock},
+           Case{true, 0x16cu, Pairing::SameKey, Sharing::Dominating},
+           Case{true, 0x16cu, Pairing::SameKey, Sharing::Sibling},
+           Case{true, 0x16cu, Pairing::SameKey, Sharing::Later},
+           Case{true, 0x16cu, Pairing::SameKey, Sharing::WrongMask},
+           Case{true, 0x16cu, Pairing::SameKey, Sharing::MixedMask}}) {
+    auto plan = make_plan(compact, 0u, Domain::Unbounded, pairing, member, sharing);
     const uint32_t width = compact ? 4u : 8u;
     const auto bytes = 2u * stride + member + width * 4u;
-    std::array<uint32_t, 8> data{0x1000u, 0u, 8u, 0u, 0x2000u, 0u, bytes, 0u};
+    std::array<uint32_t, 9> data{0x1000u, 0u, 8u, 0u, 0x2000u, 0u, bytes, 0u, 0u};
     struct Memory : LinearTestMemory { uint32_t selector_attempts = 0; } memory;
     memory.words.resize((0x1000u + bytes) / 4u, 0xdeadbeefu);
     memory.words[0] = 2u;
@@ -3503,6 +3554,8 @@ void TestCompactScalarImageTable() {
       at[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
           (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
       if (!compact) at[5] = 0x00700000u;
+      if (sharing != Sharing::None)
+        std::copy_n(at, width, memory.words.begin() + (0x1000u + row * stride + image_offset) / 4u);
     }
     const std::array poison{0x00fff000u, 0x09500000u, 0u, 0x900003acu};
     if (member == 0x16cu)
@@ -3517,19 +3570,24 @@ void TestCompactScalarImageTable() {
         }};
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
-    if (pairing != Pairing::SameKey) {
+    const bool shared = sharing == Sharing::SameBlock || sharing == Sharing::Dominating;
+    if ((sharing != Sharing::None && !shared) ||
+        (pairing != Pairing::SameKey && pairing != Pairing::MixedUses)) {
       Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
                 std::ranges::any_of(snapshot.images, [&](const auto &image) {
                   return std::equal(poison.begin(), poison.end(), image.dwords.begin());
                 }),
             "unpaired image use silently inherited a narrower sampler domain");
+      if (sharing == Sharing::Sibling)
+        Check(memory.selector_attempts == 0u,
+              "inactive sibling selector owner introduced a new specialization read");
       continue;
     }
     const auto materialize = [&] {
       memory.selector_attempts = 0u;
       Check(MaterializeResources(plan, runtime, snapshot, specialization),
             "paired compact image/sampler table did not materialize");
-      Check(snapshot.images.size() == 3u && snapshot.samplers.size() == 3u &&
+      Check(snapshot.images.size() == (shared ? 6u : 3u) && snapshot.samplers.size() == 3u &&
                 memory.selector_attempts == 1u,
             "paired table omitted an image, index-list value or OOB zero key");
       for (const auto &image : snapshot.images) {
@@ -3548,11 +3606,11 @@ void TestCompactScalarImageTable() {
           "compact descriptor payload refresh changed specialization or stayed stale");
     data[2] = 4u;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == 2u && snapshot.samplers.size() == 2u,
+              snapshot.images.size() == (shared ? 4u : 2u) && snapshot.samplers.size() == 2u,
           "index-list count refresh retained a stale sampler candidate");
     data[2] = 0u;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == 1u && snapshot.images[0].dwords[0] == 0x100u &&
+              snapshot.images.size() == (shared ? 2u : 1u) && snapshot.images[0].dwords[0] == 0x100u &&
               snapshot.samplers.size() == 1u &&
               snapshot.samplers[0].dwords[0] == 0u,
           "empty index list lost the scalar OOB zero key");
