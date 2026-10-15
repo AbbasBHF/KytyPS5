@@ -2994,7 +2994,9 @@ void TestUniformScalarBufferImage() {
 void TestCompactScalarImageTable() {
   using F = Libs::Graphics::Prospero::BufferFormat;
   constexpr uint32_t stride = 0x330u, image_offset = 0x98u, sampler_offset = 0x88u;
-  const auto make_plan = [&](bool compact, uint32_t invalid = 0u) {
+  enum class Domain { Unbounded, SharedPrefix, SeparatePrefix, SeparateMask };
+  const auto make_plan = [&](bool compact, uint32_t invalid = 0u,
+                             Domain domain = Domain::Unbounded) {
     Fixture fixture;
     const auto list = invalid == 1u
         ? fixture.Address(fixture.UserData(0), fixture.UserData(1))
@@ -3002,10 +3004,12 @@ void TestCompactScalarImageTable() {
                           fixture.UserData(2), fixture.UserData(3)});
     const auto table = fixture.Buffer({fixture.UserData(4), fixture.UserData(5),
                                        fixture.UserData(6), fixture.UserData(7)});
-    // Uniform on the GPU, but no CPU-evaluable row or workgroup-prefix proof.
     const auto group = fixture.Emit(ValueOpcode::GetBuiltin,
         {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)});
-    const auto index = fixture.Emit(ValueOpcode::BitwiseXor32, {group, Value(1u)});
+    // The original case has no CPU-evaluable row or workgroup-prefix proof.
+    const auto index = domain == Domain::Unbounded
+        ? fixture.Emit(ValueOpcode::BitwiseXor32, {group, Value(1u)})
+        : fixture.Emit(ValueOpcode::IAdd32, {group, fixture.UserData(8u)});
     const auto offset = fixture.Emit(invalid == 2u ? ValueOpcode::UDiv32
                                                   : ValueOpcode::ShiftLeftLogical32,
                                      {index, Value(2u)});
@@ -3016,23 +3020,27 @@ void TestCompactScalarImageTable() {
                        fixture.AddMemory(scalar, 0x570u))
         : fixture.Emit(ValueOpcode::ReadConstBuffer, {list, offset},
                        fixture.AddMemory(scalar, 0x570u));
-    const auto record = fixture.Emit(ValueOpcode::IMul32, {key, Value(stride)});
     scalar.kind = ResourceKind::ScalarBuffer;
-    std::array<Value, 8> image_words;
-    std::array<Value, 4> sampler_words;
-    for (uint32_t word = 0; word < 8u; ++word) {
-      scalar.offset = image_offset + word * 4u;
-      image_words[word] = compact && word >= 4u ? Value(0u)
-          : fixture.Emit(ValueOpcode::ReadConstBuffer, {table, record},
-                          fixture.AddMemory(scalar, 0x590u));
-      if (word < 4u) {
-        scalar.offset = sampler_offset + word * 4u;
-        sampler_words[word] = fixture.Emit(ValueOpcode::ReadConstBuffer, {table, record},
-                                            fixture.AddMemory(scalar, 0x590u));
+    const auto make_image = [&](Value selected, uint32_t member) {
+      const auto record = fixture.Emit(ValueOpcode::IMul32, {selected, Value(stride)});
+      std::array<Value, 8> words;
+      for (uint32_t word = 0; word < 8u; ++word) {
+        scalar.offset = member + word * 4u;
+        words[word] = compact && word >= 4u ? Value(0u)
+            : fixture.Emit(ValueOpcode::ReadConstBuffer, {table, record},
+                            fixture.AddMemory(scalar, 0x590u));
       }
+      if (invalid == 3u) words[7] = Value(1u);
+      return fixture.Image(words, 0x59cu);
+    };
+    const auto image = make_image(key, image_offset);
+    const auto record = fixture.Emit(ValueOpcode::IMul32, {key, Value(stride)});
+    std::array<Value, 4> sampler_words;
+    for (uint32_t word = 0; word < 4u; ++word) {
+      scalar.offset = sampler_offset + word * 4u;
+      sampler_words[word] = fixture.Emit(ValueOpcode::ReadConstBuffer, {table, record},
+                                          fixture.AddMemory(scalar, 0x590u));
     }
-    if (invalid == 3u) image_words[7] = Value(1u);
-    const auto image = fixture.Image(image_words, 0x59cu);
     MemoryInfo sample;
     sample.kind = ResourceKind::Image;
     sample.image_dimension = Decoder::ImageDimension::Dim2D;
@@ -3040,6 +3048,19 @@ void TestCompactScalarImageTable() {
     const auto sampler = fixture.Sampler(sampler_words, 0x59cu);
     fixture.Emit(ValueOpcode::ImageSampleRaw,
         {image, sampler, fixture.ImageAddress(), Value(true)}, fixture.AddMemory(sample, 0x59cu));
+    if (domain != Domain::Unbounded) {
+      // Distinct SSA expressions with equivalent runtime first values share a domain.
+      const auto second_offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+          {fixture.Emit(ValueOpcode::IAdd32, {group, fixture.UserData(8u)}), Value(2u)});
+      scalar.offset = domain == Domain::SeparatePrefix ? 4u : 0u;
+      auto second_key = fixture.Emit(ValueOpcode::ReadConstBuffer, {list, second_offset},
+                                     fixture.AddMemory(scalar, 0x580u));
+      if (domain == Domain::SeparateMask)
+        second_key = fixture.Emit(ValueOpcode::BitFieldUExtract, {second_key, Value(0u), Value(1u)});
+      fixture.Emit(ValueOpcode::ImageSampleRaw,
+          {make_image(second_key, 0x16cu), sampler, fixture.ImageAddress(), Value(true)},
+          fixture.AddMemory(sample, 0x79cu));
+    }
     if (invalid == 4u) {
       sample.image_r128 = false;
       fixture.Emit(ValueOpcode::ImageSampleRaw,
@@ -3049,7 +3070,9 @@ void TestCompactScalarImageTable() {
     const auto &source = fixture.program.descriptor_sources[fixture.program.info.samplers[0].source];
     Check(source.indirect_descriptor && source.indirect_descriptor->selector &&
               source.indirect_descriptor->selector->stride == 4u &&
-              source.indirect_descriptor->selector_first.IsEmpty() &&
+              (domain == Domain::Unbounded ? source.indirect_descriptor->selector_first.IsEmpty()
+                  : !source.indirect_descriptor->selector_first.IsImmediate() &&
+                    source.indirect_descriptor->workgroup_axis == 0u) &&
               source.indirect_descriptor->key_count.IsEmpty() &&
               source.indirect_descriptor->table_stride == stride &&
               source.indirect_descriptor->table_immediate == sampler_offset,
@@ -3122,6 +3145,84 @@ void TestCompactScalarImageTable() {
     memory.selector_attempts = 0u;
     Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.selector_attempts == 0u,
           "oversized index list was read before the existing probe cap");
+  }
+  for (const auto domain : {Domain::SharedPrefix, Domain::SeparatePrefix, Domain::SeparateMask}) {
+    auto plan = make_plan(true, 0u, domain);
+    constexpr uint32_t bytes = 2u * stride + 0x16cu + 16u;
+    std::array<uint32_t, 9> data{0x1000u, 0u, 8u, 0u, 0x2000u, 0u, bytes, 0u, 0u};
+    std::array<uint32_t, 3> counts{3u, 1u, 1u};
+    struct Memory : LinearTestMemory {
+      std::vector<std::pair<uint64_t, uint64_t>> selector_reads;
+    } memory;
+    memory.words.resize((0x1000u + bytes) / 4u, 0u);
+    memory.words[0] = 2u;
+    memory.words[1] = 1u;
+    for (uint32_t row = 0; row < 3u; ++row) {
+      memory.words[(0x1000u + row * stride + sampler_offset) / 4u] = row;
+      for (const auto [member, base] : {std::pair{image_offset, 0x100u},
+                                      std::pair{0x16cu, 0x200u}}) {
+        auto at = memory.words.begin() + (0x1000u + row * stride + member) / 4u;
+        at[0] = base + row;
+        at[1] = static_cast<uint32_t>(F::k32_32_32_32Float) << 20u;
+        at[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+            (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+      }
+    }
+    const SrtRuntime runtime{.user_data = data, .userdata = &memory,
+        .read_specialization_memory = [](void *userdata, uint64_t address,
+                                         std::span<uint32_t> words) {
+          auto &memory = *static_cast<Memory *>(userdata);
+          if (address < 0x2000u) memory.selector_reads.emplace_back(address, words.size_bytes());
+          return ReadLinearTestMemory(&memory, address, words);
+        }, .workgroup_counts = counts};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const auto materialize = [&](std::vector<uint32_t> expected, std::vector<uint32_t> expected_samplers) {
+      memory.selector_reads.clear();
+      Check(MaterializeResources(plan, runtime, snapshot, specialization),
+            "shared selector domain failed to materialize");
+      std::vector<uint32_t> images;
+      for (const auto &image : snapshot.images) images.push_back(image.dwords[0]);
+      std::ranges::sort(images);
+      std::vector<uint32_t> samplers;
+      for (const auto &sampler : snapshot.samplers) samplers.push_back(sampler.dwords[0]);
+      std::ranges::sort(samplers);
+      Check(images == expected && samplers == expected_samplers,
+            "shared selector domain mixed descriptor fields or retained stale keys");
+      std::vector<std::pair<uint64_t, uint64_t>> reads;
+      const auto expect_read = [&](uint32_t offset) {
+        offset += data[8] * 4u;
+        if (counts[0] != 0u && offset < data[2])
+          reads.emplace_back(0x1000u + offset, std::min(counts[0] * 4u, data[2] - offset));
+      };
+      expect_read(0u);
+      if (domain != Domain::SharedPrefix) expect_read(domain == Domain::SeparatePrefix ? 4u : 0u);
+      Check(memory.selector_reads == reads,
+            "selector domain was reread per resource or distinct domains were merged");
+    };
+    materialize(domain == Domain::SharedPrefix
+        ? std::vector<uint32_t>{0x100u, 0x101u, 0x102u, 0x200u, 0x201u, 0x202u}
+        : std::vector<uint32_t>{0x100u, 0x101u, 0x102u, 0x200u, 0x201u}, {0u, 1u, 2u});
+    memory.words[0] = 1u;
+    materialize({0x100u, 0x101u, 0x200u, 0x201u}, {0u, 1u});
+    counts[0] = 1u;
+    materialize({0x101u, 0x201u}, {1u});
+    data[8] = 1u;
+    materialize({0x101u, domain == Domain::SeparatePrefix ? 0x200u : 0x201u}, {1u});
+    data[8] = 0u;
+    counts[0] = 0u;
+    materialize({0u, 0u}, {0u});
+    counts[0] = 3u;
+    data[2] = 0u;
+    materialize({0x100u, 0x200u}, {0u});
+    data[2] = 8u;
+    memory.fail_address = 0x1004u;
+    memory.selector_reads.clear();
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+              memory.selector_reads == std::vector<std::pair<uint64_t, uint64_t>>{{0x1000u, 8u}},
+          "shared selector reused a previous domain after a failed refresh");
+    memory.fail_address = UINT64_MAX;
+    materialize({0x100u, 0x101u, 0x200u, 0x201u}, {0u, 1u});
   }
   for (uint32_t invalid : {1u, 2u, 3u, 4u})
     CheckFatal([&] { make_plan(true, invalid); }, "not a valid runtime value",
@@ -5393,7 +5494,7 @@ void TestWorkgroupSelectedBufferRecords() {
     const bool empty = std::ranges::find(dimensions, 0u) != dimensions.end();
     Check(materialize() && memory.watched_reads == 1u && memory.watched_dwords == 3u &&
               snapshot.buffers.size() == plan.info.buffers.size() + (empty ? 0u : (dimensions[0] - 1u) * 2u) &&
-              memory.reads == (empty ? 1u : 3u + dimensions[0] * 2u),
+              memory.reads == (empty ? 1u : 2u + dimensions[0] * 2u),
           "workgroup prefix reread arguments, visited an inactive key or retained stale candidates");
     Check(std::ranges::find(snapshot.specialization_reads, std::pair{memory.base, uint64_t{12u}}) !=
               snapshot.specialization_reads.end(),
@@ -5433,7 +5534,7 @@ void TestWorkgroupSelectedBufferRecords() {
     std::fill_n(memory.words.begin() + selector / 4u, 8u, 0xdeadbeefu);
     for (uint32_t index = 0; index < 4u; ++index)
       memory.words[selector / 4u + ((index + 1u) * stride) / 4u] = index & 1u;
-    Check(materialize() && memory.reads == 7u &&
+    Check(materialize() && memory.reads == 6u &&
               snapshot.buffers.size() == plan.info.buffers.size() + 2u,
           "batched vector selector changed independent scalar DWORD alignment");
   }
@@ -5446,7 +5547,7 @@ void TestWorkgroupSelectedBufferRecords() {
   user_data[6] = MaxIndirectDescriptorProbes;
   std::fill(memory.words.begin() + selector / 4u, memory.words.end(), 0u);
   memory.words[0] = MaxIndirectDescriptorProbes;
-  Check(materialize() && memory.reads == 9u,
+  Check(materialize() && memory.reads == 6u,
         "strided selector prefix was not read in bounded contiguous batches");
   memory.words[0] = MaxIndirectDescriptorProbes + 1u;
   Check(!materialize() && memory.reads == 1u,
