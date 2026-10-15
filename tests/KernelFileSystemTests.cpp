@@ -104,6 +104,48 @@ private:
   std::filesystem::path m_path;
 };
 
+void CheckOpenFileCoherence(const std::filesystem::path& root) {
+  const auto path = root / "open-file-coherence.dat";
+  Common::File writer;
+  Check(writer.Create(path), "create shared file fixture");
+  uint32_t count = 0;
+  writer.Write("abcdef", 6, &count);
+  Check(count == 6 && Common::File::Size(path) == 6,
+        "created file writes are visible before flush or close");
+
+  Common::File reader(path, Common::File::Mode::Read);
+  Common::File update(path, Common::File::Mode::Write);
+  Check(!reader.IsInvalid() && !update.IsInvalid(), "open independent file handles");
+  std::array<char, 2> bytes {};
+  reader.Read(bytes.data(), 1, &count);
+  Check(count == 1 && bytes[0] == 'a' && update.Seek(1),
+        "prime sequential read and position independent writer");
+  update.Write("XY", 2, &count);
+  Check(count == 2, "overwrite bytes through write handle");
+  reader.Read(bytes.data(), bytes.size(), &count);
+  Check(count == bytes.size() && std::memcmp(bytes.data(), "XY", bytes.size()) == 0,
+        "sequential reader observes another handle's writes without seeking");
+
+  Common::File read_write(path, Common::File::Mode::ReadWrite);
+  Check(!read_write.IsInvalid() && read_write.Seek(3), "open read-write handle");
+  read_write.Write("Z", 1, &count);
+  Check(count == 1, "overwrite through read-write handle");
+  reader.Read(bytes.data(), 1, &count);
+  Check(count == 1 && bytes[0] == 'Z', "read-write handle changes are immediately visible");
+
+  writer.Write("g", 1, &count);
+  Check(count == 1 && writer.Tell() == 7, "extend through the original writer");
+  std::error_code error;
+  std::filesystem::resize_file(path, 2, error);
+  Check(!error && writer.Tell() == 7 && Common::File::Size(path) == 2,
+        "path resize preserves an open writer's position");
+  writer.Close();
+  update.Close();
+  read_write.Close();
+  Check(Common::File::Size(path) == 2,
+        "closing existing writers cannot undo a path truncation");
+}
+
 void CheckSaveRename(const std::filesystem::path &root,
                      std::string_view payload) {
   constexpr char Source[] = "/savedata0/STEMP000.DAT";
@@ -1851,6 +1893,7 @@ int main(int, char**) {
   graphics->CreateVulkan();
 
   TempDirectory temporary;
+  CheckOpenFileCoherence(temporary.Path());
   FileSystem::Initialize();
   TestSysmoduleReferences();
   TestSystemServiceEntitlementEvents();
