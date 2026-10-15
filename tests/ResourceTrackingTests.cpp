@@ -336,6 +336,10 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
   };
   put(16u, 0u);
   put(64u, 1u);
+  // Captured sampler/T# overlap: valid-looking format149 at an unreachable DWORD start.
+  const std::array<uint32_t, 8> unreachable{
+      0x00fff000u, 0x09500000u, 0u, 0x900672b0u, 0u, 0u, 0u, 0u};
+  std::copy(unreachable.begin(), unreachable.end(), memory.words.begin() + 0x1064u / 4u);
   SrtRuntime runtime{.user_data = data, .userdata = &memory,
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
@@ -352,6 +356,22 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
             snapshot.flattened_srt[mapping + 17u] == 2u &&
             snapshot.specialization_reads == std::vector<std::pair<uint64_t, uint64_t>>{{0x2000u, 144u}},
         "dense image mapping lost its null slot, trimmed length or coherent read dependency");
+  for (const uint32_t stride : {1u, 2u}) {
+    auto subdword = MakeIndirectImageFixture(false, stride, 0u, 0u, nested);
+    subdword->PlanAndTrack();
+    const auto subdword_plan = ExtractResourcePlan(subdword->program);
+    auto subdword_memory = memory;
+    auto subdword_runtime = runtime;
+    subdword_runtime.userdata = &subdword_memory;
+    ResourceSnapshot subdword_snapshot;
+    ResourceSpecialization subdword_specialization;
+    Check(!MaterializeResources(subdword_plan, subdword_runtime, subdword_snapshot,
+                               subdword_specialization) &&
+              std::ranges::any_of(subdword_snapshot.images, [&](const auto &image) {
+                return image.dwords == unreachable;
+              }),
+          "sub-DWORD affine stride skipped a reachable unsupported descriptor");
+  }
   const auto original_specialization = specialization;
   std::fill_n(memory.words.begin() + 0x1040u / 4u, 8u, 0u);
   put(112u, 1u);
@@ -577,7 +597,8 @@ void TestExactUnfilteredImageCandidates() {
 
 void TestWaterfallImageTable() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  const auto make = [](bool equality, bool scalar) {
+  enum class Sources { ScalarFirst, IndexedFirst, DistinctScalars };
+  const auto make = [](bool equality, bool scalar, Sources sources = Sources::ScalarFirst) {
     auto fixture = std::make_unique<Fixture>();
     auto *entry = fixture->block;
     auto *body = fixture->AddBlock();
@@ -628,24 +649,33 @@ void TestWaterfallImageTable() {
       fixture->Emit(ValueOpcode::ReferenceU32,
           {fixture->Emit(ValueOpcode::CompositeExtractU32x4, {value, Value(0u)}, 0, block)}, 0, block);
     };
+    Value delayed_scalar;
     if (scalar) {
       const auto key = fixture->Emit(ValueOpcode::ReadFirstLane, {lane_value, active});
-      const auto offset = fixture->Emit(ValueOpcode::IAdd32,
-          {fixture->Emit(ValueOpcode::IMul32, {key, Value(48u)}), Value(16u)});
-      std::array<Value, 8> scalar_words;
-      for (uint32_t word = 0; word < 8u; ++word) {
-        MemoryInfo memory;
-        memory.kind = ResourceKind::ScalarBuffer;
-        memory.offset = word * 4u;
-        scalar_words[word] = fixture->Emit(ValueOpcode::ReadConstBuffer, {table, offset},
-                                           fixture->AddMemory(memory, 0x7bcu));
+      for (const uint32_t member : {16u, 20u}) {
+        if (member == 20u && sources != Sources::DistinctScalars) break;
+        const auto offset = fixture->Emit(ValueOpcode::IAdd32,
+            {fixture->Emit(ValueOpcode::IMul32, {key, Value(48u)}), Value(member)});
+        std::array<Value, 8> scalar_words;
+        for (uint32_t word = 0; word < 8u; ++word) {
+          MemoryInfo memory;
+          memory.kind = ResourceKind::ScalarBuffer;
+          memory.offset = word * 4u;
+          scalar_words[word] = fixture->Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+                                             fixture->AddMemory(memory, 0x7bcu));
+        }
+        const auto scalar_image = fixture->Image(scalar_words);
+        if (sources == Sources::IndexedFirst) delayed_scalar = scalar_image;
+        else sample(scalar_image, entry);
       }
-      sample(fixture->Image(scalar_words), entry);
     }
-    const auto image = fixture->Emit(ValueOpcode::GetImageResource,
-        {image_words[0], image_words[1], image_words[2], image_words[3],
-         image_words[4], image_words[5], image_words[6], image_words[7]}, 0, body);
-    sample(image, body);
+    if (sources != Sources::DistinctScalars) {
+      const auto image = fixture->Emit(ValueOpcode::GetImageResource,
+          {image_words[0], image_words[1], image_words[2], image_words[3],
+           image_words[4], image_words[5], image_words[6], image_words[7]}, 0, body);
+      sample(image, body);
+    }
+    if (!delayed_scalar.IsEmpty()) sample(delayed_scalar, body);
     return fixture;
   };
   auto fixture = make(true, true);
@@ -666,6 +696,34 @@ void TestWaterfallImageTable() {
   Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.reads == 1u &&
             snapshot.images.size() == 2u,
         "shared scalar/waterfall table repeated its coherent bulk read");
+  auto reversed = make(true, true, Sources::IndexedFirst);
+  reversed->PlanAndTrack();
+  const auto reversed_plan = ExtractResourcePlan(reversed->program);
+  Check(reversed_plan.info.images.size() == 1u,
+        "indexed-first image table did not share its scalar use");
+  const auto &shared = *reversed_plan.descriptor_sources[
+      reversed_plan.info.images[0].source].indirect_descriptor;
+  Check(shared.table_scalar && shared.table_record_bytes == 48u &&
+            shared.table_stride == 0u && shared.table_offset == 0u && shared.table_immediate == 0u,
+        "indexed-first union lost scalar access or the unrestricted byte domain");
+  const auto previous_reads = memory.reads;
+  ResourceSnapshot reversed_snapshot;
+  ResourceSpecialization reversed_specialization;
+  Check(MaterializeResources(reversed_plan, runtime, reversed_snapshot, reversed_specialization) &&
+            memory.reads == previous_reads + 1u && reversed_snapshot.images == snapshot.images,
+        "indexed-first table repeated its bulk read or changed descriptor candidates");
+  auto distinct = make(true, true, Sources::DistinctScalars);
+  distinct->PlanAndTrack();
+  const auto distinct_plan = ExtractResourcePlan(distinct->program);
+  Check(distinct_plan.info.images.size() == 2u,
+        "distinct scalar image domains were merged into an unrestricted heap");
+  for (uint32_t image = 0; image < 2u; ++image) {
+    const auto &restricted = *distinct_plan.descriptor_sources[
+        distinct_plan.info.images[image].source].indirect_descriptor;
+    Check(restricted.table_record_bytes == 0u && restricted.table_stride == 48u &&
+              restricted.table_offset == 16u + image * 4u && restricted.table_immediate == 0u,
+          "scalar image union discarded a proven affine residue");
+  }
   const auto handle = std::ranges::find_if(*fixture->program.blocks[1], [](const Inst &inst) {
     return inst.GetOpcode() == ValueOpcode::GetImageResource;
   });

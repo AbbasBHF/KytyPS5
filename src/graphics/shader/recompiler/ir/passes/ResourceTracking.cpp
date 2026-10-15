@@ -972,6 +972,7 @@ private:
 	uint32_t InternSource(const DescriptorSource& descriptor) {
 		for (uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
 			auto& current = m_sources[candidate];
+			bool shared_image_heap = false;
 			if (current.dword_count != descriptor.dword_count ||
 			    current.indirect_descriptor.has_value() != descriptor.indirect_descriptor.has_value()) {
 				continue;
@@ -979,11 +980,16 @@ private:
 			if (current.indirect_descriptor.has_value()) {
 				const auto& a = *current.indirect_descriptor;
 				const auto& b = *descriptor.indirect_descriptor;
+				// An indexed image heap already covers every DWORD start, so its domain
+				// subsumes an affine scalar use of the same table and shares its snapshot.
+				shared_image_heap = descriptor.dword_count == 8u &&
+				    (a.table_record_bytes != 0u || b.table_record_bytes != 0u);
 				if (a.selector != b.selector || a.table_maximum != b.table_maximum ||
 				    a.pointer_offset != b.pointer_offset ||
 				    a.table_source != b.table_source ||
-				    a.table_offset != b.table_offset || a.table_immediate != b.table_immediate ||
-				    a.table_stride != b.table_stride || a.indexed != b.indexed ||
+				    (!shared_image_heap && (a.table_offset != b.table_offset ||
+				                           a.table_immediate != b.table_immediate ||
+				                           a.table_stride != b.table_stride)) || a.indexed != b.indexed ||
 				    a.workgroup_axis != b.workgroup_axis || a.sources != b.sources ||
 				    a.signed_count != b.signed_count ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
@@ -1000,6 +1006,11 @@ private:
 			}
 			if (same) {
 				if (current.indirect_descriptor) {
+					if (shared_image_heap) {
+						current.indirect_descriptor->table_stride = 0u;
+						current.indirect_descriptor->table_offset = 0u;
+						current.indirect_descriptor->table_immediate = 0u;
+					}
 					current.indirect_descriptor->table_scalar |= descriptor.indirect_descriptor->table_scalar;
 					current.indirect_descriptor->table_record_bytes = std::max(
 					    current.indirect_descriptor->table_record_bytes,
@@ -2920,16 +2931,19 @@ private:
 			}
 			if ((table_offset & 3u) != 0u) return false;
 		} else {
-			// A bounded V# supplies the complete image table. Leave every GPU selector
-			// and descriptor read in the shader; the host only translates table bytes.
+			// Keep the GPU selector and descriptor reads, and preserve the proven scalar
+			// offset domain within the bounded image table.
 			if (sampler || plan.split_offsets) return false;
-			indirect.table_stride = 0u;
-			indirect.table_offset = 0u;
-			indirect.table_immediate = 0u;
 			indirect.workgroup_axis = UINT32_MAX;
 			plan.table_read = plan.reads[0];
-			if (plan.table_indexed) indirect.table_record_bytes = table_immediate + plan.read_dwords * 4u;
-			else indirect.table_scalar = true;
+			if (plan.table_indexed) {
+				indirect.table_stride = 0u;
+				indirect.table_offset = 0u;
+				indirect.table_immediate = 0u;
+				indirect.table_record_bytes = table_immediate + plan.read_dwords * 4u;
+			} else {
+				indirect.table_scalar = true;
+			}
 			plan.retain_reads = true;
 		}
 

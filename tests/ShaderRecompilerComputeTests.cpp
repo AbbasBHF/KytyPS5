@@ -38724,6 +38724,11 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
       std::copy(sampler.begin(), sampler.end(),
                 test.initial.begin() + (object + (compact ? 0x88u : 0x3f8u)) / 4u);
     }
+    if (compact) {
+      // PC59c can only start at residue8 mod16; this captured tuple starts at residue12.
+      const std::array unreachable{0x00fff000u, 0x09500000u, 0u, 0x900672b0u};
+      std::copy(unreachable.begin(), unreachable.end(), test.initial.begin() + (table + 0xbcu) / 4u);
+    }
     auto records = MakeStructuredStorageBufferData(compact ? 0u : stride,
                                                     compact ? table_bytes : keys.size());
     records[0] = table;
