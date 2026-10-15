@@ -2851,7 +2851,8 @@ private:
 	}
 
 	bool TryMakeTableDescriptor(Inst& handle, const DescriptorSource& descriptor,
-	                            IndirectDescriptorPlan& plan) {
+	                            IndirectDescriptorPlan& plan,
+	                            const IndirectDescriptorPlan* paired_sampler) {
 		const bool sampler = handle.GetOpcode() == ValueOpcode::GetSamplerResource;
 		if ((!sampler && handle.GetOpcode() != ValueOpcode::GetImageResource) ||
 		    handle.NumArgs() != (sampler ? 4u : 8u)) return false;
@@ -2934,15 +2935,39 @@ private:
 			// Keep the GPU selector and descriptor reads, and preserve the proven scalar
 			// offset domain within the bounded image table.
 			if (sampler || plan.split_offsets) return false;
-			indirect.workgroup_axis = UINT32_MAX;
-			plan.table_read = plan.reads[0];
-			if (plan.table_indexed) {
-				indirect.table_stride = 0u;
-				indirect.table_offset = 0u;
-				indirect.table_immediate = 0u;
-				indirect.table_record_bytes = table_immediate + plan.read_dwords * 4u;
-			} else {
-				indirect.table_scalar = true;
+			bool shared_selector = false;
+			if (!plan.table_indexed && paired_sampler != nullptr &&
+			    m_sources[paired_sampler->source].indirect_descriptor->selector &&
+			    EquivalentValue(m_program, key, paired_sampler->key) &&
+			    std::ranges::all_of(handle.Uses(), [&](const Use& use) {
+				    return use.user->GetOpcode() == ValueOpcode::ImageSampleRaw &&
+				        use.user->Arg(1).Resolve().TryInstruction() == paired_sampler->handle &&
+				        (m_program.memory_info[use.user->Flags<MemoryFlags>().index].image_sample_flags &
+				         Decoder::ImageSampleFlagAdjust) == 0u;
+			    })) {
+				// This sampler already requires these exact keys. Prove the pairing before
+				// interning, so image-only handles keep their independent heap domain.
+				auto selected = indirect;
+				DescriptorSource selected_source;
+				if (MatchScalarMaterialKey(key, selected, selected_source, false, true) &&
+				    EquivalentSelectorDomain(m_program, selected,
+				        *m_sources[paired_sampler->source].indirect_descriptor)) {
+					indirect = std::move(selected);
+					material_source = std::move(selected_source);
+					shared_selector = true;
+				}
+			}
+			if (!shared_selector) {
+				indirect.workgroup_axis = UINT32_MAX;
+				plan.table_read = plan.reads[0];
+				if (plan.table_indexed) {
+					indirect.table_stride = 0u;
+					indirect.table_offset = 0u;
+					indirect.table_immediate = 0u;
+					indirect.table_record_bytes = table_immediate + plan.read_dwords * 4u;
+				} else {
+					indirect.table_scalar = true;
+				}
 			}
 			plan.retain_reads = true;
 		}
@@ -3415,6 +3440,7 @@ private:
 				}
 				const auto flags = inst.Flags<MemoryFlags>();
 				const auto& memory = m_program.memory_info[flags.index];
+				const IndirectDescriptorPlan* paired_sampler = nullptr;
 				const auto plan_handle = [&](Value value, uint32_t width, uint32_t base, bool sampler) {
 					auto* handle = value.Resolve().TryInstruction();
 					if (handle == nullptr || FindIndirectDescriptor(*handle) != nullptr) return;
@@ -3437,7 +3463,7 @@ private:
 					}
 					if (TryMakeNestedDescriptor(*handle, descriptor, plan) ||
 					    (sampler && TryMakeFiniteDescriptor(*handle, plan)) ||
-					    TryMakeTableDescriptor(*handle, descriptor, plan) ||
+					    TryMakeTableDescriptor(*handle, descriptor, plan, paired_sampler) ||
 					    (!sampler && (TryMakeFiniteDescriptor(*handle, plan) ||
 					                  TryMakeIndirectBuffer(*handle, descriptor, plan)))) {
 						for (const auto& previous: m_indirect_descriptors) {
@@ -3448,11 +3474,14 @@ private:
 						m_indirect_descriptors.push_back(std::move(plan));
 					}
 				};
+				if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw &&
+				    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) == 0u) {
+					plan_handle(inst.Arg(1), 4u, memory.sampler * 4u, true);
+					if (const auto* handle = inst.Arg(1).Resolve().TryInstruction())
+						paired_sampler = FindIndirectDescriptor(*handle);
+				}
 				plan_handle(inst.Arg(0), IndirectBufferAccess(inst) ? 4u : 8u,
 				            memory.resource * 4u, false);
-				if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw &&
-				    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) == 0u)
-					plan_handle(inst.Arg(1), 4u, memory.sampler * 4u, true);
 			}
 		}
 	}

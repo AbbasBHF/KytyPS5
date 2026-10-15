@@ -2995,8 +2995,10 @@ void TestCompactScalarImageTable() {
   using F = Libs::Graphics::Prospero::BufferFormat;
   constexpr uint32_t stride = 0x330u, image_offset = 0x98u, sampler_offset = 0x88u;
   enum class Domain { Unbounded, SharedPrefix, SeparatePrefix, SeparateMask };
+  enum class Pairing { SameKey, DifferentKey, PairedFirst, UnpairedFirst, MixedUses };
   const auto make_plan = [&](bool compact, uint32_t invalid = 0u,
-                             Domain domain = Domain::Unbounded) {
+                             Domain domain = Domain::Unbounded, Pairing pairing = Pairing::SameKey,
+                             uint32_t member = 0x98u) {
     Fixture fixture;
     const auto list = invalid == 1u
         ? fixture.Address(fixture.UserData(0), fixture.UserData(1))
@@ -3033,8 +3035,18 @@ void TestCompactScalarImageTable() {
       if (invalid == 3u) words[7] = Value(1u);
       return fixture.Image(words, 0x59cu);
     };
-    const auto image = make_image(key, image_offset);
-    const auto record = fixture.Emit(ValueOpcode::IMul32, {key, Value(stride)});
+    const auto image = make_image(key, member);
+    auto sampler_key = key;
+    Value unpaired;
+    if (pairing == Pairing::DifferentKey || pairing == Pairing::PairedFirst ||
+        pairing == Pairing::UnpairedFirst) {
+      scalar.offset = 4u;
+      const auto other_key = fixture.Emit(ValueOpcode::ReadConstBuffer, {list, offset},
+                                           fixture.AddMemory(scalar, 0x578u));
+      if (pairing == Pairing::DifferentKey) sampler_key = other_key;
+      else unpaired = make_image(other_key, member);
+    } else if (pairing == Pairing::MixedUses) unpaired = image;
+    const auto record = fixture.Emit(ValueOpcode::IMul32, {sampler_key, Value(stride)});
     std::array<Value, 4> sampler_words;
     for (uint32_t word = 0; word < 4u; ++word) {
       scalar.offset = sampler_offset + word * 4u;
@@ -3046,8 +3058,14 @@ void TestCompactScalarImageTable() {
     sample.image_dimension = Decoder::ImageDimension::Dim2D;
     sample.image_r128 = compact;
     const auto sampler = fixture.Sampler(sampler_words, 0x59cu);
+    const auto read_unpaired = [&] {
+      fixture.Emit(ValueOpcode::ImageRead, {unpaired, fixture.ImageAddress(), Value(true)},
+                   fixture.AddMemory(sample, 0x580u));
+    };
+    if (pairing == Pairing::UnpairedFirst) read_unpaired();
     fixture.Emit(ValueOpcode::ImageSampleRaw,
         {image, sampler, fixture.ImageAddress(), Value(true)}, fixture.AddMemory(sample, 0x59cu));
+    if (pairing == Pairing::PairedFirst || pairing == Pairing::MixedUses) read_unpaired();
     if (domain != Domain::Unbounded) {
       // Distinct SSA expressions with equivalent runtime first values share a domain.
       const auto second_offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
@@ -3077,12 +3095,34 @@ void TestCompactScalarImageTable() {
               source.indirect_descriptor->table_stride == stride &&
               source.indirect_descriptor->table_immediate == sampler_offset,
           "compact image sampler lost its complete bounded index-list domain");
+    if (domain == Domain::Unbounded) {
+      const auto &image_source = fixture.program.descriptor_sources[
+          fixture.program.info.images[image.Instruction()->Flags<uint32_t>()].source];
+      const bool paired = pairing != Pairing::DifferentKey && pairing != Pairing::MixedUses;
+      Check(image_source.indirect_descriptor &&
+                image_source.indirect_descriptor->selector.has_value() == paired,
+            "paired image selector proof ignored key identity or an unpaired handle use");
+      if (!unpaired.IsEmpty() && unpaired != image) {
+        const auto &other_source = fixture.program.descriptor_sources[
+            fixture.program.info.images[unpaired.Instruction()->Flags<uint32_t>()].source];
+        Check(&other_source != &image_source && other_source.indirect_descriptor &&
+                  !other_source.indirect_descriptor->selector &&
+                  other_source.indirect_descriptor->table_stride == stride &&
+                  other_source.indirect_descriptor->table_immediate == member,
+              "paired image narrowed an existing unpaired heap source");
+      }
+    }
     return ExtractResourcePlan(fixture.program);
   };
-  for (const bool compact : {false, true}) {
-    auto plan = make_plan(compact);
+  struct Case { bool compact; uint32_t member; Pairing pairing; };
+  for (const auto [compact, member, pairing] : {
+           Case{false, image_offset, Pairing::SameKey}, Case{true, image_offset, Pairing::SameKey},
+           Case{true, 0x16cu, Pairing::SameKey}, Case{true, 0x16cu, Pairing::DifferentKey},
+           Case{true, 0x16cu, Pairing::PairedFirst}, Case{true, 0x16cu, Pairing::UnpairedFirst},
+           Case{true, 0x16cu, Pairing::MixedUses}}) {
+    auto plan = make_plan(compact, 0u, Domain::Unbounded, pairing, member);
     const uint32_t width = compact ? 4u : 8u;
-    const auto bytes = 2u * stride + image_offset + width * 4u;
+    const auto bytes = 2u * stride + member + width * 4u;
     std::array<uint32_t, 8> data{0x1000u, 0u, 8u, 0u, 0x2000u, 0u, bytes, 0u};
     struct Memory : LinearTestMemory { uint32_t selector_attempts = 0; } memory;
     memory.words.resize((0x1000u + bytes) / 4u, 0xdeadbeefu);
@@ -3092,7 +3132,7 @@ void TestCompactScalarImageTable() {
       auto at = memory.words.begin() + (0x1000u + row * stride + sampler_offset) / 4u;
       std::fill_n(at, 4u, 0u);
       at[0] = row;
-      at += 4;
+      at = memory.words.begin() + (0x1000u + row * stride + member) / 4u;
       std::fill_n(at, width, 0u);
       at[0] = 0x100u + row;
       at[1] = static_cast<uint32_t>(F::k32_32_32_32Float) << 20u;
@@ -3100,6 +3140,9 @@ void TestCompactScalarImageTable() {
           (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
       if (!compact) at[5] = 0x00700000u;
     }
+    const std::array poison{0x00fff000u, 0x09500000u, 0u, 0x900672b0u};
+    if (member == 0x16cu)
+      std::copy(poison.begin(), poison.end(), memory.words.begin() + (0x1000u + 0x17cu) / 4u);
     memory.fail_address = 0x2000u + bytes; // Last descriptor ends at the readable boundary.
     SrtRuntime runtime{.user_data = data, .userdata = &memory,
         .read_specialization_memory = [](void *userdata, uint64_t address,
@@ -3110,10 +3153,20 @@ void TestCompactScalarImageTable() {
         }};
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
+    if (pairing != Pairing::SameKey) {
+      Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+                std::ranges::any_of(snapshot.images, [&](const auto &image) {
+                  return std::equal(poison.begin(), poison.end(), image.dwords.begin());
+                }),
+            "unpaired image use silently inherited a narrower sampler domain");
+      continue;
+    }
     const auto materialize = [&] {
+      memory.selector_attempts = 0u;
       Check(MaterializeResources(plan, runtime, snapshot, specialization),
             "paired compact image/sampler table did not materialize");
-      Check(snapshot.images.size() == 4u && snapshot.samplers.size() == 3u,
+      Check(snapshot.images.size() == 3u && snapshot.samplers.size() == 3u &&
+                memory.selector_attempts == 1u,
             "paired table omitted an image, index-list value or OOB zero key");
       for (const auto &image : snapshot.images) {
         Check(image.dword_count == 8u, "compact image escaped normalized eight-DWORD ABI");
@@ -3124,16 +3177,19 @@ void TestCompactScalarImageTable() {
     };
     materialize();
     const auto original = specialization;
-    memory.words[(0x1000u + stride + image_offset) / 4u] = 0x201u;
+    memory.words[(0x1000u + stride + member) / 4u] = 0x201u;
     materialize();
     Check(specialization == original && std::ranges::any_of(snapshot.images,
               [](const auto &image) { return image.dwords[0] == 0x201u; }),
           "compact descriptor payload refresh changed specialization or stayed stale");
     data[2] = 4u;
-    Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.samplers.size() == 2u,
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 2u && snapshot.samplers.size() == 2u,
           "index-list count refresh retained a stale sampler candidate");
     data[2] = 0u;
-    Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.samplers.size() == 1u &&
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 1u && snapshot.images[0].dwords[0] == 0x100u &&
+              snapshot.samplers.size() == 1u &&
               snapshot.samplers[0].dwords[0] == 0u,
           "empty index list lost the scalar OOB zero key");
     data[2] = 8u;

@@ -38699,12 +38699,14 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
   constexpr u32 keys_address = 128, list_address = 160, table = 256, objects = 4096;
   constexpr std::array keys{5u, 0u, 3u, 1u, 4u, 2u};
   constexpr std::array list{2u, 1u, 4u, 0u, 5u, 3u};
-  for (const bool compact : {false, true})
+  for (const u32 member : {0u, 0x98u, 0x16cu})
   for (const u32 wave : {32u, 64u}) {
+    const bool compact = member != 0u;
     const u32 stride = compact ? 0x330u : 592u;
-    const u32 table_bytes = (keys.size() - 1u) * stride + 0x98u + 16u;
+    const u32 table_bytes = (keys.size() - 1u) * stride + member + 16u;
     TestCase test;
-    test.name = compact ? "CompactRecordImageSamplerTable" : "NestedPointerImageSamplerTable";
+    test.name = member == 0x16cu ? "CompactPairedImageSamplerTable"
+              : compact ? "CompactRecordImageSamplerTable" : "NestedPointerImageSamplerTable";
     test.initial.resize((compact ? table + table_bytes : objects + keys.size() * 0x430u) / 4u,
                         compact ? 0xdeadbeefu : 0u);
     std::fill_n(test.initial.begin(), keys.size(), 0xdeadbeefu);
@@ -38719,15 +38721,16 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
       image[3] = DstSel(4, 0, 0, 1) |
           (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
       std::copy_n(image.begin(), compact ? 4u : 8u,
-                  test.initial.begin() + (object + (compact ? 0x98u : 0x3d0u)) / 4u);
+                  test.initial.begin() + (object + (compact ? member : 0x3d0u)) / 4u);
       const std::array sampler{0u, 0x00fff000u, (row & 1u) ? 0x0a500000u : 0u, 0u};
       std::copy(sampler.begin(), sampler.end(),
                 test.initial.begin() + (object + (compact ? 0x88u : 0x3f8u)) / 4u);
     }
     if (compact) {
-      // PC59c can only start at residue8 mod16; this captured tuple starts at residue12.
+      // Member 0x16c admits this tuple's residue; only the paired selector list excludes it.
       const std::array unreachable{0x00fff000u, 0x09500000u, 0u, 0x900672b0u};
-      std::copy(unreachable.begin(), unreachable.end(), test.initial.begin() + (table + 0xbcu) / 4u);
+      std::copy(unreachable.begin(), unreachable.end(),
+                test.initial.begin() + (table + (member == 0x16cu ? 0x17cu : 0xbcu)) / 4u);
     }
     auto records = MakeStructuredStorageBufferData(compact ? 0u : stride,
                                                     compact ? table_bytes : keys.size());
@@ -38760,8 +38763,11 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
     if (compact) {
       code.insert(code.end(), {EncodeSop2(0x1e, 23, 22, InlineU32(2)),
                               EncodeSmem0(0x08, 22, 18), EncodeSmem1(0, 23),
-                              EncodeSop2(0x26, 23, 22, 255), stride,
-                              EncodeSmem0(0x0b, 8, 16), EncodeSmem1(0x88u, 23)});
+                              EncodeSop2(0x26, 23, 22, 255), stride});
+      if (member == 0x98u)
+        code.insert(code.end(), {EncodeSmem0(0x0b, 8, 16), EncodeSmem1(0x88u, 23)});
+      else code.insert(code.end(), {EncodeSmem0(0x0a, 8, 16), EncodeSmem1(0x88u, 23),
+                                   EncodeSmem0(0x0a, 12, 16), EncodeSmem1(member, 23)});
       for (u32 reg = 16u; reg < 20u; ++reg) AppendSMovLiteral(&code, reg, 0xdeadbeefu);
     } else code.insert(code.end(), {EncodeSop2(0x26, 23, 22, 255), stride,
                             EncodeSmem0(0x09, 20, 16), EncodeSmem1(0, 23),
@@ -38778,18 +38784,23 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
         O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
     if (compact) {
       test.opcodes.insert(test.opcodes.end(), {O::S_BUFFER_LOAD_DWORD,
-          O::S_BUFFER_LOAD_DWORDX8, O::S_MOV_B32});
+          member == 0x98u ? O::S_BUFFER_LOAD_DWORDX8 : O::S_BUFFER_LOAD_DWORDX4, O::S_MOV_B32});
       test.decoded_counts = {{"r128=1", 1}};
     } else test.opcodes.insert(test.opcodes.end(),
         {O::S_BUFFER_LOAD_DWORDX2, O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX4});
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-    if (compact) Require(test.name, "physical R128 descriptor boundary",
-        compiled.resources.images.size() == keys.size() + 1u &&
+    if (compact) {
+      std::vector<u32> candidates;
+      for (const auto &image : compiled.resources.images) candidates.push_back(image.dwords[0]);
+      std::ranges::sort(candidates);
+      Require(test.name, "paired R128 descriptor boundary",
+        candidates == std::vector<u32>{10u, 11u, 12u, 13u, 14u, 15u} &&
             std::ranges::all_of(compiled.resources.images, [](const auto &image) {
               return image.dword_count == 8u &&
                   std::ranges::all_of(std::span(image.dwords).subspan(4u),
                                       [](u32 word) { return word == 0u; });
-            }), "compact descriptor copied adjacent poison or omitted the trailing 16-byte image");
+            }), "paired selector admitted poison or omitted the trailing 16-byte image");
+    }
     for (const auto &value : compiled.resources.buffers) {
       ShaderBufferResource descriptor{};
       std::copy_n(value.dwords.begin(), 4, descriptor.fields);

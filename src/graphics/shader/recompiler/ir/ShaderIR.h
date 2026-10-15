@@ -708,6 +708,9 @@ bool        HasShaderMemoryWrites(const Program& program);
 void  ValidateProgram(const Program& program, bool require_ssa);
 void  ResolveControlFlowIdentities(Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
+bool  EquivalentSelectorDomain(const ResourcePlan& program,
+                               const DescriptorSource::IndirectDescriptor& left,
+                               const DescriptorSource::IndirectDescriptor& right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);
 Value ResolveActiveU32(Value value, Value active);
 
