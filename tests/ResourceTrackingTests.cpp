@@ -950,6 +950,9 @@ void TestNestedPointerImageTable() {
   memory.fail_address = objects + 0x3d0u;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "failed nested image pointee read was treated as a null descriptor");
+  memory.fail_address = objects + 0x3f8u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "failed nested sampler pointee read was treated as a null descriptor");
   memory.fail_address = 0x1800u;
   *at(table) = 0u;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
@@ -1154,6 +1157,10 @@ void TestIndexedPointerImageTable() {
     Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.reads == reads,
           "incomplete indexed parent domain became null images or performed partial candidate reads");
   }
+  user_data[2] = UINT32_MAX;
+  const auto oversized_reads = memory.reads;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.reads == oversized_reads,
+        "oversized indexed parent table performed candidate reads");
   user_data[2] = 2u;
   for (const uint32_t bad_stride : {0u, 4u, 161u}) {
     user_data[1] = 1u | (bad_stride << 16u);
@@ -1169,6 +1176,9 @@ void TestIndexedPointerImageTable() {
           "indexed pointer table accepted unsupported RDNA2 geometry before reading candidates");
     user_data[word] &= ~(1u << bit);
   }
+  memory.fail_address = high + table + stride;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "unreadable indexed parent pointer was treated as a null image");
   memory.fail_address = high + objects + 2u * 368u + 64u;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "unreadable nested child was silently converted to a null image");
