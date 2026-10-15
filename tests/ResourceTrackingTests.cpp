@@ -986,19 +986,35 @@ void TestIndexedPointerImageTable() {
   enum class Case { Valid, ReverseSigned, MissingParent, WrongParent, MissingChild,
                     InclusiveChild, MismatchedPair, DifferentLaneMask, ExtraUse,
                     UnboundedChoice, MissingOuterWitness, WrongOuterWitness, CyclicChoice,
-                    ExcessiveDomain };
+                    ExcessiveDomain, Counted, MissingCount, DifferentCount, MaskedCount, UnprovenMask };
   const auto make = [](Case variant = Case::Valid) {
     auto fixture = std::make_unique<Fixture>();
     std::array<Value, 4> table_words;
     for (uint32_t word = 0; word < 4u; ++word) table_words[word] = fixture->UserData(word);
     const auto table = fixture->Buffer(table_words);
     const auto lane = fixture->Emit(ValueOpcode::LaneId);
-    const auto choice = fixture->Emit(ValueOpcode::ULessThan32, {lane, Value(8u)});
-    const auto valid = fixture->Emit(ValueOpcode::ULessThan32, {lane, Value(16u)});
-    auto row = fixture->Emit(ValueOpcode::SelectU32,
-        {valid, fixture->Emit(ValueOpcode::SelectU32,
-             {choice, Value(0u), variant == Case::UnboundedChoice ? lane : Value(1u)}),
-         Value(UINT32_MAX)});
+    const bool counted = variant >= Case::Counted;
+    Value choice, row, count, other_count;
+    if (counted) {
+      const auto address = fixture->Address(fixture->UserData(4), fixture->UserData(5));
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      count = fixture->Emit(ValueOpcode::LoadAddressU32,
+          {address, Value(0u), Value(0u), Value(true)}, fixture->AddMemory(memory, 0x8u));
+      if (variant == Case::DifferentCount) {
+        memory.offset = 4u;
+        other_count = fixture->Emit(ValueOpcode::LoadAddressU32,
+            {address, Value(0u), Value(0u), Value(true)}, fixture->AddMemory(memory, 0x10u));
+      }
+      choice = fixture->Emit(ValueOpcode::ULessThan32, {Value(0u), count});
+    } else {
+      choice = fixture->Emit(ValueOpcode::ULessThan32, {lane, Value(8u)});
+      const auto valid = fixture->Emit(ValueOpcode::ULessThan32, {lane, Value(16u)});
+      row = fixture->Emit(ValueOpcode::SelectU32,
+          {valid, fixture->Emit(ValueOpcode::SelectU32,
+               {choice, Value(0u), variant == Case::UnboundedChoice ? lane : Value(1u)}),
+           Value(UINT32_MAX)});
+    }
     auto* entry = fixture->block;
     auto* left = fixture->AddBlock();
     auto* right = fixture->AddBlock();
@@ -1012,22 +1028,44 @@ void TestIndexedPointerImageTable() {
       from->AddBranch(merge);
       from->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
     }
+    if (counted) {
+      fixture->block = left;
+      const auto selector = fixture->Emit(ValueOpcode::BitwiseAnd32, {lane, Value(3u)});
+      row = Value(UINT32_MAX);
+      for (uint32_t key = 4u; key-- > 0u;) {
+        auto active = fixture->Emit(ValueOpcode::IEqual32, {selector, Value(key)});
+        // Row zero uses the uniform CFG-entry bound, like the captured shader.
+        if (key != 0u && !(variant == Case::MissingCount && key == 2u)) {
+          const auto bound = variant == Case::DifferentCount && key == 2u ? other_count : count;
+          active = fixture->Emit(ValueOpcode::LogicalAnd,
+              {active, fixture->Emit(ValueOpcode::ULessThan32, {Value(key), bound})});
+        }
+        row = fixture->Emit(ValueOpcode::SelectU32, {active, Value(key), row});
+      }
+    }
     fixture->block = merge;
     auto& phi = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
     phi.AddPhiOperand(left, row);
-    phi.AddPhiOperand(right, row);
+    phi.AddPhiOperand(right, counted ? Value(UINT32_MAX) : row);
     row = Value(&phi);
     if (variant == Case::CyclicChoice) {
       merge->AddBranch(merge);
       merge->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
       phi.AddPhiOperand(merge, row);
     } else merge->terminator.kind = CFG::TerminatorKind::Return;
-    const auto parent = variant == Case::MissingParent ? Value(true)
+    Value selected_mask;
+    if (variant == Case::MaskedCount || variant == Case::UnprovenMask) {
+      selected_mask = fixture->Emit(ValueOpcode::ULessThan32, {lane, Value(2u)});
+      row = fixture->Emit(ValueOpcode::SelectU32, {selected_mask, row, Value(0u)});
+    }
+    auto parent = variant == Case::MissingParent ? Value(true)
         : variant == Case::ReverseSigned
             ? fixture->Emit(ValueOpcode::SGreaterThanEqual32, {row, Value(0u)})
             : fixture->Emit(variant == Case::WrongParent ? ValueOpcode::ULessThanEqual32
                                                        : ValueOpcode::SLessThanEqual32,
                             {Value(0u), row});
+    if (variant == Case::MaskedCount)
+      parent = fixture->Emit(ValueOpcode::LogicalAnd, {selected_mask, parent});
     MemoryInfo pointer_memory;
     pointer_memory.kind = ResourceKind::Buffer;
     pointer_memory.idxen = true;
@@ -1096,7 +1134,7 @@ void TestIndexedPointerImageTable() {
   constexpr uint32_t table = 0x2000u, objects = 0x10000u, row_bytes = 1536u;
   LinearTestMemory memory;
   memory.base += high;
-  memory.words.resize((objects + 2u * row_bytes - 0x1000u) / 4u, 0xdeadbeefu);
+  memory.words.resize((objects + 4u * row_bytes - 0x1000u) / 4u, 0xdeadbeefu);
   const auto at = [&](uint32_t address) { return memory.words.begin() + (address - 0x1000u) / 4u; };
   const auto image_words = [](uint32_t id) {
     return std::array<uint32_t, 8>{id,
@@ -1105,7 +1143,7 @@ void TestIndexedPointerImageTable() {
   };
   // Runtime stride differs from the native sampler's 136-byte table arithmetic.
   constexpr uint32_t stride = 160u;
-  for (uint32_t row = 0; row < 2u; ++row) {
+  for (uint32_t row = 0; row < 4u; ++row) {
     *at(table + row * stride) = objects + row * row_bytes;
     *at(table + row * stride + 4u) = 0xbeef0001u;
     for (uint32_t child = 0; child < 3u; ++child) {
@@ -1196,6 +1234,59 @@ void TestIndexedPointerImageTable() {
     auto invalid = make(variant);
     CheckFatal([&] { invalid->PlanAndTrack(); }, "not a valid runtime value",
         "nested table accepted an unproved domain, mismatched pointer pair or unguarded use");
+  }
+
+  auto counted = make(Case::Counted);
+  counted->PlanAndTrack();
+  const auto counted_plan = ExtractResourcePlan(counted->program);
+  constexpr uint32_t count_address = 0x1800u;
+  std::array<uint32_t, 6> counted_data{table, 1u | (stride << 16u), 2u, 0x5204u, count_address, 1u};
+  const SrtRuntime counted_runtime{.user_data = counted_data, .read_memory = ReadLinearTestMemory, .userdata = &memory,
+                                  .read_specialization_memory = ReadLinearTestMemory};
+  *at(table) = objects;
+  *at(table + 4u) = 0xbeef0001u;
+  *at(count_address) = *at(count_address + 4u) = 2u;
+  Check(MaterializeResources(counted_plan, counted_runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+        "finite parent choices lost their runtime count and enumerated unavailable rows");
+  const auto& counted_indirect = *counted_plan.descriptor_sources[counted_plan.info.images[0].source].indirect_descriptor;
+  Check(counted_indirect.table_maximum == 3u && !counted_indirect.key_count.IsEmpty() &&
+            captured(high + count_address, 4u),
+        "finite parent domain lost its static maximum or captured runtime count");
+  auto masked = make(Case::MaskedCount);
+  masked->PlanAndTrack();
+  const auto masked_plan = ExtractResourcePlan(masked->program);
+  Check(!masked_plan.descriptor_sources[masked_plan.info.images[0].source].indirect_descriptor->key_count.IsEmpty() &&
+            MaterializeResources(masked_plan, counted_runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+        "inactive preserved selector value discarded the selected lane's runtime count");
+  memory.watched_address = high + table;
+  for (const uint32_t count : {0u, 1u, 2u, 4u, 5u}) {
+    *at(count_address) = count;
+    counted_data[2] = std::min(count, 4u);
+    memory.watched_reads = 0u;
+    Check(MaterializeResources(counted_plan, counted_runtime, snapshot, specialization) &&
+              snapshot.images.size() == 1u + 3u * std::min(count, 4u) &&
+              (count != 0u || memory.watched_reads == 0u),
+          "finite parent count refresh lost candidates, ignored its static cap or read an empty domain");
+  }
+  counted_data[2] = 2u;
+  *at(count_address) = 3u;
+  memory.watched_reads = 0u;
+  Check(!MaterializeResources(counted_plan, counted_runtime, snapshot, specialization) && memory.watched_reads == 0u,
+        "runtime parent count exceeding V# records was clamped or read candidates");
+  *at(count_address) = 2u;
+  memory.fail_address = high + count_address;
+  Check(!MaterializeResources(counted_plan, counted_runtime, snapshot, specialization) && memory.watched_reads == 0u,
+        "unreadable parent count was ignored before candidate reads");
+  memory.fail_address = UINT64_MAX;
+  for (const auto variant : {Case::MissingCount, Case::DifferentCount, Case::UnprovenMask}) {
+    auto unproved = make(variant);
+    unproved->PlanAndTrack();
+    const auto unproved_plan = ExtractResourcePlan(unproved->program);
+    const auto& source = unproved_plan.descriptor_sources[unproved_plan.info.images[0].source];
+    memory.watched_reads = 0u;
+    Check(source.indirect_descriptor->key_count.IsEmpty() &&
+              !MaterializeResources(unproved_plan, counted_runtime, snapshot, specialization) && memory.watched_reads == 0u,
+          "finite choice borrowed a missing or different leaf's count or pruned an unproven inactive arm");
   }
 }
 
