@@ -332,6 +332,60 @@ void TestSaveOpenVisibility() {
   Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
 }
 
+void TestSaveTruncate() {
+  namespace Kernel = Libs::LibKernel;
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto* symbol = symbols.Find(
+      {"WlyEA-sLDf0", "libkernel", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+  Check(symbol != nullptr, "sceKernelTruncate export resolves");
+  const auto truncate =
+      reinterpret_cast<int (KYTY_SYSV_ABI *)(const char*, int64_t)>(symbol->vaddr);
+  constexpr char Path[] = "/savedata0/truncate-save.dat";
+  constexpr char Payload[] = "profile data";
+  const int fd = FileSystem::KernelOpen(Path, 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, Payload, sizeof(Payload) - 1) ==
+                       sizeof(Payload) - 1,
+        "populate path truncation fixture");
+  FileSystem::FileStat stat {};
+  std::array<char, 8> bytes {};
+  Check(truncate(Path, 3) == OK &&
+            FileSystem::KernelFstat(fd, &stat) == OK && stat.st_size == 3 &&
+            FileSystem::KernelLseek(fd, 0, 1) == sizeof(Payload) - 1 &&
+            FileSystem::KernelPread(fd, bytes.data(), bytes.size(), 0) == 3 &&
+            std::memcmp(bytes.data(), Payload, 3) == 0,
+        "path truncate discards the tail without moving an open descriptor");
+  bytes.fill('x');
+  Check(truncate(Path, bytes.size()) == OK &&
+            FileSystem::KernelFstat(fd, &stat) == OK && stat.st_size == bytes.size() &&
+            FileSystem::KernelPread(fd, bytes.data(), bytes.size(), 0) == bytes.size() &&
+            std::memcmp(bytes.data(), Payload, 3) == 0 &&
+            std::all_of(bytes.begin() + 3, bytes.end(), [](char byte) { return byte == 0; }) &&
+            FileSystem::KernelLseek(fd, 0, 1) == sizeof(Payload) - 1,
+        "path truncate extends with zero bytes and preserves the descriptor position");
+  Check(truncate(Path, -1) == Kernel::KERNEL_ERROR_EINVAL &&
+            truncate(nullptr, 0) == Kernel::KERNEL_ERROR_EFAULT &&
+            truncate("truncate-save.dat", 0) == Kernel::KERNEL_ERROR_EINVAL &&
+            truncate("/savedata0/missing-save.dat", 0) == Kernel::KERNEL_ERROR_ENOENT &&
+            truncate("/savedata0", 0) == Kernel::KERNEL_ERROR_EISDIR &&
+            truncate("/savedata0/truncate-save.dat/child", 0) == Kernel::KERNEL_ERROR_ENOTDIR &&
+            FileSystem::KernelFstat(fd, &stat) == OK && stat.st_size == bytes.size() &&
+            FileSystem::KernelLseek(fd, 0, 1) == sizeof(Payload) - 1,
+        "path truncate errors preserve file size and descriptor position");
+  Check(truncate("/dev/urandom", 0) == OK,
+        "path truncate is a no-op for a nonregular nondirectory file");
+  std::string long_path = "/savedata0";
+  long_path.resize(1024, '/');
+  Check(truncate(long_path.c_str(), 0) == Kernel::KERNEL_ERROR_ENAMETOOLONG,
+        "path truncate rejects a pathname beyond the guest length limit");
+  long_path.pop_back();
+  Check(truncate(long_path.c_str(), 0) == Kernel::KERNEL_ERROR_EISDIR &&
+            truncate((std::string("/savedata0/") + std::string(256, 'a')).c_str(), 0) ==
+                Kernel::KERNEL_ERROR_ENAMETOOLONG,
+        "path truncate permits the pathname length limit and bounds each component");
+  Check(FileSystem::KernelClose(fd) == OK, "close path truncation fixture");
+}
+
 void TestAioBatches() {
   namespace Kernel = Libs::LibKernel;
   Loader::SymbolDatabase symbols;
@@ -699,6 +753,12 @@ void CheckArchiveMount(const std::filesystem::path &root) {
             FileSystem::KernelFtruncate(fd, 0) ==
             Libs::LibKernel::KERNEL_ERROR_EBADF,
         "archive read-only descriptors reject write and truncate");
+  Check(FileSystem::KernelTruncate(GuestMember, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelFstat(fd, &descriptor_stat) == OK &&
+            descriptor_stat.st_size == payload.size() &&
+            FileSystem::KernelLseek(fd, 0, 1) == payload.size(),
+        "path truncate rejects a read-only archive and preserves its member");
 
   const auto unicode_guest = std::string("/app0/") + std::string(ArchiveTests::UnicodeFilename);
   const int unicode = FileSystem::KernelOpen(unicode_guest.c_str(), 0, 0);
@@ -1908,6 +1968,7 @@ int main(int, char**) {
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
+  TestSaveTruncate();
   TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
