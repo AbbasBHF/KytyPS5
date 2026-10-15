@@ -5381,6 +5381,128 @@ void TestBoundedBufferRecords(uint32_t d32_components) {
   }
 }
 
+void TestGuardedWaterfallBufferRecords() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  namespace Prospero = Libs::Graphics::Prospero;
+  using Libs::Graphics::DstSel;
+  enum class Guard { Exact, Reversed, NoRange, NoEquality, OtherLocal, UnguardedUse, SeparateVotes };
+  const auto make = [](Guard guard) {
+    auto f = std::make_unique<Fixture>();
+    const auto count = f->UserData(2u);
+    const auto table = f->Buffer({f->UserData(0u), f->UserData(1u), count, f->UserData(3u)});
+    const auto lane = f->Emit(ValueOpcode::LaneId);
+    const auto input = f->Buffer({f->UserData(4u), f->UserData(5u), f->UserData(6u), f->UserData(7u)});
+    const auto local = f->Emit(ValueOpcode::LoadBufferU32,
+        {input, lane, Value(0u), Value(0u), Value(true)},
+        f->AddMemory({.kind = ResourceKind::Buffer, .idxen = true}, 0x200u));
+    const auto key = f->Emit(ValueOpcode::ReadLane, {local, Value(0u)});
+    const auto initial = f->Emit(ValueOpcode::ULessThan32, {lane, Value(32u)});
+    const auto range_local = guard == Guard::OtherLocal
+        ? f->Emit(ValueOpcode::IAdd32, {local, Value(1u)}) : local;
+    // Match the captured ANDN1_SAVEEXEC predicate, including its initial-EXEC witness.
+    const auto excluded = f->Emit(ValueOpcode::LogicalAnd,
+        {initial, f->Emit(ValueOpcode::ULessThanEqual32, {count, range_local})});
+    const auto range = f->Emit(ValueOpcode::LogicalAnd,
+        {initial, f->Emit(ValueOpcode::LogicalNot, {excluded})});
+    const auto equal = f->Emit(ValueOpcode::IEqual32,
+        guard == Guard::Reversed ? std::initializer_list<Value>{local, key}
+                                 : std::initializer_list<Value>{key, local});
+    auto active = f->Emit(ValueOpcode::LogicalAnd, {range, equal});
+    if (guard == Guard::NoRange) active = equal;
+    if (guard == Guard::NoEquality) active = range;
+    if (guard == Guard::SeparateVotes)
+      active = f->Emit(ValueOpcode::LogicalAnd,
+          {f->Emit(ValueOpcode::ConditionRef, {range}, CFG::BranchCondition::ExecNonZero),
+           f->Emit(ValueOpcode::ConditionRef, {equal}, CFG::BranchCondition::ExecNonZero)});
+    const auto offset = f->Emit(ValueOpcode::IMul32, {key, Value(488u)});
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < 4u; ++word)
+      words[word] = f->Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+          f->AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = 216u + word * 4u,
+                        .component_index = word, .component_count = 4u}, 0x304u));
+    const auto handle = f->Buffer(words);
+    for (uint32_t use = 0; use < 2u; ++use) {
+      const auto loaded = f->Emit(ValueOpcode::LoadBufferU32x3,
+          {handle, lane, Value(0u), Value(0u),
+           guard == Guard::UnguardedUse && use == 1u ? Value(true) : active},
+          f->AddMemory({.kind = ResourceKind::Buffer, .data_dwords = 3u, .data_bits = 32u,
+                        .component_count = 3u, .formatted = true, .idxen = true}, 0x360u));
+      f->Emit(ValueOpcode::ReferenceU32,
+          {f->Emit(ValueOpcode::CompositeExtractU32x3, {loaded, Value(use)})});
+    }
+    f->PlanAndTrack();
+    return f;
+  };
+  LinearTestMemory memory;
+  constexpr uint32_t table_offset = 256u;
+  for (uint32_t row = 0; row < 2u; ++row) {
+    const std::array descriptor{0x10000u + row * 0x1000u, 12u << 16u, 32u,
+        (uint32_t(Prospero::BufferFormat::k32_32_32Float) << 12u) | DstSel(4, 5, 6, 1)};
+    std::copy(descriptor.begin(), descriptor.end(),
+              memory.words.begin() + (table_offset + row * 488u + 216u) / 4u);
+  }
+  // An unbounded key 0x029f79b5 wraps to this real congruence slot, outside key < N.
+  constexpr std::array poison{0x012b6890u, 0x501502f9u, 0x493ba30eu, 0x3ea2f352u};
+  std::copy(poison.begin(), poison.end(), memory.words.begin() + (table_offset + 480u) / 4u);
+  std::array<uint32_t, 8> user_data{uint32_t(memory.base) + table_offset, 488u << 16u,
+      2u, 0x5204u, 0x9000u, 4u << 16u, 32u, 0x5204u};
+  SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+      .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const auto guard : {Guard::Exact, Guard::Reversed, Guard::NoRange, Guard::NoEquality,
+                          Guard::OtherLocal, Guard::UnguardedUse, Guard::SeparateVotes}) {
+    auto fixture = make(guard);
+    const auto plan = ExtractResourcePlan(fixture->program);
+    const auto root = std::ranges::find_if(plan.info.buffers, [&](const auto& buffer) {
+      return plan.descriptor_sources[buffer.source].indirect_descriptor.has_value();
+    });
+    Check(root != plan.info.buffers.end(), "waterfall buffer lost its indirect resource");
+    const bool proven = guard == Guard::Exact || guard == Guard::Reversed;
+    const auto& domain = *plan.descriptor_sources[root->source].indirect_descriptor;
+    Check(domain.key_count.IsEmpty() != proven && !domain.selector &&
+              domain.table_stride == 488u && domain.table_immediate == 216u,
+          "waterfall bound mixed different lanes, values or resource uses");
+    const auto materialize = [&] { return MaterializeResources(plan, runtime, snapshot, specialization); };
+    if (!proven) {
+      Check(!materialize(), "unproved waterfall skipped a reachable unsupported descriptor");
+      continue;
+    }
+    for (const uint32_t count : {2u, 0u, 1u, 2u}) {
+      user_data[2] = count;
+      memory.reads = 0;
+      Check(materialize() && memory.reads == count &&
+                snapshot.buffers.size() == 1u + std::max(count, 1u),
+            "waterfall count refresh read GPU keys or unrelated record fields");
+      for (uint32_t row = 0; row < count; ++row)
+        Check(std::ranges::find(snapshot.specialization_reads,
+                  std::pair{memory.base + table_offset + row * 488u + 216u, uint64_t{16u}}) !=
+                  snapshot.specialization_reads.end(), "waterfall descriptor read was not captured");
+    }
+    // SMEM reads the complete DWORD prefix and zeroes the missing format word.
+    user_data[1] = 359u << 16u;
+    memory.reads = 0;
+    Check(materialize() && memory.reads == 2u &&
+              std::ranges::find(snapshot.specialization_reads,
+                  std::pair{memory.base + table_offset + 704u, uint64_t{12u}}) !=
+                  snapshot.specialization_reads.end() &&
+              std::ranges::find(snapshot.specialization_reads,
+                  std::pair{memory.base + table_offset + 704u, uint64_t{16u}}) ==
+                  snapshot.specialization_reads.end() &&
+              std::ranges::all_of(snapshot.buffers.back().dwords, [](auto word) { return word == 0u; }),
+          "waterfall partial descriptor overread or retained its missing format word");
+    user_data[1] = 488u << 16u;
+    memory.fail_address = memory.base + table_offset + 704u;
+    Check(!materialize(), "waterfall descriptor bypassed a coherent read failure");
+    memory.fail_address = UINT64_MAX;
+    Check(materialize(), "waterfall descriptor did not recover after a failed refresh");
+    user_data[2] = MaxIndirectDescriptorProbes + 1u;
+    memory.reads = 0;
+    Check(!materialize() && memory.reads == 0u, "waterfall accepted an excessive runtime bound");
+    user_data[2] = 2u;
+  }
+}
+
 void TestGpuSelectedBufferRecords() {
   namespace Prospero = Libs::Graphics::Prospero;
   using Libs::Graphics::DstSel;
@@ -7677,6 +7799,7 @@ int main() {
     Run("bounded formatted buffer store", TestBoundedFormattedBufferStore);
     Run("bounded buffer records", [] {
       for (const uint32_t components : {0u, 2u, 3u, 4u}) TestBoundedBufferRecords(components);
+      TestGuardedWaterfallBufferRecords();
     });
     Run("GPU-selected buffer records", TestGpuSelectedBufferRecords);
     Run("workgroup-selected buffer records", TestWorkgroupSelectedBufferRecords);

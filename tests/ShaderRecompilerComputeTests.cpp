@@ -37982,6 +37982,114 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", "GpuSelectedRecordBufferAccess");
 }
 
+void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
+  const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
+                            .limits.minStorageBufferOffsetAlignment;
+  const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
+  constexpr u32 selectors = 256u, table = 512u;
+  for (const auto [wave, upper_only] : {std::pair{32u, false}, std::pair{64u, false},
+                                      std::pair{64u, true}}) {
+    TestCase test;
+    test.name = upper_only ? "GuardedWaterfallRecordsUpper64" : wave == 32u
+        ? "GuardedWaterfallRecords32" : "GuardedWaterfallRecords64";
+    test.initial.assign((slot * 3u + wave * 16u + 16u) / 4u, 0xdeadbeefu);
+    std::fill_n(test.initial.begin() + table / 4u, 976u / 4u, 0u);
+    constexpr std::array poison{0x012b6890u, 0x501502f9u, 0x493ba30eu, 0x3ea2f352u};
+    std::copy(poison.begin(), poison.end(), test.initial.begin() + (table + 480u) / 4u);
+    test.has_user_data = test.has_compute_info = true;
+    const std::array<u32, 8> descriptors{table, 488u << 16u, 2u, 0x5204u,
+                                        selectors, 4u << 16u, wave, 0x5204u};
+    std::copy(descriptors.begin(), descriptors.end(), test.user_data.begin());
+    const std::array output{slot * 3u, 16u << 16u, wave, 0x5204u};
+    std::copy(output.begin(), output.end(), test.user_data.begin() + 16u);
+    for (u32 row = 0; row < 2u; ++row) {
+      const std::array descriptor{slot * (row + 1u), 12u << 16u, wave,
+          (u32(Prospero::BufferFormat::k32_32_32Float) << 12u) | DstSel(4, 5, 6, 1)};
+      std::copy(descriptor.begin(), descriptor.end(),
+                test.initial.begin() + (table + row * 488u + 216u) / 4u);
+      for (u32 lane = 0; lane < wave; ++lane)
+        for (u32 component = 0; component < 3u; ++component)
+          test.initial[slot * (row + 1u) / 4u + lane * 3u + component] =
+              0x3f800000u + (row << 20u) + (lane << 12u) + (component << 8u);
+    }
+    test.compute_info.wave_size = wave;
+    test.compute_info.threads_num[0] = wave;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    test.compute_info.thread_ids_num = 1;
+    test.compute_info.lds_size_dwords = 0;
+    auto &code = test.code;
+    code.push_back(EncodeVop1(0x01, 30, Vgpr(0)));
+    if (upper_only) {
+      AppendSMovLiteral(&code, 126, 0u);
+      AppendSMovLiteral(&code, 127, UINT32_MAX);
+    }
+    code.insert(code.end(), {EncodeSop1(0x04, 20, 126),
+        EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(5, 1, 30), EncodeSopp(0x0c, 0),
+        EncodeVopc(0xc3, 2, 5), EncodeSop1(0x37, 52, 106)}); // Exclude N <= local key.
+    const auto empty = code.size();
+    code.push_back(0u);
+    code.push_back(EncodeSop1(0x04, 54, 126));
+    const auto loop = code.size();
+    code.push_back(EncodeSop1(0x14, 34, 54));
+    AppendVop3(&code, 0x360, 32, Vgpr(5), 34);
+    code.insert(code.end(), {EncodeVopc(0xc2, 32, 5), EncodeSop1(0x24, 58, 106)});
+    const auto skip = code.size();
+    code.push_back(0u);
+    code.insert(code.end(), {EncodeSop2(0x26, 33, 32, 255), 488u,
+        EncodeSmem0(0x0a, 12, 0), EncodeSmem1(216u, 33), EncodeSopp(0x0c, 0),
+        EncodeMubuf0(0x02, 0, true, false, true), EncodeMubuf1(6, 3, 30),
+        EncodeSopp(0x0c, 0), EncodeMubuf0(0x1f, 0, true, false), EncodeMubuf1(6, 4, 30)});
+    code[skip] = EncodeSopp(0x08, code.size() - skip - 1u);
+    code.insert(code.end(), {EncodeSop2(0x15, 54, 54, 106), EncodeSop1(0x04, 126, 58)});
+    code.push_back(EncodeSopp(0x05, static_cast<int16_t>(loop - code.size() - 1u)));
+    code[empty] = EncodeSopp(0x08, code.size() - empty - 1u);
+    code.push_back(EncodeSop1(0x04, 126, 20));
+    AppendVMovLiteral(&code, 9, 0x76543210u);
+    code.insert(code.end(), {EncodeMubuf0(0x1c, 12u, true, false), EncodeMubuf1(9, 4, 30)});
+    AppendEnd(&code);
+    test.required_spirv = {"OpLoopMerge", "OpGroupNonUniformShuffle", "Volatile"};
+    test.forbidden_spirv = {"load_indirect_buffer_", "indirect_buffer_format_geometry"};
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    for (const auto &descriptor : compiled.resources.buffers) {
+      ShaderBufferResource resource{};
+      std::copy_n(descriptor.dwords.begin(), 4u, resource.fields);
+      test.storage_buffer_ranges.emplace_back(resource.Base48(), std::max(4u, u32(resource.GetSize())));
+    }
+    TestCase producer;
+    producer.name = "WaterfallRecordKeyProducer";
+    producer.initial = test.initial;
+    producer.has_compute_info = true;
+    producer.compute_info.wave_size = 32u;
+    producer.compute_info.threads_num[0] = producer.compute_info.threads_num[1] =
+        producer.compute_info.threads_num[2] = 1u;
+    producer.compute_info.lds_size_dwords = 0;
+    test.expected = test.initial;
+    for (u32 lane = 0; lane < wave; ++lane) {
+      // This excluded key would wrap to the unsupported descriptor at byte480.
+      const u32 key = lane % 3u == 2u ? 0x029f79b5u : lane % 3u;
+      AppendVMovLiteral(&producer.code, 1, key);
+      AppendVMovLiteral(&producer.code, 2, selectors + lane * 4u);
+      AppendBufferStoreDword(&producer.code, 1, 2);
+      test.expected[selectors / 4u + lane] = key;
+      if (upper_only && lane < 32u) continue;
+      const u32 out = slot * 3u / 4u + lane * 4u;
+      if (key < 2u)
+        std::copy_n(test.initial.begin() + slot * (key + 1u) / 4u + lane * 3u, 3u,
+                    test.expected.begin() + out);
+      test.expected[out + 3u] = 0x76543210u;
+    }
+    AppendEnd(&producer.code);
+    const auto producer_shader = CompileCase(producer, vulkan.SubgroupSize());
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+    vulkan.Dispatch(producer, producer_shader, buffer);
+    vulkan.Dispatch(test, compiled, buffer);
+    CompareWords(test, "same-lane bound, GPU keys, wrapped poison, EXEC restoration and canaries",
+                 test.expected, vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+  }
+  std::printf("[compute] %-32s ok\n", "GuardedWaterfallBufferRecords");
+}
+
 void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
   constexpr u32 selectors = 128, table = 256, stride = 592, member = 448;
   const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
@@ -47491,6 +47599,7 @@ int main(int argc, char **argv) {
     CheckIndirectBufferStore(vulkan);
     CheckBoundedRecordBufferAccess(vulkan);
     CheckGpuSelectedRecordBufferAccess(vulkan);
+    CheckGuardedWaterfallBufferRecords(vulkan);
     CheckGpuSelectedFormattedRecordStore(vulkan);
     CheckRuntimeBufferRecords(vulkan);
     CheckSharedIndirectBufferLoads(vulkan);
@@ -48198,6 +48307,7 @@ int main(int argc, char **argv) {
   CheckIndirectBufferStore(vulkan);
   CheckBoundedRecordBufferAccess(vulkan);
   CheckGpuSelectedRecordBufferAccess(vulkan);
+  CheckGuardedWaterfallBufferRecords(vulkan);
   CheckGpuSelectedFormattedRecordStore(vulkan);
   CheckFiniteBufferSelection(vulkan);
   CheckRuntimeBufferRecords(vulkan);
