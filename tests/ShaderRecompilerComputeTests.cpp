@@ -39011,35 +39011,49 @@ void CheckPointerImageTable(VulkanHarness &vulkan) {
 
 void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
-  constexpr u32 keys_address = 128, list_address = 160, table = 256, objects = 4096;
+  constexpr u32 list_address = 160, objects = 4096;
   constexpr std::array keys{5u, 0u, 3u, 1u, 4u, 2u};
   constexpr std::array list{2u, 1u, 4u, 0u, 5u, 3u};
-  for (const u32 member : {0u, 0x98u, 0x16cu})
-  for (const u32 wave : {32u, 64u}) {
-    const bool compact = member != 0u;
-    const u32 stride = compact ? 0x330u : 592u;
-    const u32 table_bytes = (keys.size() - 1u) * stride + member + 16u;
+  for (const u32 member : {0u, 0x98u, 0x16cu, 64u})
+  for (const auto [wave, upper_only] : {std::pair{32u, false}, std::pair{64u, false},
+                                      std::pair{64u, true}}) {
+    const bool child_table = member == 64u, compact = member != 0u && !child_table;
+    if (upper_only && !child_table) continue;
+    const u32 keys_address = child_table ? 1024u : 128u, table = child_table ? 2048u : 256u;
+    const u32 rows = child_table ? 4u : keys.size(), children = child_table ? 3u : 1u;
+    const u32 stride = child_table ? 136u : compact ? 0x330u : 592u;
+    const u32 object_stride = child_table ? 1536u : 0x430u;
+    const u32 table_bytes = (rows - 1u) * stride + member + 16u;
+    const u32 outputs = child_table ? wave * 2u : keys.size();
     TestCase test;
-    test.name = member == 0x16cu ? "CompactPairedImageSamplerTable"
+    test.name = child_table ? (upper_only ? "IndexedPointerChildTableUpper64" : "IndexedPointerChildTable")
+              : member == 0x16cu ? "CompactPairedImageSamplerTable"
               : compact ? "CompactRecordImageSamplerTable" : "NestedPointerImageSamplerTable";
-    test.initial.resize((compact ? table + table_bytes : objects + keys.size() * 0x430u) / 4u,
-                        compact ? 0xdeadbeefu : 0u);
-    std::fill_n(test.initial.begin(), keys.size(), 0xdeadbeefu);
-    std::fill_n(test.initial.begin() + keys_address / 4u, keys.size(), UINT32_MAX);
+    test.initial.resize((compact ? table + table_bytes : objects + rows * object_stride) / 4u,
+                        (compact || child_table) ? 0xdeadbeefu : 0u);
+    std::fill_n(test.initial.begin(), outputs, 0xdeadbeefu);
+    std::fill_n(test.initial.begin() + keys_address / 4u, child_table ? wave * 2u : keys.size(), UINT32_MAX);
     if (compact) std::copy(list.begin(), list.end(), test.initial.begin() + list_address / 4u);
-    for (u32 row = 0; row < keys.size(); ++row) {
-      const u32 object = compact ? table + row * stride : objects + row * 0x430u;
-      if (!compact) test.initial[(table + row * stride) / 4u] = object;
-      auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
-      image[0] = 10u + row;
-      image[1] |= 1u << 30u; // Two texels: zero, then the row's value.
-      image[3] = DstSel(4, 0, 0, 1) |
-          (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
-      std::copy_n(image.begin(), compact ? 4u : 8u,
-                  test.initial.begin() + (object + (compact ? member : 0x3d0u)) / 4u);
+    for (u32 row = 0; row < rows; ++row) {
+      const u32 object = compact ? table + row * stride : objects + row * object_stride;
+      if (!compact) {
+        test.initial[(table + row * stride) / 4u] = object;
+        // The actual vector path sign-extends WORD0 and discards the packed upper bits.
+        test.initial[(table + row * stride) / 4u + 1u] = child_table ? 0xbeef0000u : 0u;
+      }
+      for (u32 child = 0; child < children; ++child) {
+        auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+        image[0] = 10u + row * children + child;
+        image[1] |= 1u << 30u; // Two texels: zero, then the selected child's value.
+        image[3] = DstSel(4, 0, 0, 1) |
+            (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+        std::copy_n(image.begin(), compact ? 4u : 8u,
+                    test.initial.begin() + (object + (child_table ? child * 368u + member
+                                                             : compact ? member : 0x3d0u)) / 4u);
+      }
       const std::array sampler{0u, 0x00fff000u, (row & 1u) ? 0x0a500000u : 0u, 0u};
-      std::copy(sampler.begin(), sampler.end(),
-                test.initial.begin() + (object + (compact ? 0x88u : 0x3f8u)) / 4u);
+      std::copy(sampler.begin(), sampler.end(), test.initial.begin() +
+          (child_table ? table + row * stride + 80u : object + (compact ? 0x88u : 0x3f8u)) / 4u);
     }
     if (compact) {
       // Member 0x16c admits this tuple's residue; only the paired selector list excludes it.
@@ -39048,10 +39062,11 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
                 test.initial.begin() + (table + (member == 0x16cu ? 0x17cu : 0xbcu)) / 4u);
     }
     auto records = MakeStructuredStorageBufferData(compact ? 0u : stride,
-                                                    compact ? table_bytes : keys.size());
+                                                    compact ? table_bytes : rows);
     records[0] = table;
     std::copy_n(records.begin(), 4, test.user_data.begin() + 32);
-    auto key_buffer = MakeStructuredStorageBufferData(0, keys.size() * 4u);
+    auto key_buffer = MakeStructuredStorageBufferData(child_table ? 8u : 0u,
+        child_table ? wave : keys.size() * 4u);
     key_buffer[0] = keys_address;
     std::copy_n(key_buffer.begin(), 4, test.user_data.begin() + 4);
     if (compact) {
@@ -39059,22 +39074,56 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
       indices[0] = list_address;
       std::copy_n(indices.begin(), 4, test.user_data.begin() + 36);
     }
-    const auto output = MakeStructuredStorageBufferData(0, keys.size() * 4u);
+    const auto output = MakeStructuredStorageBufferData(0, outputs * 4u);
     std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
     test.bda_mappings = {{0u, 0u}};
     test.has_user_data = test.has_compute_info = true;
     test.compute_info.wave_size = wave;
-    test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
-        test.compute_info.threads_num[2] = 1;
+    test.compute_info.threads_num[0] = child_table ? wave : 1u;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    test.compute_info.thread_ids_num = child_table ? 1u : 0u;
     test.compute_info.group_id[0] = true;
     test.compute_info.workgroup_register = 44;
-    test.dispatch_x = keys.size();
+    test.dispatch_x = child_table ? 1u : keys.size();
     auto &code = test.code;
-    code.push_back(EncodeSop2(0x1e, 23, 44, InlineU32(2)));
-    code.push_back(EncodeVop1(0x01, 30, 23));
-    code.insert(code.end(), {EncodeMubuf0(0x0c), EncodeMubuf1(4, 1, 30),
-                            EncodeVop2(0x16, 6, InlineU32(16), 4)});
-    AppendVop3(&code, 0x360, 22, Vgpr(6), InlineU32(0));
+    size_t loop = 0, empty = 0, skip_child = 0;
+    if (child_table) {
+      code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
+      if (upper_only) {
+        AppendSMovLiteral(&code, 126, 0u);
+        AppendSMovLiteral(&code, 127, UINT32_MAX);
+      }
+      code.insert(code.end(), {EncodeSop1(0x04, 60, 126),
+          EncodeMubuf0(0x0d, 0, true, false), EncodeMubuf1(4, 1, 0), EncodeSopp(0x0c, 0)});
+      AppendVMovLiteral(&code, 6, UINT32_MAX);
+      for (u32 row = 0; row < rows; ++row) {
+        code.push_back(EncodeVopc(0xc2, InlineU32(row), 4));
+        AppendVop3(&code, 0x101, 6, Vgpr(6), InlineU32(row), 106);
+      }
+      code.push_back(EncodeVopc(0x93, InlineU32(0), 6)); // Only finite nonnegative parent rows.
+      empty = code.size(); code.push_back(0u);
+      code.insert(code.end(), {EncodeMubuf0(0x0d, 0, true, false), EncodeMubuf1(10, 8, 6),
+                              EncodeSopp(0x0c, 0)});
+      AppendVop3(&code, 0x149, 11, Vgpr(11), InlineU32(0), InlineU32(16));
+      loop = code.size();
+      code.insert(code.end(), {EncodeVop1(0x02, 22, Vgpr(6)),
+          EncodeVop1(0x02, 20, Vgpr(10)), EncodeVop1(0x02, 21, Vgpr(11)),
+          EncodeVop1(0x02, 24, Vgpr(5)), EncodeVopc(0xc2, 22, 6), EncodeSop1(0x04, 56, 106)});
+      for (const auto [sgpr, vgpr] : {std::pair{20u, 10u}, std::pair{21u, 11u}, std::pair{24u, 5u}})
+        code.insert(code.end(), {EncodeVopc(0xc2, sgpr, vgpr), EncodeSop2(0x0f, 56, 56, 106)});
+      code.insert(code.end(), {EncodeSop1(0x24, 58, 56), EncodeSopc(0x09, 24, InlineU32(children))});
+      skip_child = code.size(); code.push_back(0u);
+      code.insert(code.end(), {EncodeSop2(0x26, 23, 24, 255), 368u,
+          EncodeSmem0(0x03, 8, 10), EncodeSmem1(member, 23),
+          EncodeSop2(0x26, 25, 22, 255), stride,
+          EncodeSmem0(0x0a, 16, 16), EncodeSmem1(80u, 25), EncodeSopp(0x0c, 0)});
+    } else {
+      code.push_back(EncodeSop2(0x1e, 23, 44, InlineU32(2)));
+      code.push_back(EncodeVop1(0x01, 30, 23));
+      code.insert(code.end(), {EncodeMubuf0(0x0c), EncodeMubuf1(4, 1, 30),
+                              EncodeVop2(0x16, 6, InlineU32(16), 4)});
+      AppendVop3(&code, 0x360, 22, Vgpr(6), InlineU32(0));
+    }
     if (compact) {
       code.insert(code.end(), {EncodeSop2(0x1e, 23, 22, InlineU32(2)),
                               EncodeSmem0(0x08, 22, 18), EncodeSmem1(0, 23),
@@ -39084,26 +39133,53 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
       else code.insert(code.end(), {EncodeSmem0(0x0a, 8, 16), EncodeSmem1(0x88u, 23),
                                    EncodeSmem0(0x0a, 12, 16), EncodeSmem1(member, 23)});
       for (u32 reg = 16u; reg < 20u; ++reg) AppendSMovLiteral(&code, reg, 0xdeadbeefu);
-    } else code.insert(code.end(), {EncodeSop2(0x26, 23, 22, 255), stride,
+    } else if (!child_table) code.insert(code.end(), {EncodeSop2(0x26, 23, 22, 255), stride,
                             EncodeSmem0(0x09, 20, 16), EncodeSmem1(0, 23),
                             EncodeSmem0(0x03, 8, 10), EncodeSmem1(0x3d0, 125),
                             EncodeSmem0(0x02, 16, 10), EncodeSmem1(0x3f8, 125)});
     AppendVMovLiteral(&code, 20, std::bit_cast<u32>(0.5f));
     AppendVMovLiteral(&code, 21, std::bit_cast<u32>(0.5f));
     code.insert(code.end(), {EncodeMimg0(0x27, 1, 0, false, 1, compact),
-                            EncodeMimg1(5, 20, compact ? 3u : 2u, compact ? 2u : 4u)});
-    AppendBufferStoreDword(&code, 5, 30);
+                            EncodeMimg1(12, 20, compact ? 3u : 2u, compact ? 2u : 4u)});
+    AppendBufferStoreDword(&code, 12, 30);
+    if (child_table) {
+      code[skip_child] = EncodeSopp(0x05, code.size() - skip_child - 1u);
+      code.push_back(EncodeSop2(0x15, 126, 58, 56));
+      code.push_back(EncodeSopp(0x09, static_cast<int16_t>(loop - code.size() - 1u)));
+      code[empty] = EncodeSopp(0x08, code.size() - empty - 1u);
+      code.push_back(EncodeSop1(0x04, 126, 60));
+      AppendVMovLiteral(&code, 12, 0x76543210u);
+      code.insert(code.end(), {EncodeMubuf0(0x1c, wave * 4u), EncodeMubuf1(12, 12, 30)});
+    }
     AppendEnd(&code);
-    test.opcodes = {O::S_LSHL_B32, O::V_MOV_B32, O::BUFFER_LOAD_DWORD,
+    if (child_table) {
+      test.decoded_counts = {{"BUFFER_LOAD_DWORDX2", 2u}, {"V_READFIRSTLANE_B32", 4u},
+          {"V_BFE_I32", 1u}, {"V_CMPX_LE_I32", 1u}, {"S_CBRANCH_EXECNZ", 1u}};
+      test.required_spirv = {"OpLoopMerge", "OpGroupNonUniformShuffle", "OpBitFieldSExtract"};
+    } else test.opcodes = {O::S_LSHL_B32, O::V_MOV_B32, O::BUFFER_LOAD_DWORD,
         O::V_LSHRREV_B32, O::V_READLANE_B32, O::S_MUL_I32,
         O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
     if (compact) {
       test.opcodes.insert(test.opcodes.end(), {O::S_BUFFER_LOAD_DWORD,
           member == 0x98u ? O::S_BUFFER_LOAD_DWORDX8 : O::S_BUFFER_LOAD_DWORDX4, O::S_MOV_B32});
       test.decoded_counts = {{"r128=1", 1}};
-    } else test.opcodes.insert(test.opcodes.end(),
+    } else if (!child_table) test.opcodes.insert(test.opcodes.end(),
         {O::S_BUFFER_LOAD_DWORDX2, O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX4});
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    if (child_table) {
+      std::vector<u32> candidates;
+      for (const auto &image : compiled.resources.images)
+        if (image.dwords[0] != 0u) candidates.push_back(image.dwords[0]);
+      std::ranges::sort(candidates);
+      std::vector<u32> expected_candidates(rows * children);
+      std::iota(expected_candidates.begin(), expected_candidates.end(), 10u);
+      Require(test.name, "complete child domain", candidates == expected_candidates,
+              "parent/child planning omitted a record or admitted poisoned padding");
+      Require(test.name, "GPU selectors remain unread by materialization",
+          std::ranges::none_of(compiled.resources.specialization_reads, [&](const auto &span) {
+            return span.first < keys_address + wave * 8u && keys_address < span.first + span.second;
+          }), "host planning captured GPU-only selector bytes");
+    }
     if (compact) {
       std::vector<u32> candidates;
       for (const auto &image : compiled.resources.images) candidates.push_back(image.dwords[0]);
@@ -39143,10 +39219,27 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
     producer.compute_info.threads_num[0] = producer.compute_info.threads_num[1] =
         producer.compute_info.threads_num[2] = 1;
     producer.compute_info.wave_size = 32;
-    for (u32 group = 0; group < keys.size(); ++group) {
-      AppendVMovLiteral(&producer.code, 1, (keys[group] << 16u) | 0xbeefu);
-      AppendVMovLiteral(&producer.code, 2, keys_address + group * 4u);
+    test.expected = test.initial;
+    for (u32 group = 0; group < (child_table ? wave : keys.size()); ++group) {
+      const u32 outer = child_table ? (group % 8u == 7u ? UINT32_MAX : group % rows) : keys[group];
+      const u32 child = child_table ? (group / 8u) % 4u : 0u;
+      const u32 address = keys_address + group * (child_table ? 8u : 4u);
+      AppendVMovLiteral(&producer.code, 1, child_table ? outer : (outer << 16u) | 0xbeefu);
+      AppendVMovLiteral(&producer.code, 2, address);
       AppendBufferStoreDword(&producer.code, 1, 2);
+      test.expected[address / 4u] = child_table ? outer : (outer << 16u) | 0xbeefu;
+      if (child_table) {
+        AppendVMovLiteral(&producer.code, 1, child);
+        AppendVMovLiteral(&producer.code, 2, address + 4u);
+        AppendBufferStoreDword(&producer.code, 1, 2);
+        test.expected[address / 4u + 1u] = child;
+        if (upper_only && group < 32u) continue;
+        test.expected[wave + group] = 0x76543210u;
+        if (outer >= rows || child >= children) continue;
+      }
+      const u32 row = compact ? list[outer] : outer;
+      test.expected[group] = std::bit_cast<u32>(float(10u + row * children + child) *
+                                                ((row & 1u) ? 0.5f : 1.0f));
     }
     AppendEnd(&producer.code);
     const auto producer_shader = CompileCase(producer, vulkan.SubgroupSize());
@@ -39154,13 +39247,8 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
     vulkan.Dispatch(producer, producer_shader, buffer);
     vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr,
                      nullptr, images, samplers);
-    std::vector<u32> expected;
-    for (auto key : keys) {
-      if (compact) key = list[key];
-      expected.push_back(std::bit_cast<u32>(float(10u + key) * ((key & 1u) ? 0.5f : 1.0f)));
-    }
-    CompareWords(test, "GPU-selected nested image and sampler", expected,
-                 vulkan.ReadBuffer(test.name, buffer, expected.size()));
+    CompareWords(test, "GPU-selected parent/child, paired sampler, EXEC restoration and canaries",
+                 test.expected, vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
     vulkan.DestroyBuffer(&buffer);
     for (const auto sampler : samplers) vulkan.Device().destroySampler(sampler);
     for (auto &image : images) vulkan.DestroyImage(&image);

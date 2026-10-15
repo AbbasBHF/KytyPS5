@@ -868,7 +868,9 @@ void TestNestedPointerImageTable() {
     const auto& indirect = descriptor.indirect_descriptor;
     Check(indirect && !indirect->selector && indirect->table_maximum == 65535u &&
               indirect->table_stride == 592u &&
-              indirect->pointer_offset == (descriptor.dword_count == 8u ? 0x3d0u : 0x3f8u),
+              indirect->pointer_table && indirect->pointer_table->count == 1u &&
+              indirect->pointer_table->stride == 0u && !indirect->pointer_table->indexed &&
+              indirect->pointer_table->offset == (descriptor.dword_count == 8u ? 0x3d0u : 0x3f8u),
           "nested pointer descriptors lost their row geometry or captured the GPU selector payload");
   }
 
@@ -973,6 +975,217 @@ void TestNestedPointerImageTable() {
     auto invalid = make(variant);
     CheckFatal([&] { invalid->PlanAndTrack(); }, "not a valid runtime value",
         "nested pointer planning accepted wrapping keys, mismatched words, lane-local bounds or mappable null-pointee bytes");
+  }
+}
+
+void TestIndexedPointerImageTable() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Case { Valid, ReverseSigned, MissingParent, WrongParent, MissingChild,
+                    InclusiveChild, MismatchedPair, DifferentLaneMask, ExtraUse,
+                    UnboundedChoice, MissingOuterWitness, WrongOuterWitness, CyclicChoice,
+                    ExcessiveDomain };
+  const auto make = [](Case variant = Case::Valid) {
+    auto fixture = std::make_unique<Fixture>();
+    std::array<Value, 4> table_words;
+    for (uint32_t word = 0; word < 4u; ++word) table_words[word] = fixture->UserData(word);
+    const auto table = fixture->Buffer(table_words);
+    const auto lane = fixture->Emit(ValueOpcode::LaneId);
+    const auto choice = fixture->Emit(ValueOpcode::ULessThan32, {lane, Value(8u)});
+    const auto valid = fixture->Emit(ValueOpcode::ULessThan32, {lane, Value(16u)});
+    auto row = fixture->Emit(ValueOpcode::SelectU32,
+        {valid, fixture->Emit(ValueOpcode::SelectU32,
+             {choice, Value(0u), variant == Case::UnboundedChoice ? lane : Value(1u)}),
+         Value(UINT32_MAX)});
+    auto* entry = fixture->block;
+    auto* left = fixture->AddBlock();
+    auto* right = fixture->AddBlock();
+    auto* merge = fixture->AddBlock();
+    entry->AddBranch(left);
+    entry->AddBranch(right);
+    entry->condition = choice;
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                        .true_block = left, .false_block = right};
+    for (auto* from : {left, right}) {
+      from->AddBranch(merge);
+      from->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
+    }
+    fixture->block = merge;
+    auto& phi = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    phi.AddPhiOperand(left, row);
+    phi.AddPhiOperand(right, row);
+    row = Value(&phi);
+    if (variant == Case::CyclicChoice) {
+      merge->AddBranch(merge);
+      merge->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
+      phi.AddPhiOperand(merge, row);
+    } else merge->terminator.kind = CFG::TerminatorKind::Return;
+    const auto parent = variant == Case::MissingParent ? Value(true)
+        : variant == Case::ReverseSigned
+            ? fixture->Emit(ValueOpcode::SGreaterThanEqual32, {row, Value(0u)})
+            : fixture->Emit(variant == Case::WrongParent ? ValueOpcode::ULessThanEqual32
+                                                       : ValueOpcode::SLessThanEqual32,
+                            {Value(0u), row});
+    MemoryInfo pointer_memory;
+    pointer_memory.kind = ResourceKind::Buffer;
+    pointer_memory.idxen = true;
+    pointer_memory.data_dwords = pointer_memory.component_count = 2u;
+    const auto load = fixture->Emit(ValueOpcode::LoadBufferU32x2,
+        {table, row, Value(0u), Value(0u), parent},
+        fixture->AddMemory(pointer_memory, 0x3d4u));
+    const auto other = variant == Case::MismatchedPair
+        ? fixture->Emit(ValueOpcode::LoadBufferU32x2,
+            {table, Value(0u), Value(0u), Value(0u), parent},
+            fixture->AddMemory(pointer_memory, 0x3dcu)) : load;
+    const auto low = fixture->Emit(ValueOpcode::SelectU32,
+        {parent, fixture->Emit(ValueOpcode::CompositeExtractU32x2, {load, Value(0u)}), Value(0u)});
+    const auto high = fixture->Emit(ValueOpcode::SelectU32,
+        {parent, fixture->Emit(ValueOpcode::CompositeExtractU32x2, {other, Value(1u)}), Value(0u)});
+    const auto child = fixture->Emit(ValueOpcode::ReadFirstLane, {lane, parent});
+    const auto range = variant == Case::MissingChild ? Value(true)
+        : fixture->Emit(variant == Case::InclusiveChild ? ValueOpcode::ULessThanEqual32
+                                                      : ValueOpcode::ULessThan32,
+                        {child, Value(variant == Case::ExcessiveDomain ? MaxIndirectDescriptorProbes : 3u)});
+    const auto active = fixture->Emit(ValueOpcode::LogicalAnd, {parent, range});
+    const auto extended = fixture->Emit(ValueOpcode::SelectU32,
+        {active, fixture->Emit(ValueOpcode::BitFieldSExtract, {high, Value(0u), Value(16u)}), Value(0u)});
+    const auto uniform_low = fixture->Emit(ValueOpcode::ReadFirstLane, {low, active});
+    const auto uniform_high = fixture->Emit(ValueOpcode::ReadFirstLane,
+        {extended, variant == Case::DifferentLaneMask
+                       ? fixture->Emit(ValueOpcode::LogicalNot, {choice}) : active});
+    const auto uniform_row = fixture->Emit(ValueOpcode::ReadFirstLane, {row, active});
+    const auto row_equal = fixture->Emit(ValueOpcode::IEqual32,
+        {uniform_row, variant == Case::WrongOuterWitness ? lane : row});
+    const auto executing = variant == Case::MissingOuterWitness ? active
+        : fixture->Emit(ValueOpcode::LogicalAnd, {active, row_equal});
+    const auto address = fixture->Address(uniform_low, uniform_high);
+    const auto offset = fixture->Emit(ValueOpcode::IMul32, {child, Value(368u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < 8u; ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = 64u + word * 4u;
+      words[word] = fixture->Emit(ValueOpcode::LoadAddressU32,
+          {address, offset, Value(0u), Value(true)}, fixture->AddMemory(memory, 0x898u));
+    }
+    const auto image = fixture->Image(words);
+    const auto sampler = fixture->Sampler({Value(0u), Value(0x00fff000u), Value(0u), Value(0u)});
+    MemoryInfo image_memory;
+    image_memory.kind = ResourceKind::Image;
+    image_memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture->Emit(ValueOpcode::ImageSampleRaw,
+        {image, sampler, fixture->ImageAddress(), executing}, fixture->AddMemory(image_memory, 0x8b4u));
+    if (variant == Case::ExtraUse)
+      fixture->Emit(ValueOpcode::ImageSampleRaw,
+          {image, sampler, fixture->ImageAddress(), parent}, fixture->AddMemory(image_memory, 0x8bcu));
+    return fixture;
+  };
+  auto fixture = make();
+  fixture->PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  Check(plan.info.images.size() == 1u && plan.info.buffers.size() == 1u,
+        "indexed nested table expanded IR candidates or discarded the GPU pointer load");
+  const auto& indirect = *plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
+  Check(indirect.table_maximum == 1u && indirect.pointer_table &&
+            indirect.pointer_table->indexed && indirect.pointer_table->count == 3u &&
+            indirect.pointer_table->stride == 368u && indirect.pointer_table->offset == 64u,
+        "nested table did not preserve separate parent and child geometry");
+  constexpr uint64_t high = uint64_t{1} << 32u;
+  constexpr uint32_t table = 0x2000u, objects = 0x10000u, row_bytes = 1536u;
+  LinearTestMemory memory;
+  memory.base += high;
+  memory.words.resize((objects + 2u * row_bytes - 0x1000u) / 4u, 0xdeadbeefu);
+  const auto at = [&](uint32_t address) { return memory.words.begin() + (address - 0x1000u) / 4u; };
+  const auto image_words = [](uint32_t id) {
+    return std::array<uint32_t, 8>{id,
+        uint32_t(Libs::Graphics::Prospero::BufferFormat::k32Float) << 20u, 0u,
+        Libs::Graphics::DstSel(4, 0, 0, 1) | (9u << 28u), 0u, 0u, 0u, 0u};
+  };
+  // Runtime stride differs from the native sampler's 136-byte table arithmetic.
+  constexpr uint32_t stride = 160u;
+  for (uint32_t row = 0; row < 2u; ++row) {
+    *at(table + row * stride) = objects + row * row_bytes;
+    *at(table + row * stride + 4u) = 0xbeef0001u;
+    for (uint32_t child = 0; child < 3u; ++child) {
+      const auto image = image_words(10u + row * 3u + child);
+      std::copy(image.begin(), image.end(), at(objects + row * row_bytes + child * 368u + 64u));
+    }
+  }
+  std::array<uint32_t, 4> user_data{table, 1u | (stride << 16u), 2u, 0x5204u};
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                          .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+        "indexed pointer/child domain lost candidates or read poisoned child padding");
+  const auto captured = [&](uint64_t address, uint64_t bytes) {
+    return std::ranges::any_of(snapshot.specialization_reads, [&](const auto& span) {
+      return span.first <= address && address - span.first <= span.second &&
+          bytes <= span.second - (address - span.first);
+    });
+  };
+  for (uint32_t row = 0; row < 2u; ++row) {
+    Check(captured(high + table + row * stride, 8u),
+          "nested pointer read was absent from the captured alias ranges");
+    for (uint32_t child = 0; child < 3u; ++child)
+      Check(captured(high + objects + row * row_bytes + child * 368u + 64u, 32u),
+            "nested child read was absent from the captured alias ranges");
+  }
+  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  Check(snapshot.flattened_srt[mapping] == 6u,
+        "nested child table did not produce one dense composite-key mapping");
+  for (uint32_t key = 0; key < 6u; ++key)
+    Check(snapshot.images[key + 1u].dwords[0] == 10u + key &&
+              snapshot.flattened_srt[mapping + key + 1u] == key + 1u,
+          "nested composite key mixed parent rows or child records");
+  const auto original = specialization;
+  user_data[2] = 100u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+        "nested parent enumeration included unreachable poison rows");
+  user_data[2] = 2u;
+  *at(table) = objects + row_bytes;
+  *at(objects + row_bytes + 64u) = 42u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 4u &&
+            snapshot.images[1].dwords[0] == 42u && specialization != original,
+        "nested table refresh retained stale pointer/descriptor data or duplicated aliases");
+  *at(table) = objects;
+  for (const uint32_t records : {0u, 1u}) {
+    user_data[2] = records;
+    const auto reads = memory.reads;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.reads == reads,
+          "incomplete indexed parent domain became null images or performed partial candidate reads");
+  }
+  user_data[2] = 2u;
+  for (const uint32_t bad_stride : {0u, 4u, 161u}) {
+    user_data[1] = 1u | (bad_stride << 16u);
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "indexed pointer table accepted incomplete or misaligned records");
+  }
+  user_data[1] = 1u | (stride << 16u);
+  for (const auto [word, bit] : {std::pair{1u, 31u}, std::pair{3u, 23u},
+                                 std::pair{3u, 28u}, std::pair{3u, 30u}}) {
+    user_data[word] |= 1u << bit;
+    const auto reads = memory.reads;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.reads == reads,
+          "indexed pointer table accepted unsupported RDNA2 geometry before reading candidates");
+    user_data[word] &= ~(1u << bit);
+  }
+  memory.fail_address = high + objects + 2u * 368u + 64u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "unreadable nested child was silently converted to a null image");
+  memory.fail_address = UINT64_MAX;
+  *at(table) = 0u;
+  *at(table + 4u) = 0u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "explicit null pointer bypassed the strict child reader");
+  auto reversed = make(Case::ReverseSigned);
+  reversed->PlanAndTrack();
+  for (const auto variant : {Case::MissingParent, Case::WrongParent, Case::MissingChild,
+          Case::InclusiveChild, Case::MismatchedPair, Case::DifferentLaneMask,
+          Case::ExtraUse, Case::UnboundedChoice, Case::MissingOuterWitness, Case::WrongOuterWitness,
+          Case::CyclicChoice, Case::ExcessiveDomain}) {
+    auto invalid = make(variant);
+    CheckFatal([&] { invalid->PlanAndTrack(); }, "not a valid runtime value",
+        "nested table accepted an unproved domain, mismatched pointer pair or unguarded use");
   }
 }
 
@@ -5877,7 +6090,7 @@ void TestGpuSelectedFormattedRecordStore() {
     const auto& indirect = plan.descriptor_sources[plan.info.buffers[resource].source].indirect_descriptor;
     if (!indirect) continue;
     Check(root == UINT32_MAX && indirect->table_scalar && indirect->table_maximum == 65535u &&
-              !indirect->pointer_offset && !indirect->selector && indirect->key_count.IsEmpty() &&
+              !indirect->pointer_table && !indirect->selector && indirect->key_count.IsEmpty() &&
               indirect->table_stride == 592u && indirect->table_immediate == 448u,
           "formatted record store lost its exact rows or captured the GPU selector");
     root = resource;
@@ -6002,7 +6215,7 @@ void TestGpuSelectedFormattedRecordStore() {
     if (!source.indirect_descriptor) continue;
     const auto& indirect = *source.indirect_descriptor;
     Check(wide_root == UINT32_MAX && !indirect.table_scalar && !indirect.selector &&
-              !indirect.table_maximum && !indirect.pointer_offset &&
+              !indirect.table_maximum && !indirect.pointer_table &&
               indirect.key_count == Value(32u) && indirect.table_stride == 16u &&
               indirect.table_offset == 0u && indirect.table_immediate == 48u &&
               wide_plan.descriptor_sources[indirect.table_source].dword_count == 2u &&
@@ -7837,6 +8050,7 @@ int main() {
     Run("exact unfiltered image candidates", TestExactUnfilteredImageCandidates);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("nested pointer image table", TestNestedPointerImageTable);
+    Run("indexed pointer image table", TestIndexedPointerImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
