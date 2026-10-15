@@ -45742,29 +45742,6 @@ void CheckVulkan13FeatureRequirements() {
   std::printf("[host]    %-32s ok\n", "Vulkan13FeatureRequirements");
 }
 
-void CheckPm4AcquireMemNoOp(RenderContext &renderer) {
-  GraphicsInitJmpTables();
-  CommandProcessor processor(renderer, 0);
-  const std::array<uint32_t, 6> standard_payload{0x00400000u, 1u, 0u,
-                                                 0u,          0u, 10u};
-  const std::array<uint32_t, 7> custom_payload{
-      0xdeadbeefu, 0xffffffffu, 0x80000000u, 0x13579bdfu,
-      0x2468ace0u, 0xaaaaaaaau, 0x55555555u};
-  const auto standard_before = standard_payload;
-  const auto custom_before = custom_payload;
-  Require("Pm4AcquireMemNoOp", "recognized packets",
-          CpOpAcquireMem(processor, 0xC0055800u, standard_payload.data(), 0,
-                         0) == 6 &&
-              CpOpAcquireMem(processor, 0xc0061050u, custom_payload.data(), 0,
-                             0) == 7 &&
-              standard_payload == standard_before &&
-              custom_payload == custom_before,
-          "ACQUIRE_MEM did not consume both pinned packet forms as "
-          "side-effect-free "
-          "no-ops");
-  std::printf("[host]    %-32s ok\n", "Pm4AcquireMemNoOp");
-}
-
 void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
@@ -46530,6 +46507,64 @@ struct CommandBufferLayout {
 };
 static_assert(offsetof(CommandBufferLayout, cursor_up) == 0x10);
 static_assert(offsetof(CommandBufferLayout, reserved_dw) == 0x30);
+
+void CheckPm4AcquireMemPackets(RenderContext &renderer) {
+  constexpr const char *name = "Pm4AcquireMemPackets";
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  // Byte ranges cover every touched 256-byte block, including partial first and last blocks.
+  struct Case {
+    const char *label;
+    bool async;
+    uint8_t engine;
+    uint32_t cb_db, gcr;
+    uint64_t base, size;
+    uint32_t poll;
+    std::array<uint32_t, 8> expected;
+  };
+  const Case cases[]{
+      {"captured byte range", false, 1, 0, 0x9000, 0x2036000308ull, 0x20, 400,
+       {0xc0065800, 0x80000000, 1, 0, 0x20360003, 0, 25, 0x9000}},
+      {"crossing high address", false, 0, 0x7fc0, 0x20, 0xab12345678f0ull, 0x40, 400,
+       {0xc0065800, 0x7fc0, 2, 0, 0x12345678, 0xab, 25, 0x20}},
+      {"full range", false, 0, 0x7fc0, 0x20, 0, UINT64_MAX, 400,
+       {0xc0065800, 0x7fc0, UINT32_MAX, 0xff, 0, 0, 25, 0x20}},
+      {"wide range and saturated poll", false, 1, 0, 0x380, 0, 0x10000000000ull, UINT32_MAX,
+       {0xc0065800, 0x80000000, 0, 1, 0, 0, 0xffff, 0x380}},
+      {"async byte range", true, 0, 0, 0x9000, 0x2036000308ull, 0x20, 400,
+       {0xc0065800, 0, 1, 0, 0x20360003, 0, 25, 0x9000}},
+  };
+  Require(name, "packet sizes", Gen5::AgcDcbAcquireMemGetSize() == 32 &&
+              Gen5::AgcAcbAcquireMemGetSize() == 32,
+          "native single ACQUIRE_MEM packet size changed");
+  for (const auto &test : cases) {
+    std::array<uint32_t, 8> packet{};
+    CommandBufferLayout layout{packet.data(), packet.data() + packet.size(),
+                               packet.data(), packet.data() + packet.size(),
+                               nullptr, nullptr, 0};
+    auto *buffer = reinterpret_cast<Gen5::CommandBuffer *>(&layout);
+    const auto *base = reinterpret_cast<const volatile void *>(test.base);
+    auto *emitted = test.async
+        ? Gen5::AgcAcbAcquireMem(buffer, test.gcr, base, test.size, test.poll)
+        : Gen5::AgcDcbAcquireMem(buffer, test.engine, test.cb_db, test.gcr,
+                                 base, test.size, test.poll);
+    Require(name, test.label, emitted == packet.data() &&
+                layout.cursor_up == packet.data() + packet.size() && packet == test.expected,
+            "ACQUIRE_MEM differs from the pinned native packet");
+    const auto tick = renderer.GetCommandScheduler().CurrentTick();
+    Pm4Execution execution;
+    Require(name, test.label,
+            processor.Process(execution, packet) == Pm4ProcessResult::Complete &&
+                packet == test.expected && renderer.GetCommandScheduler().CurrentTick() == tick,
+            "native ACQUIRE_MEM was not consumed without mutation or queue submission");
+  }
+  const std::array<uint32_t, 7> ps4_packet{0xc0055800, 0x00400000, 1, 0, 0, 0, 10};
+  Pm4Execution execution;
+  Require(name, "native PS4 packet",
+          processor.Process(execution, ps4_packet) == Pm4ProcessResult::Complete,
+          "seven-DWORD ACQUIRE_MEM was not consumed");
+  std::printf("[host]    %-32s ok\n", name);
+}
 
 void CheckPm4WaitPackets(RenderContext &renderer) {
   GraphicsInitJmpTables();
@@ -48240,6 +48275,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--pm4-wait-only") == 0) {
     VulkanHarness vulkan;
+    CheckPm4AcquireMemPackets(vulkan.RuntimeRenderer());
     CheckPm4WaitPackets(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
     return 0;
@@ -48512,7 +48548,7 @@ int main(int argc, char **argv) {
   CheckErrorDialogLifecycle();
   CheckSigninDialogLifecycle();
   CheckVulkan13FeatureRequirements();
-  CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
+  CheckPm4AcquireMemPackets(vulkan.RuntimeRenderer());
   CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
   CheckPm4Predication(vulkan.RuntimeRenderer());
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
