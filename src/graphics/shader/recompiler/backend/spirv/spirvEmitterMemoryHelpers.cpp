@@ -480,6 +480,20 @@ uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::Buffer
 	return data;
 }
 
+uint32_t EncodePackedColorComponent(EmitterState& state, const Format::BufferFormatInfo& info,
+                                    uint32_t component, uint32_t data, uint32_t data_bits) {
+	auto value = EncodeFormattedStoreComponent(state, info, component, data, data_bits);
+	if (info.type == Format::ComponentType::Uint) {
+		value = EmitUMin32(state, value,
+		                  ConstantU32(state, (1u << info.component_bits[component]) - 1u));
+	}
+	if (info.component_bit_offset[component] != 0u) {
+		value = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), value,
+		               ConstantU32(state, info.component_bit_offset[component]));
+	}
+	return value;
+}
+
 spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
 		case IR::ValueOpcode::SharedAtomicCmpSwap64:

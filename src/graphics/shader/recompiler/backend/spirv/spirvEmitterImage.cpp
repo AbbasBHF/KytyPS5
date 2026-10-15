@@ -642,19 +642,13 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 		}
 		if (converted) {
 			if (!selected) continue;
-			auto value = EncodeFormattedStoreComponent(ctx.state, info, component, raw, mem.data_bits);
 			if (!packed) {
-				values[component] = value;
+				values[component] =
+				    EncodeFormattedStoreComponent(ctx.state, info, component, raw, mem.data_bits);
 				continue;
 			}
-			if (info.type == Format::ComponentType::Uint) {
-				value = EmitUMin32(ctx.state, value,
-				                  ConstantU32(ctx.state, (1u << info.component_bits[component]) - 1u));
-			}
-			if (info.component_bit_offset[component] != 0u) {
-				value = Binary(ctx.state, spv::OpShiftLeftLogical, TypeU32(ctx.state), value,
-				               ConstantU32(ctx.state, info.component_bit_offset[component]));
-			}
+			const auto value =
+			    EncodePackedColorComponent(ctx.state, info, component, raw, mem.data_bits);
 			packed_value = packed_value == zero ? value
 			    : Binary(ctx.state, spv::OpBitwiseOr, TypeU32(ctx.state), packed_value, value);
 			continue;
