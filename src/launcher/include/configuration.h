@@ -125,6 +125,7 @@ public:
 	bool                   skip_bvh_intersections      = false;
 	bool                   skip_mesh_fallback_draws    = false;
 	bool                   trophy_enabled              = true;
+	int                    trophy_duration_seconds     = 6;
 	bool                   skip_notice_screen          = false;
 	bool                   network_connected           = false;
 	int                    vblank_frequency            = 60;
@@ -164,6 +165,7 @@ public:
 		skip_bvh_intersections      = other.skip_bvh_intersections;
 		skip_mesh_fallback_draws    = other.skip_mesh_fallback_draws;
 		trophy_enabled              = other.trophy_enabled;
+		trophy_duration_seconds     = other.trophy_duration_seconds;
 		skip_notice_screen          = other.skip_notice_screen;
 		network_connected           = other.network_connected;
 		vblank_frequency            = other.vblank_frequency;

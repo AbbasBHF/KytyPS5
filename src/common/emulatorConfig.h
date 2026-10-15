@@ -81,6 +81,7 @@ struct ConfigOptions {
 	bool                   skip_bvh_intersections      = false;
 	bool                   skip_mesh_fallback_draws    = false;
 	bool                   trophy_enabled              = true;
+	uint32_t               trophy_duration_seconds     = 6;
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_notice_screen          = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -139,6 +140,7 @@ bool TessellationEnabled();
 bool SkipBvhIntersections();
 bool SkipMeshFallbackDraws();
 bool TrophyEnabled();
+uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();
 bool SkipNoticeScreen();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

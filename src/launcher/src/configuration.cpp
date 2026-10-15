@@ -18,6 +18,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(skip_bvh_intersections);
 	KYTY_CFG_SET(skip_mesh_fallback_draws);
 	KYTY_CFG_SET(trophy_enabled);
+	KYTY_CFG_SET(trophy_duration_seconds);
 	KYTY_CFG_SET(skip_notice_screen);
 	KYTY_CFG_SET(network_connected);
 	KYTY_CFG_SET(vblank_frequency);
@@ -67,6 +68,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(skip_bvh_intersections);
 	KYTY_CFG_GET(skip_mesh_fallback_draws);
 	trophy_enabled   = s.value("trophy_enabled", trophy_enabled).toBool();
+	KYTY_CFG_GET(trophy_duration_seconds);
 	KYTY_CFG_GET(skip_notice_screen);
 	KYTY_CFG_GET(network_connected);
 	vblank_frequency = s.value("vblank_frequency", vblank_frequency).toInt();
@@ -146,6 +148,9 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 	}
 	if (vblank_frequency < 30 || vblank_frequency > 360) {
 		return fail(tr("Vblank frequency must be between 30 and 360."));
+	}
+	if (trophy_duration_seconds < 5 || trophy_duration_seconds > 10) {
+		return fail(tr("Trophy notification duration must be between 5 and 10 seconds."));
 	}
 	if ((shader_log_direction == LogDirection::File && shader_log_folder.isEmpty()) ||
 	    (printf_direction == LogDirection::File && printf_output_file.isEmpty()) ||
