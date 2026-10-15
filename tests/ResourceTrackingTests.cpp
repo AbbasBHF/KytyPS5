@@ -5079,7 +5079,7 @@ void TestFmaskLoadSpecialization() {
                              specialization),
         "FMASK resources did not materialize");
   ApplyResourceSpecialization(fixture.program, specialization);
-  RemoveIdentities(fixture.program.blocks);
+  RemoveIdentities(fixture.program);
   EliminateDeadCode(fixture.program.blocks);
   Check(fixture.program.info.images.size() == 1 && snapshot.images.size() == 1 &&
             snapshot.images[0].dwords[0] == 0x2000u &&
@@ -7392,7 +7392,7 @@ void TestLoopCycleEnteredThroughRuntimeValue() {
                {handle, Value(0u), Value(0u), Value(0u), Value(true)},
                fixture.AddMemory(memory, 16), loop);
   ConstantPropagationPass(fixture.program.blocks);
-  RemoveIdentities(fixture.program.blocks);
+  RemoveIdentities(fixture.program);
   fixture.PlanAndTrack();
   auto plan = ExtractResourcePlan(fixture.program);
   const std::array<uint32_t, 1> user_data{0x4000u};

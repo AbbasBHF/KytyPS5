@@ -718,7 +718,7 @@ void TestCompleteUMinReduction() {
       Check(reduction->GetOpcode() == ValueOpcode::SubgroupUMinU32 &&
                 reduction->Arg(0).Resolve() == seed.Resolve(),
             "UMin reduction changed the neutral-masked input");
-      RemoveIdentities(fixture.program.blocks);
+      RemoveIdentities(fixture.program);
       EliminateDeadCode(fixture.program.blocks);
       uint32_t updates = 0;
       for (const auto &inst : fixture.BlockAt()) {
@@ -745,7 +745,7 @@ void TestOptimizationPipeline() {
   fixture.Emit(ValueOpcode::IMul32, {Value(6u), Value(7u)});
 
   ConstantPropagationPass(fixture.program.blocks);
-  RemoveIdentities(fixture.program.blocks);
+  RemoveIdentities(fixture.program);
   EliminateDeadCode(fixture.program.blocks);
 
   const auto &instructions = fixture.BlockAt().Instructions();
@@ -785,8 +785,7 @@ void TestControlFlowValueSurvivesReadLaneFolding() {
   Check(EliminateReadLane(fixture.program, 64).rewritten_reads == 1,
         "control-flow fixture did not eliminate its fixed-lane read");
   ConstantPropagationPass(fixture.program.blocks);
-  ResolveControlFlowIdentities(fixture.program);
-  RemoveIdentities(fixture.program.blocks);
+  RemoveIdentities(fixture.program);
   EliminateDeadCode(fixture.program.blocks);
 
   Check(entry_info.condition == Value(true),

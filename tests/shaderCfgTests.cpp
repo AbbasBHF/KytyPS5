@@ -9336,7 +9336,7 @@ void TestScalarSelectedVccBufferAddress() {
   }
 }
 
-void TestNativeGuardedSamplerSource() {
+void TestNativeGuardedSamplerSource(bool inline_constants) {
   constexpr uint32_t nested = 12, sample = 18, join = 20, end = 22;
   const uint32_t shader[] = {
       EncodeSopc(0x07, 21, 128),
@@ -9357,8 +9357,29 @@ void TestNativeGuardedSamplerSource() {
       EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0),
       EncodeSopp(0x01),
   };
+  std::vector<uint32_t> code;
+  if (inline_constants) {
+    // Native paths reaching the sample bypass both clobbers, although
+    // structurization merges their definitions into the sampler's SSA Phis.
+    code = {EncodeSopk(0x00, 16, 146), EncodeSop2(0x24, 17, 140, 140),
+            EncodeSMovB32(18, 255), 0x05000000u, EncodeSMovB32(19, 244)};
+  }
+  const auto prefix = code.size();
+  code.insert(code.end(), std::begin(shader), std::end(shader));
+  if (inline_constants) {
+    for (const uint32_t clobber : {4u, 12u}) {
+      code[prefix + clobber] = EncodeSmem0(0x02, 16, 14);
+      code[prefix + clobber + 1u] = 125u << 25u;
+      code[prefix + clobber + 2u] = code[prefix + clobber + 3u] = EncodeSopp(0x00);
+    }
+  }
   auto user_data = ImageTestUserData();
-  const std::array<uint32_t, 4> sampler{0u, 0u, 0x09500000u, 0u};
+  const auto sampler = inline_constants ? std::array<uint32_t, 4>{0x92u, 0x00fff000u, 0x05000000u, 0u}
+                                        : std::array<uint32_t, 4>{0u, 0u, 0x09500000u, 0u};
+  const std::array<uint32_t, 4> clobbered{5u, 6u, 7u, 8u};
+  const auto clobber_address = reinterpret_cast<uint64_t>(clobbered.data());
+  user_data[20] = static_cast<uint32_t>(clobber_address);
+  user_data[21] = static_cast<uint32_t>(clobber_address >> 32u);
   std::ranges::copy(sampler, user_data.begin() + 8);
   user_data[13] = 1u;
   for (uint32_t mode = 0; mode != 3; ++mode) {
@@ -9366,7 +9387,7 @@ void TestNativeGuardedSamplerSource() {
     auto options = MakeCompileOptions(ShaderType::Pixel);
     options.user_data_base = 8;
     options.user_data = user_data;
-    const auto result = RecompileForTest(shader, options);
+    const auto result = RecompileForTest(code, options, ReadHostTestMemory);
     const auto expected = mode == 2u ? sampler : std::array<uint32_t, 4>{};
     Check(!result.program.dispatcher_fallback && result.resources.samplers.size() == 1u &&
               result.resources.samplers[0].dword_count == expected.size() &&
@@ -9374,6 +9395,41 @@ void TestNativeGuardedSamplerSource() {
           "guarded native sample selected an unrelated arm's sampler constants");
     CheckSpirvBinaryValidates(result.spirv);
   }
+}
+
+void TestNativeConstantSamplerSelection() {
+  const uint32_t shader[] = {
+      EncodeSopk(0x00, 16, 146), EncodeSop2(0x24, 17, 140, 140),
+      EncodeSMovB32(18, 255), 0x05000000u, EncodeSMovB32(19, 128),
+      EncodeVop1(0x01, 1, 191), EncodeVopc(0xc4, 256, 1),
+      EncodeSopp(0x06, 1), EncodeSMovB32(16, 128),
+      EncodeMimg0(0x27, 0x1), EncodeMimg1(0, 2, 4, 2),
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  auto user_data = ImageTestUserData();
+  user_data[0] = 0x1000u;
+  user_data[1] = 0u;
+  user_data[2] = 4u;
+  user_data[3] = 0x30005204u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto input = *options.input_info.compute;
+  input.thread_ids_num = 1u;
+  input.threads_num[0] = 128u;
+  options.wave_size = input.wave_size = 64u;
+  options.input_info.compute = &input;
+  options.user_data = user_data;
+  const auto result = RecompileForTest(shader, options);
+  const auto selected = std::ranges::find_if(result.program.info.samplers,
+      [](const auto& sampler) { return !sampler.indirect_resources.empty(); });
+  Check(selected != result.program.info.samplers.end() && selected->indirect_resources.size() == 2u,
+        "different native sampler definitions were folded into a single state");
+  const auto& choices = selected->indirect_resources;
+  const auto first = result.resources.samplers[choices[0]].dwords[0];
+  const auto second = result.resources.samplers[choices[1]].dwords[0];
+  Check((first == 0x92u && second == 0u) || (first == 0u && second == 0x92u),
+        "native sampler selection lost either reachable constant state");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestBoundedMaterialBufferStores(bool scalar_key) {
@@ -11399,7 +11455,7 @@ void TestEmbeddedVertexFormatSwizzle() {
       }
     }
     RewriteToSsa(program.blocks);
-    RemoveIdentities(program.blocks);
+    RemoveIdentities(program);
     ConstantPropagationPass(program.blocks);
     uint32_t exports = 0;
     for (const auto *block : program.blocks) {
@@ -12302,7 +12358,7 @@ void TestTypedEntryStateIsMinimal() {
           "typed entry did not materialize the active invocation mask once");
 
     IR::RewriteToSsa(values.blocks);
-    IR::RemoveIdentities(values.blocks);
+    IR::RemoveIdentities(values);
     IR::EliminateDeadCode(values.blocks);
     IR::ValidateProgram(values, true);
   };
@@ -12766,8 +12822,7 @@ void TestLaneMaskProjection() {
     Check(raw_consumer.Resolve().TryInstruction()->Arg(0).Resolve() == initial_mask.Resolve() &&
               gated_raw_consumer.Resolve().TryInstruction()->Arg(0).Resolve() == gated_mask.Resolve(),
           "mask projection changed a raw scalar mask consumer");
-    ResolveControlFlowIdentities(program);
-    RemoveIdentities(program.blocks);
+    RemoveIdentities(program);
     ValidateProgram(program, true);
   }
 }
@@ -12836,9 +12891,8 @@ void TestLateConstantPropagation() {
                 selected.Resolve() == Value(42u) && projected.Resolve() == Value(true) &&
                 absorbed.Resolve() == active.Resolve(),
             "late constants did not reach Phi, nested mask patterns or new logical nodes");
-      ResolveControlFlowIdentities(program);
+      RemoveIdentities(program);
       Check(exit->condition == Value(true), "late constant lost its control-flow use");
-      RemoveIdentities(program.blocks);
       ValidateProgram(program, true);
     }
   }
@@ -14123,15 +14177,13 @@ void BuildTypedPlan(const uint32_t *code, uint32_t words,
   ir = ShaderRecompiler::Frontend::TranslateProgram(decoded, cfg, options);
   ShaderRecompiler::IR::RewriteToSsa(ir.blocks);
   ShaderRecompiler::IR::ConstantPropagationPass(ir.blocks);
-  ShaderRecompiler::IR::ResolveControlFlowIdentities(ir);
-  ShaderRecompiler::IR::RemoveIdentities(ir.blocks);
+  ShaderRecompiler::IR::RemoveIdentities(ir);
   ShaderRecompiler::IR::EliminateDeadCode(ir.blocks);
   const auto read_lane =
       ShaderRecompiler::IR::EliminateReadLane(ir, ir.wave_size);
   if (read_lane.rewritten_reads != 0) {
     ShaderRecompiler::IR::ConstantPropagationPass(ir.blocks);
-    ShaderRecompiler::IR::ResolveControlFlowIdentities(ir);
-    ShaderRecompiler::IR::RemoveIdentities(ir.blocks);
+    ShaderRecompiler::IR::RemoveIdentities(ir);
     ShaderRecompiler::IR::EliminateDeadCode(ir.blocks);
   }
   ShaderRecompiler::IR::TrackResources(ir, decoded, cfg);
@@ -16296,7 +16348,9 @@ int main() {
   TestNestedSelectionPreservesDescriptorSources();
   TestNativeScalarReadDescriptorPlanning();
   TestScalarSelectedVccBufferAddress();
-  TestNativeGuardedSamplerSource();
+  TestNativeGuardedSamplerSource(false);
+  TestNativeGuardedSamplerSource(true);
+  TestNativeConstantSamplerSelection();
   for (const bool scalar_key : {false, true}) TestBoundedMaterialBufferStores(scalar_key);
   TestNativeDescriptorProvenanceKeepsGpuSelection();
   TestCfgSiblingSharedExit();
