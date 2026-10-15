@@ -386,6 +386,82 @@ void TestSaveTruncate() {
   Check(FileSystem::KernelClose(fd) == OK, "close path truncation fixture");
 }
 
+void TestSaveWritev() {
+  namespace Kernel = Libs::LibKernel;
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto resolve = [&](const char* nid) {
+    const auto* symbol = symbols.Find(
+        {nid, "libkernel", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+    Check(symbol != nullptr, "vectored write export resolves");
+    return symbol->vaddr;
+  };
+  const auto writev = reinterpret_cast<int64_t (KYTY_SYSV_ABI *)(
+      int, const FileSystem::KernelIovec*, int)>(resolve("kAt6VDbHmro"));
+  const auto pwritev = reinterpret_cast<int64_t (KYTY_SYSV_ABI *)(
+      int, const FileSystem::KernelIovec*, int, int64_t)>(resolve("mBd4AfLP+u8"));
+  constexpr char Path[] = "/savedata0/vector-save.dat";
+  char first[] = "abc";
+  char second[] = "DE";
+  const std::array<FileSystem::KernelIovec, 3> buffers {{
+      {first, 3}, {nullptr, 0}, {second, 2}}};
+  const int fd = FileSystem::KernelOpen(Path, 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, "_", 1) == 1 &&
+            writev(fd, buffers.data(), buffers.size()) == 5 &&
+            FileSystem::KernelLseek(fd, 0, 1) == 6,
+        "writev writes consecutive segments and advances the descriptor position");
+  std::array<char, 6> bytes {};
+  Check(FileSystem::KernelPread(fd, bytes.data(), bytes.size(), 0) == bytes.size() &&
+            std::memcmp(bytes.data(), "_abcDE", bytes.size()) == 0,
+        "writev preserves the prefix and writes every nonempty segment in order");
+  char replacement[] = "12";
+  const std::array<FileSystem::KernelIovec, 2> patch {{
+      {replacement, 1}, {replacement + 1, 1}}};
+  Check(pwritev(fd, patch.data(), patch.size(), 1) == 2 &&
+            FileSystem::KernelLseek(fd, 0, 1) == 6 &&
+            FileSystem::KernelPread(fd, bytes.data(), bytes.size(), 0) == bytes.size() &&
+            std::memcmp(bytes.data(), "_12cDE", bytes.size()) == 0,
+        "pwritev shares segment ordering while preserving the descriptor position");
+
+  const std::array<FileSystem::KernelIovec, 2> invalid {{
+      {first, 1}, {nullptr, 1}}};
+  const std::array<FileSystem::KernelIovec, 2> oversized {{
+      {first, 1}, {second, static_cast<size_t>(std::numeric_limits<int>::max())}}};
+  Check(writev(fd, nullptr, 1) == Kernel::KERNEL_ERROR_EFAULT &&
+            writev(fd, invalid.data(), invalid.size()) == Kernel::KERNEL_ERROR_EFAULT &&
+            writev(fd, buffers.data(), -1) == Kernel::KERNEL_ERROR_EINVAL &&
+            writev(fd, buffers.data(), 1025) == Kernel::KERNEL_ERROR_EINVAL &&
+            writev(fd, oversized.data(), oversized.size()) == Kernel::KERNEL_ERROR_EINVAL &&
+            pwritev(fd, patch.data(), patch.size(), -1) == Kernel::KERNEL_ERROR_EINVAL &&
+            writev(-1, buffers.data(), buffers.size()) == Kernel::KERNEL_ERROR_EBADF &&
+            writev(fd, nullptr, 0) == 0 &&
+            FileSystem::KernelLseek(fd, 0, 1) == 6 &&
+            FileSystem::KernelPread(fd, bytes.data(), bytes.size(), 0) == bytes.size() &&
+            std::memcmp(bytes.data(), "_12cDE", bytes.size()) == 0,
+        "invalid vectors fail before writing any segment or moving the descriptor");
+  const int reader = FileSystem::KernelOpen(Path, 0, 0);
+  Check(reader >= 3 && writev(reader, buffers.data(), buffers.size()) ==
+                           Kernel::KERNEL_ERROR_EBADF &&
+            FileSystem::KernelLseek(reader, 0, 1) == 0 &&
+            FileSystem::KernelClose(reader) == OK,
+        "writev rejects a read-only descriptor without moving it");
+
+  const int append = FileSystem::KernelOpen(Path, 0xa, 0);
+  Check(append >= 3 && FileSystem::KernelLseek(append, 1, 0) == 1 &&
+            writev(append, buffers.data(), buffers.size()) == 5 &&
+            FileSystem::KernelLseek(append, 0, 1) == 11 &&
+            FileSystem::KernelLseek(append, 1, 0) == 1 &&
+            pwritev(append, patch.data(), patch.size(), 0) == 2 &&
+            FileSystem::KernelLseek(append, 0, 1) == 1,
+        "append vectored writes target EOF while positional writes preserve the cursor");
+  std::array<char, 13> appended {};
+  Check(FileSystem::KernelPread(fd, appended.data(), appended.size(), 0) == appended.size() &&
+            std::memcmp(appended.data(), "_12cDEabcDE12", appended.size()) == 0,
+        "append writes retain the original contents and ordered segments");
+  Check(FileSystem::KernelClose(append) == OK && FileSystem::KernelClose(fd) == OK,
+        "close vectored write fixtures");
+}
+
 void TestAioBatches() {
   namespace Kernel = Libs::LibKernel;
   Loader::SymbolDatabase symbols;
@@ -1969,6 +2045,7 @@ int main(int, char**) {
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
   TestSaveTruncate();
+  TestSaveWritev();
   TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
