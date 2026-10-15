@@ -5387,7 +5387,8 @@ void TestGuardedWaterfallBufferRecords() {
   using Libs::Graphics::DstSel;
   enum class Guard {
     Exact, Reversed, Greater, GreaterEqual, WrongGreater, SignedGreater,
-    NoRange, NoEquality, OtherLocal, UnguardedUse, SeparateVotes
+    NoRange, NoEquality, OtherLocal, UnguardedUse, SeparateVotes,
+    Loop, LoopReversed, LoopEntries, LoopBadEntry, LoopWiden, LoopUnanchored, LoopVarying
   };
   const auto make = [](Guard guard) {
     auto f = std::make_unique<Fixture>();
@@ -5398,7 +5399,6 @@ void TestGuardedWaterfallBufferRecords() {
     const auto local = f->Emit(ValueOpcode::LoadBufferU32,
         {input, lane, Value(0u), Value(0u), Value(true)},
         f->AddMemory({.kind = ResourceKind::Buffer, .idxen = true}, 0x200u));
-    const auto key = f->Emit(ValueOpcode::ReadLane, {local, Value(0u)});
     const auto initial = f->Emit(ValueOpcode::ULessThan32, {lane, Value(32u)});
     const auto range_local = guard == Guard::OtherLocal
         ? f->Emit(ValueOpcode::IAdd32, {local, Value(1u)}) : local;
@@ -5413,11 +5413,48 @@ void TestGuardedWaterfallBufferRecords() {
       range = f->Emit(ValueOpcode::LogicalAnd, {initial, compare});
     } else {
       // Match ANDN1_SAVEEXEC, including its initial-EXEC witness.
+      auto executing = initial;
+      auto comparison_mask = initial;
+      if (guard >= Guard::Loop) {
+        auto* entry = f->block;
+        auto* header = f->AddBlock();
+        f->block = header;
+        auto& mask = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U1));
+        if (guard != Guard::LoopUnanchored) entry->AddBranch(header);
+        header->AddBranch(header);
+        if (guard == Guard::LoopVarying) {
+          auto& predicate = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U1));
+          predicate.AddPhiOperand(entry, initial);
+          predicate.AddPhiOperand(header, f->Emit(ValueOpcode::LogicalNot, {Value(&predicate)}));
+          comparison_mask = Value(&predicate);
+        }
+        const auto next = guard == Guard::LoopWiden
+            ? f->Emit(ValueOpcode::LogicalNot, {initial})
+            : guard == Guard::LoopVarying ? comparison_mask
+            : f->Emit(ValueOpcode::ULessThan32, {lane, Value(16u)});
+        const auto carried = f->Emit(guard == Guard::LoopWiden
+            ? ValueOpcode::LogicalOr : ValueOpcode::LogicalAnd, {Value(&mask), next});
+        if (guard == Guard::LoopReversed) mask.AddPhiOperand(header, carried);
+        if (guard != Guard::LoopUnanchored) mask.AddPhiOperand(entry, initial);
+        if (guard != Guard::LoopReversed) mask.AddPhiOperand(header, carried);
+        if (guard == Guard::LoopEntries || guard == Guard::LoopBadEntry ||
+            guard == Guard::LoopUnanchored) {
+          auto* alternate = f->AddBlock();
+          (guard == Guard::LoopUnanchored ? header : entry)->AddBranch(alternate);
+          alternate->AddBranch(header);
+          const auto incoming = guard == Guard::LoopUnanchored
+              ? f->Emit(ValueOpcode::LogicalAnd, {Value(&mask), initial}, 0, alternate)
+              : guard == Guard::LoopBadEntry ? Value(true) : initial;
+          mask.AddPhiOperand(alternate, incoming);
+        }
+        executing = Value(&mask);
+      }
       const auto excluded = f->Emit(ValueOpcode::LogicalAnd,
-          {initial, f->Emit(ValueOpcode::ULessThanEqual32, {count, range_local})});
+          {comparison_mask, f->Emit(ValueOpcode::ULessThanEqual32, {count, range_local})});
       range = f->Emit(ValueOpcode::LogicalAnd,
-          {initial, f->Emit(ValueOpcode::LogicalNot, {excluded})});
+          {executing, f->Emit(ValueOpcode::LogicalNot, {excluded})});
     }
+    const auto key = f->Emit(ValueOpcode::ReadLane, {local, Value(0u)});
     const auto equal = f->Emit(ValueOpcode::IEqual32,
         guard == Guard::Reversed ? std::initializer_list<Value>{local, key}
                                  : std::initializer_list<Value>{key, local});
@@ -5466,14 +5503,17 @@ void TestGuardedWaterfallBufferRecords() {
   ResourceSpecialization specialization;
   for (const auto guard : {Guard::Exact, Guard::Reversed, Guard::Greater, Guard::GreaterEqual,
                           Guard::WrongGreater, Guard::SignedGreater, Guard::NoRange, Guard::NoEquality,
-                          Guard::OtherLocal, Guard::UnguardedUse, Guard::SeparateVotes}) {
+                          Guard::OtherLocal, Guard::UnguardedUse, Guard::SeparateVotes,
+                          Guard::Loop, Guard::LoopReversed, Guard::LoopEntries, Guard::LoopBadEntry,
+                          Guard::LoopWiden, Guard::LoopUnanchored, Guard::LoopVarying}) {
     auto fixture = make(guard);
     const auto plan = ExtractResourcePlan(fixture->program);
     const auto root = std::ranges::find_if(plan.info.buffers, [&](const auto& buffer) {
       return plan.descriptor_sources[buffer.source].indirect_descriptor.has_value();
     });
     Check(root != plan.info.buffers.end(), "waterfall buffer lost its indirect resource");
-    const bool proven = guard == Guard::Exact || guard == Guard::Reversed || guard == Guard::Greater;
+    const bool proven = guard == Guard::Exact || guard == Guard::Reversed || guard == Guard::Greater ||
+        guard == Guard::Loop || guard == Guard::LoopReversed || guard == Guard::LoopEntries;
     const auto& domain = *plan.descriptor_sources[root->source].indirect_descriptor;
     Check(domain.key_count.IsEmpty() != proven && !domain.selector &&
               domain.table_stride == 488u && domain.table_immediate == 216u,

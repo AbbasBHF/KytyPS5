@@ -37987,16 +37987,19 @@ void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
                             .limits.minStorageBufferOffsetAlignment;
   const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
   constexpr u32 selectors = 256u, table = 512u;
-  for (const bool direct_gt : {false, true})
+  enum class Guard { AndNot, DirectGt, NarrowingLoop };
+  for (const auto guard : {Guard::AndNot, Guard::DirectGt, Guard::NarrowingLoop})
   for (const auto [wave, upper_only] : {std::pair{32u, false}, std::pair{64u, false},
                                       std::pair{64u, true}}) {
+    const bool direct_gt = guard == Guard::DirectGt;
+    const bool outer_loop = guard == Guard::NarrowingLoop;
+    const u32 iterations = outer_loop ? 2u : 1u;
+    const std::string name = std::string(direct_gt ? "GuardedWaterfallGtRecords" : outer_loop
+        ? "GuardedWaterfallLoopRecords" : "GuardedWaterfallRecords") +
+        (upper_only ? "Upper64" : std::to_string(wave));
     TestCase test;
-    test.name = direct_gt
-        ? upper_only ? "GuardedWaterfallGtRecordsUpper64" : wave == 32u
-            ? "GuardedWaterfallGtRecords32" : "GuardedWaterfallGtRecords64"
-        : upper_only ? "GuardedWaterfallRecordsUpper64" : wave == 32u
-            ? "GuardedWaterfallRecords32" : "GuardedWaterfallRecords64";
-    test.initial.assign((slot * 3u + wave * 16u + 16u) / 4u, 0xdeadbeefu);
+    test.name = name.c_str();
+    test.initial.assign((slot * 3u + wave * iterations * 16u + 16u) / 4u, 0xdeadbeefu);
     std::fill_n(test.initial.begin() + table / 4u, 976u / 4u, 0u);
     constexpr std::array poison{0x012b6890u, 0x501502f9u, 0x493ba30eu, 0x3ea2f352u};
     std::copy(poison.begin(), poison.end(), test.initial.begin() + (table + 480u) / 4u);
@@ -38004,7 +38007,7 @@ void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
     const std::array<u32, 8> descriptors{table, 488u << 16u, 2u, 0x5204u,
                                         selectors, 4u << 16u, wave, 0x5204u};
     std::copy(descriptors.begin(), descriptors.end(), test.user_data.begin());
-    const std::array output{slot * 3u, 16u << 16u, wave, 0x5204u};
+    const std::array output{slot * 3u, 16u << 16u, wave * iterations, 0x5204u};
     std::copy(output.begin(), output.end(), test.user_data.begin() + 16u);
     for (u32 row = 0; row < 2u; ++row) {
       const std::array descriptor{slot * (row + 1u), 12u << 16u, wave,
@@ -38027,9 +38030,20 @@ void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
       AppendSMovLiteral(&code, 126, 0u);
       AppendSMovLiteral(&code, 127, UINT32_MAX);
     }
+    if (outer_loop) code.insert(code.end(), {EncodeVop2(0x1b, 10, InlineU32(8), 30),
+                                           EncodeVopc(0xd2, InlineU32(0), 10)});
     code.insert(code.end(), {EncodeSop1(0x04, 20, 126),
         EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(5, 1, 30), EncodeSopp(0x0c, 0)});
+    if (outer_loop) {
+      // Save the initial-EXEC comparison before the loop, as in native 9d4c.
+      code.insert(code.end(), {EncodeVopc(0xc3, 2, 5), EncodeSop1(0x04, 52, 106)});
+      AppendSMovLiteral(&code, 36, 0u);
+    }
+    const auto outer = code.size();
     if (direct_gt) code.push_back(EncodeVopc(0xd4, 2, 5)); // Keep N > local key in EXEC.
+    else if (outer_loop) code.insert(code.end(), {
+        EncodeSop2(0x1e, 37, 36, InlineU32(std::countr_zero(wave))),
+        EncodeVop2(0x25, 31, 37, 30), EncodeSop1(0x37, 50, 52)});
     else code.insert(code.end(), {EncodeVopc(0xc3, 2, 5),
                                  EncodeSop1(0x37, 52, 106)}); // Exclude N <= local key.
     const auto empty = code.size();
@@ -38044,16 +38058,27 @@ void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
     code.insert(code.end(), {EncodeSop2(0x26, 33, 32, 255), 488u,
         EncodeSmem0(0x0a, 12, 0), EncodeSmem1(216u, 33), EncodeSopp(0x0c, 0),
         EncodeMubuf0(0x02, 0, true, false, true), EncodeMubuf1(6, 3, 30),
-        EncodeSopp(0x0c, 0), EncodeMubuf0(0x1f, 0, true, false), EncodeMubuf1(6, 4, 30)});
+        EncodeSopp(0x0c, 0), EncodeMubuf0(0x1f, 0, true, false),
+        EncodeMubuf1(6, 4, outer_loop ? 31u : 30u)});
     code[skip] = EncodeSopp(0x08, code.size() - skip - 1u);
     code.insert(code.end(), {EncodeSop2(0x15, 54, 54, 106), EncodeSop1(0x04, 126, 58)});
     code.push_back(EncodeSopp(0x05, static_cast<int16_t>(loop - code.size() - 1u)));
     code[empty] = EncodeSopp(0x08, code.size() - empty - 1u);
+    if (outer_loop) {
+      code.push_back(EncodeSop1(0x04, 126, 50));
+      AppendVMovLiteral(&code, 9, 0x13579bdfu);
+      code.insert(code.end(), {EncodeMubuf0(0x1c, 12u, true, false), EncodeMubuf1(9, 4, 31),
+          EncodeVop2(0x1b, 10, InlineU32(4), 30), EncodeVopc(0xd2, InlineU32(0), 10),
+          EncodeSop2(0x00, 36, 36, InlineU32(1)), EncodeSopc(0x0a, 36, InlineU32(iterations))});
+      code.push_back(EncodeSopp(0x05, static_cast<int16_t>(outer - code.size() - 1u)));
+    }
     code.push_back(EncodeSop1(0x04, 126, 20));
     AppendVMovLiteral(&code, 9, 0x76543210u);
     code.insert(code.end(), {EncodeMubuf0(0x1c, 12u, true, false), EncodeMubuf1(9, 4, 30)});
     AppendEnd(&code);
     test.decoded_counts = {{direct_gt ? "V_CMPX_GT_U32" : "V_CMP_LE_U32", 1u}};
+    if (outer_loop) test.decoded_counts.insert(test.decoded_counts.end(),
+        {{"V_CMPX_EQ_U32", 2u}, {"S_CBRANCH_SCC1", 2u}});
     test.required_spirv = {"OpLoopMerge", "OpGroupNonUniformShuffle", "Volatile"};
     test.forbidden_spirv = {"load_indirect_buffer_", "indirect_buffer_format_geometry"};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
@@ -38080,18 +38105,23 @@ void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
       AppendBufferStoreDword(&producer.code, 1, 2);
       test.expected[selectors / 4u + lane] = key;
       if (upper_only && lane < 32u) continue;
-      const u32 out = slot * 3u / 4u + lane * 4u;
-      if (key < 2u)
-        std::copy_n(test.initial.begin() + slot * (key + 1u) / 4u + lane * 3u, 3u,
-                    test.expected.begin() + out);
-      test.expected[out + 3u] = 0x76543210u;
+      if (outer_loop && (lane & 8u) != 0u) continue;
+      for (u32 iteration = 0; iteration < iterations; ++iteration) {
+        if (iteration != 0u && (lane & 4u) != 0u) continue;
+        const u32 out = slot * 3u / 4u + (iteration * wave + lane) * 4u;
+        if (key < 2u)
+          std::copy_n(test.initial.begin() + slot * (key + 1u) / 4u + lane * 3u, 3u,
+                      test.expected.begin() + out);
+        if (outer_loop) test.expected[out + 3u] = 0x13579bdfu;
+      }
+      test.expected[slot * 3u / 4u + lane * 4u + 3u] = 0x76543210u;
     }
     AppendEnd(&producer.code);
     const auto producer_shader = CompileCase(producer, vulkan.SubgroupSize());
     auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
     vulkan.Dispatch(producer, producer_shader, buffer);
     vulkan.Dispatch(test, compiled, buffer);
-    CompareWords(test, "same-lane bound, key == N, wrapped poison, EXEC restoration and canaries",
+    CompareWords(test, "same-lane bound, narrowing loop, key == N, poison, EXEC restoration and canaries",
                  test.expected, vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
     vulkan.DestroyBuffer(&buffer);
   }
