@@ -31073,7 +31073,8 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   test.compute_info.wave_size = wave;
   test.has_compute_info = true;
   test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge", formatted ? "OpSwitch" : "Volatile"};
-  if (!formatted) test.forbidden_spirv = {"convert_indirect_buffer_format"};
+  if (!formatted) test.forbidden_spirv = {"convert_indirect_buffer_format",
+                                         "indirect_buffer_format_geometry"};
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHLREV_B32,
                   O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_LSHL_B32,
                   O::S_BUFFER_LOAD_DWORDX8, load,
@@ -37418,6 +37419,18 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
           test.expected[slot_bytes * (key + 10u) / 4u + lane] =
               lane < source_records[key] ? 0x80000001u + key * 0x10000u + lane : 0u;
       auto compiled = CompileCase(test, vulkan.SubgroupSize());
+      if (count == 0u) {
+        u32 formatted_reads = 0;
+        for (const auto* block : compiled.program.blocks) {
+          for (const auto& inst : *block) {
+            if (inst.GetOpcode() != ValueOpcode::LoadBufferU32) continue;
+            const auto& memory = compiled.program.memory_info[inst.Flags<MemoryFlags>().index];
+            formatted_reads += memory.kind == ResourceKind::IndirectBuffer && memory.formatted;
+          }
+        }
+        Require(test.name, "runtime zero loop bound", formatted_reads == 1u,
+                "runtime loop count must retain the GPU formatted source read");
+      }
       Require(test.name, "finite writable descriptors",
               compiled.resources.buffers.size() == std::max(1u, count),
               "the bounded loop lost or overprobed a destination");
@@ -37430,8 +37443,10 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
       if (count == 8u) {
         std::set<u32> nonuniform;
         std::vector<u32> stores;
-        u32 bda_function = 0, conversion_function = 0;
+        u32 bda_function = 0, conversion_function = 0, geometry_function = 0, function = 0;
         u32 bda_calls = 0, conversion_calls = 0, conversion_definitions = 0;
+        u32 geometry_calls = 0, geometry_definitions = 0, geometry_switches = 0;
+        bool geometry_pure = true, geometry_cases = true;
         for (size_t offset = 5; offset < compiled.spirv.size();) {
           const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
           const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
@@ -37439,22 +37454,46 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
             const std::string_view name(reinterpret_cast<const char *>(words.data() + 2));
             if (name == "get_bda_pointer") bda_function = words[1];
             if (name == "convert_indirect_buffer_format") conversion_function = words[1];
+            if (name == "indirect_buffer_format_geometry") geometry_function = words[1];
           }
           if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
             nonuniform.insert(words[1]);
           if (opcode == spv::OpStore) stores.push_back(words[1]);
-          if (opcode == spv::OpFunction && words[2] == conversion_function)
-            ++conversion_definitions;
+          if (opcode == spv::OpFunction) {
+            function = words[2];
+            conversion_definitions += function == conversion_function;
+            geometry_definitions += function == geometry_function;
+          }
+          if (function == geometry_function && function != 0u) {
+            geometry_pure &= opcode != spv::OpLoad && opcode != spv::OpStore &&
+                             opcode != spv::OpFunctionCall;
+            if (opcode == spv::OpSwitch) {
+              ++geometry_switches;
+              constexpr u32 formats = u32(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
+              geometry_cases &= words.size() == 3u + 2u * formats;
+              if (words.size() == 3u + 2u * formats) {
+                geometry_cases &= words[2] == words[4]; // Invalid formats use format zero.
+                for (u32 format = 0; format < formats; ++format)
+                  geometry_cases &= words[3u + 2u * format] == format;
+              }
+            }
+          }
           if (opcode == spv::OpFunctionCall) {
             if (words[3] == bda_function) ++bda_calls;
             if (words[3] == conversion_function) ++conversion_calls;
+            if (words[3] == geometry_function) ++geometry_calls;
           }
+          if (opcode == spv::OpFunctionEnd) function = 0;
           offset += words.size();
         }
         Require(test.name, "one shared formatted conversion",
                 conversion_definitions == 1u &&
                     conversion_calls == (wave > vulkan.SubgroupSize() ? 2u : 1u),
                 "formatted loads must call one conversion function across virtual halves");
+        Require(test.name, "one shared pure format geometry",
+                geometry_definitions == 1u && geometry_calls == conversion_calls &&
+                    geometry_switches == 1u && geometry_cases && geometry_pure,
+                "format geometry duplicated, lost a format/default or acquired memory accesses");
         Require(test.name, "one shared indirect store per virtual half",
                 std::ranges::count_if(stores, [&](u32 pointer) { return nonuniform.contains(pointer); }) ==
                     (wave > vulkan.SubgroupSize() ? 2 : 1),
@@ -37570,7 +37609,8 @@ void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
       }
       if (count == 2u || count == 3u) {
         test.required_spirv = {"StorageBufferArrayNonUniformIndexing"};
-        test.forbidden_spirv = {"OpSwitch", "PhysicalStorageBuffer", "convert_indirect_buffer_format"};
+        test.forbidden_spirv = {"OpSwitch", "PhysicalStorageBuffer", "convert_indirect_buffer_format",
+                               "indirect_buffer_format_geometry"};
       } else if (count == 6u) test.required_spirv = {"OpSwitch"};
       auto compiled = CompileCase(test, vulkan.SubgroupSize());
       Require(test.name, "mixed native aliases", count != 6u ||
@@ -37693,7 +37733,8 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
       // Compile against poison selectors. A separate GPU dispatch writes the actual keys.
       auto compiled = CompileCase(test, vulkan.SubgroupSize());
       if (table_bytes == 0u || components != 0u)
-        test.forbidden_spirv = {"convert_indirect_buffer_format", "load_indirect_buffer_"};
+        test.forbidden_spirv = {"convert_indirect_buffer_format", "load_indirect_buffer_",
+                               "indirect_buffer_format_geometry"};
       else
         test.required_spirv = {"get_bda_pointer", "convert_indirect_buffer_format"};
       CheckSpirvEmission(test, compiled.spirv);
