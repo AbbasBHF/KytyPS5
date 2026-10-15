@@ -459,11 +459,15 @@ uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits);
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw);
 
+enum class UnormRounding { RoundEven, HalfUp, Truncate };
+
 uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::BufferFormatInfo& info,
-                                       uint32_t component, uint32_t data, uint32_t data_bits);
+                                       uint32_t component, uint32_t data, uint32_t data_bits,
+                                       UnormRounding rounding = UnormRounding::RoundEven);
 
 uint32_t EncodePackedColorComponent(EmitterState& state, const Format::BufferFormatInfo& info,
-                                    uint32_t component, uint32_t data, uint32_t data_bits);
+                                    uint32_t component, uint32_t data, uint32_t data_bits,
+                                    UnormRounding rounding = UnormRounding::RoundEven);
 
 spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode);
 

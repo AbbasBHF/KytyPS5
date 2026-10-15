@@ -18093,6 +18093,175 @@ public:
           }
         }
       }
+      // Captured format30 uses uncompressed mode9 at MRT2. Keep a blended
+      // floating-point MRT live beside it, including sparse export routing.
+      constexpr uint64_t packed_address = depth_address + 0x28000;
+      static const auto packed_pixels = [] {
+        std::array<std::vector<u32>, 2> result;
+        constexpr std::array<std::array<u32, 3>, 2> inputs{{
+            {0x3aa01403u, 0x3ae01c04u, 0x3c282a0bu}, // just above 2.5/3.5/10.5 LSB
+            {0xbf800000u, 0x40000000u, 0x3e800000u}}};
+        for (u32 i = 0; i < result.size(); ++i) {
+          auto &code = result[i];
+          for (u32 component = 0; component < 3; ++component)
+            AppendVMovLiteral(&code, component, inputs[i][component]);
+          AppendVMovLiteral(&code, 4, 0x38004400u); // FP16 RG: 4, 0.5
+          AppendVMovLiteral(&code, 5, 0x4000bc00u); // FP16 BA: -1, 2
+          for (u32 ordinal = 0; ordinal < 7; ++ordinal) {
+            code.push_back(EncodeExp0(ordinal, 0xf, ordinal == 6, ordinal != 2));
+            code.push_back(ordinal == 2 ? EncodeExp1(0, 1, 2, 0) : EncodeExp1(4, 5, 0, 0));
+          }
+          AppendEnd(&code);
+        }
+        return result;
+      }();
+      TestCase packed_read;
+      packed_read.name = "PackedUnormRenderTargetRead";
+      packed_read.has_user_data = true;
+      packed_read.image_descriptor_swizzle = DstSel(4, 5, 6, 1);
+      const ShaderTextureResource packed_descriptor{{static_cast<u32>(packed_address >> 8u),
+          (static_cast<u32>(Prospero::BufferFormat::k11_11_10UNorm) << 20u) | (3u << 30u),
+          ((extent - 1u) >> 2u) | ((extent - 1u) << 14u),
+          packed_read.image_descriptor_swizzle |
+              (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0x00700000u, 0, 0}};
+      std::copy_n(packed_descriptor.fields, 8, packed_read.user_data.begin());
+      packed_read.user_data[8] = 0x92u;
+      packed_read.user_data[9] = 0x00fff000u;
+      packed_read.user_data[10] = 0x0a500000u; // Existing packed-UNorm bilinear clamp contract.
+      packed_read.user_data[50] = 8 * sizeof(u32);
+      AppendVMovU32(&packed_read.code, 20, extent / 2);
+      AppendVMovU32(&packed_read.code, 21, extent / 2);
+      packed_read.code.insert(packed_read.code.end(),
+          {EncodeMimg0(0x00, 0xf), EncodeMimg1(0, 20)});
+      AppendVMovLiteral(&packed_read.code, 20, 0x3f000000u);
+      AppendVMovLiteral(&packed_read.code, 21, 0x3f000000u);
+      packed_read.code.insert(packed_read.code.end(),
+          {EncodeMimg0(0x27, 0xf), EncodeMimg1(4, 20, 0, 2)});
+      for (u32 component = 0; component < 8; ++component)
+        AppendStoreVgpr(&packed_read.code, component, component);
+      AppendEnd(&packed_read.code);
+      const auto packed_reader = CompileCase(packed_read, SubgroupSize());
+      auto packed_output = CreateStorageBuffer(name, {}, 8);
+      const auto packed_sampler = CreateSampler(name);
+      uint64_t half_up_program = 0, truncate_program = 0;
+      struct PackedDraw { u32 slot, wave; bool truncate, clamp; };
+      for (const auto test : {PackedDraw{2, 64, false, false}, {2, 64, true, false},
+                              {2, 64, false, false}, {3, 32, false, false},
+                              {3, 32, false, true}}) {
+        const u32 float_slot = test.slot == 2 ? 6 : 7;
+        registers.Reset();
+        registers.SetViewportTransformControl(0x300);
+        registers.SetViewportScaleOffset(0, extent / 2, extent / 2,
+                                         extent / 2, extent / 2, 1, 0);
+        registers.SetViewportZMax(0, 1);
+        registers.SetScreenScissor(0, 0, extent, extent);
+        registers.SetWindowScissor(0, 0, extent, extent, false);
+        registers.SetGenericScissor(0, 0, extent, extent, false);
+        registers.SetViewportScissor(0, 0, 0, extent, extent, false);
+        registers.SetRenderTargetMask((7u << (4u * test.slot)) | (0xfu << (4u * float_slot)));
+        registers.SetShaderMask(test.slot == 2 ? 0x0fffffffu : 0xfffff0ffu);
+        registers.SetPsInControl(test.wave == 32 ? 0x8000 : 0);
+        constexpr std::array<u32, 7> modes{4, 4, 9, 5, 4, 4, 4};
+        for (u32 ordinal = 0; ordinal < modes.size(); ++ordinal)
+          registers.SetTargetOutputMode(ordinal, modes[ordinal]);
+        for (const auto slot : {test.slot, float_slot}) {
+          const bool packed = slot == test.slot;
+          registers.SetColorBase(slot, {.addr = packed ? packed_address : depth_address + 0x10000});
+          registers.SetColorInfo(slot,
+              {.blend_clamp = packed, .round_mode = packed && test.truncate,
+               .format = packed ? Prospero::ChannelLayout::k11_11_10
+                                : Prospero::ChannelLayout::k32_32_32_32,
+               .channel_type = packed ? Prospero::ChannelType::kUNorm : Prospero::ChannelType::kFloat,
+               .channel_order = Prospero::ChannelOrder::kStandard});
+          registers.SetColorAttrib2(slot, {.height = extent - 1, .width = extent - 1});
+          registers.SetColorAttrib3(slot, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+        }
+        HW::BlendControl additive{};
+        additive.enable = true;
+        additive.color_srcblend = additive.color_destblend =
+            additive.alpha_srcblend = additive.alpha_destblend =
+                static_cast<uint8_t>(Prospero::BlendFactor::kOne);
+        registers.SetBlendControl(float_slot, additive);
+        const auto &code = packed_pixels[test.clamp];
+        const auto ps_address = reinterpret_cast<uint64_t>(code.data());
+        ShaderMapUserData(ps_address, {.type = Prospero::ShaderBinaryType::kPs,
+            .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+        shaders.SetEsShaderBase(vertex_address);
+        shaders.SetGsShaderResource2({});
+        shaders.SetPsShaderBase(ps_address);
+        user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+        native_vertex_regs.es_regs.data_addr = vertex_address;
+        native_pixel_regs.ps_regs.data_addr = ps_address;
+        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
+            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
+            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+        Require(name, "packed format follows export ordinal",
+                pixel.target_output_mode[2] == 9 && pixel.wave_size == test.wave &&
+                    pixel.target_packed_unorm_mask == 4u &&
+                    pixel.target_round_mode == (test.truncate ? 4u : 0u),
+                "packed conversion or rounding contaminated another MRT or followed a physical slot");
+        if (test.slot == 2) {
+          auto &id = test.truncate ? truncate_program : half_up_program;
+          Require(name, "packed rounding program reuse", id == 0 || id == programs.pixel.id,
+                  "restoring half-up rounding failed to reuse its program");
+          id = programs.pixel.id;
+        }
+        RenderColorInfo packed_target{}, float_target{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(
+            executor, scheduler.Current(), packed_target, test.slot);
+        RenderExecutorTestAccess::ResolveRenderColorTarget(
+            executor, scheduler.Current(), float_target, float_slot);
+        Require(name, "packed target storage", packed_target.desc.info.bytes_per_block == 4 &&
+                    packed_target.desc.info.pixel_format == vk::Format::eR32Uint,
+                "packed target expanded its physical storage or used floating-point bit encoding");
+        vk::ClearValue packed_clear{}, float_clear{};
+        packed_clear.color.uint32[0] = 0xdeadbeefu;
+        float_clear.color.float32 = std::array<float, 4>{-2.f, 0.25f, 3.f, 0.5f};
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), packed_target.image_id, range, packed_clear);
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), float_target.image_id, range, float_clear);
+        RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+        const std::array<u32, 3> channels = test.clamp ? std::array<u32, 3>{0, 2047, 256}
+            : test.truncate ? std::array<u32, 3>{2, 3, 10} : std::array<u32, 3>{3, 4, 11};
+        const u32 word = channels[0] | (channels[1] << 11u) | (channels[2] << 22u);
+        Require(name, "packed MRT words",
+                ReadCachedTexel(name, context, packed_target.image_id, {}, {extent, extent, 1}) ==
+                    std::vector<u32>(extent * extent, word),
+                "mode9 export lost packed widths, half-up/truncate rounding, clamp or RGB write mask");
+        const auto floats = ReadCachedTexel(name, context, float_target.image_id, {}, {extent, extent, 1});
+        constexpr std::array<float, 4> blended{2.f, 0.75f, 2.f, 2.5f};
+        for (size_t i = 0; i < floats.size(); ++i)
+          Require(name, "unconverted MRT blending", floats[i] == std::bit_cast<u32>(blended[i % 4]),
+                  "packed MRT handling changed another target's floating-point export or blending");
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        std::copy_n(packed_descriptor.fields, 8, value.dwords.begin());
+        const auto binding = RenderExecutorTestAccess::ResolveTexture(
+            executor, packed_reader.program.info.images.at(0), value);
+        Require(name, "packed target sampled alias", binding.image_id == packed_target.image_id,
+                "sampling the packed target allocated a different image or lost the rendered data");
+        Image sampled;
+        sampled.view = cache.FindTexture(binding.image_id, binding.desc);
+        sampled.layout = cache.GetImage(binding.image_id).backing.state.layout;
+        scheduler.Finish();
+        Dispatch(packed_read, packed_reader, packed_output, nullptr, &sampled,
+                 nullptr, nullptr, packed_sampler);
+        const auto loaded = ReadBuffer(name, packed_output, 8);
+        for (u32 i = 0; i < loaded.size(); ++i) {
+          const auto component = i % 4;
+          const float expected = component == 3 ? 1.f
+              : channels[component] / (component == 2 ? 1023.f : 2047.f);
+          Require(name, "rendered packed load and sample",
+                  std::abs(std::bit_cast<float>(loaded[i]) - expected) < 0.000001f,
+                  "packed rendered contents lost normalization, ordering or texture visibility");
+        }
+      }
+      Require(name, "packed rounding program distinction", half_up_program != truncate_program,
+              "half-up and truncate exports shared one shader specialization");
+      DestroyBuffer(&packed_output);
+      m_device.destroySampler(packed_sampler);
       DestroyBuffer(&stencil_readback);
 
       vertex_shader = owned_vertex_shader;

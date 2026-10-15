@@ -13558,6 +13558,12 @@ void TestRenderTargetReverseExportMapping() {
        2,
        {Prospero::ColorMappingRgba, Prospero::ColorMappingRgab,
         Prospero::ColorMappingBgra, Prospero::ColorMappingAgbr}},
+      {Prospero::ChannelLayout::k11_11_10,
+       Prospero::ChannelType::kUNorm,
+       vk::Format::eR32Uint,
+       4,
+       {Prospero::ColorMappingRgba, Prospero::ColorMappingRgab,
+        Prospero::ColorMappingBgra, Prospero::ColorMappingAgbr}},
       {Prospero::ChannelLayout::k16_16_16_16,
        Prospero::ChannelType::kFloat,
        vk::Format::eR16G16B16A16Sfloat,
@@ -13696,6 +13702,45 @@ void TestRenderTargetReverseExportMapping() {
   PrepareProgram(regs, sh, mappings, compiled_info);
   Check(sparse_slot_key == MakeStageStaticKey(compiled_info),
         "component-only shader mask changes introduced a duplicate shader variant");
+
+  ShaderPixelInputInfo packed_info{};
+  packed_info.target_output_mode[0] = 9;
+  const auto unconverted_key = MakeStageStaticKey(packed_info);
+  packed_info.target_packed_unorm_mask = 1;
+  const auto half_up_key = MakeStageStaticKey(packed_info);
+  options.input_info.pixel = &packed_info;
+  const auto packed = RecompileForTest(shader, options);
+  const auto packed_source = DisassembleSpirvBinary(packed.spirv);
+  Check(half_up_key != unconverted_key &&
+            packed_source.find("OpVariable %_ptr_Output_v4uint Output") != std::string::npos &&
+            packed_source.find("RoundEven") == std::string::npos &&
+            packed_source.find("UnpackHalf2x16") == std::string::npos,
+        "mode9 packed MRT export lost its cache identity, integer backing or FP32 interpretation");
+  CheckSpirvBinaryValidates(packed.spirv);
+  packed_info.target_round_mode = 1;
+  const auto truncate = RecompileForTest(shader, options);
+  Check(MakeStageStaticKey(packed_info) != half_up_key && truncate.spirv != packed.spirv,
+        "packed MRT rounding was omitted from shader specialization");
+  CheckSpirvBinaryValidates(truncate.spirv);
+  packed_info.target_round_mode = 0;
+  Check(MakeStageStaticKey(packed_info) == half_up_key,
+        "restoring packed MRT rounding did not restore the static key");
+  packed_info.target_export_mapping[0] = Prospero::ColorMappingBgra;
+  const auto packed_reversed = RecompileForTest(shader, options);
+  Check(MakeStageStaticKey(packed_info) != half_up_key &&
+            SpirvContainsVectorShuffle(packed_reversed.spirv, {2u, 1u, 0u, 3u}),
+        "packed MRT conversion bypassed logical component ordering");
+  CheckSpirvBinaryValidates(packed_reversed.spirv);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  const uint32_t partial_packed[] = {
+      EncodeExp0(0, 0x3), EncodeExp1(0, 1, 2, 3), 0xbf810000u};
+  ExpectFatal([&] { (void)RecompileForTest(partial_packed, options); },
+              "partial packed MRT export was accepted without preserving untouched fields");
+  const uint32_t compressed_packed[] = {
+      EncodeExp0(0, 0xf, true, true), EncodeExp1(0, 1, 0, 0), 0xbf810000u};
+  ExpectFatal([&] { (void)RecompileForTest(compressed_packed, options); },
+              "packed MRT accepted an unsupported compressed export");
+#endif
 }
 
 void TestBlendMappingClassification() {

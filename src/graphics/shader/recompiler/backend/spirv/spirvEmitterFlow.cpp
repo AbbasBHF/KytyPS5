@@ -570,6 +570,28 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 				                          mapping.Map(3));
 				value = mapped;
 			}
+			if ((state.input_info.pixel->target_packed_unorm_mask & (1u << exp.index)) != 0u) {
+				if (exp.compr || MrtOutputMode(state, exp) != 9u ||
+				    (mapping.ApplyMask(exp.en) & 7u) != 7u) {
+					EXIT("unsupported packed UNorm EXP: export=%u mode=%u en=0x%x compr=%u\n",
+					     exp.index, MrtOutputMode(state, exp), exp.en, static_cast<uint32_t>(exp.compr));
+				}
+				const auto info = Format::GetFormatInfo(Prospero::BufferFormat::k11_11_10UNorm);
+				const auto rounding = (state.input_info.pixel->target_round_mode & (1u << exp.index)) != 0
+				                          ? UnormRounding::Truncate : UnormRounding::HalfUp;
+				const auto raw = Unary(state, spv::OpBitcast, TypeU32Vector(state, 4), value);
+				auto packed = ConstantU32(state, 0);
+				for (uint32_t component = 0; component < info.component_count; component++) {
+					const auto encoded = EncodePackedColorComponent(
+					    state, info, component, ExportRawComponent(ctx, raw, component), 32u, rounding);
+					packed = component == 0u ? encoded
+					    : Binary(state, spv::OpBitwiseOr, TypeU32(state), packed, encoded);
+				}
+				value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), value,
+				                          packed, ConstantU32(state, 0), ConstantU32(state, 0),
+				                          ConstantU32(state, 0));
+			}
 		}
 		if (exp.kind == IR::ExportTargetKind::Position &&
 		    state.input_info.vertex->clip_space.enabled) {

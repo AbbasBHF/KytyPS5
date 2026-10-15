@@ -663,7 +663,8 @@ void DefineOutputs(EmitterState& state) {
 				    binding.kind == IR::StageOutputKind::Mrt &&
 				    state.program.stage == ShaderType::Pixel &&
 				    binding.index < std::size(state.input_info.pixel->target_output_mode) &&
-				    state.input_info.pixel->target_output_mode[binding.index] == 7u;
+				    (state.input_info.pixel->target_output_mode[binding.index] == 7u ||
+				     (state.input_info.pixel->target_packed_unorm_mask & (1u << binding.index)) != 0u);
 				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
 				                                              binding.debug_name.c_str());

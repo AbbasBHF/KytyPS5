@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -773,6 +774,28 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	ShaderParams pixel_params;
 	if (pixel_active) {
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		for (uint32_t export_index = 0; export_index < 8u; export_index++) {
+			const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, export_index);
+			if (slot >= 8u || pixel_info.target_output_mode[export_index] == 0u) continue;
+			const auto& rt = context.GetRenderTarget(slot);
+			const auto target_mask = render_target_mask_slot(context.GetRenderTargetMask(), slot);
+			if (rt.base.addr == 0 || target_mask == 0u) continue;
+			const auto format = Prospero::ResolveRenderTargetFormat(rt.info.format, rt.info.channel_type);
+			if (format.buffer_format != Prospero::BufferFormat::k11_11_10UNorm) continue;
+			const auto mapping = pixel_info.target_export_mapping[export_index];
+			const auto shader_mask = render_target_mask_slot(pixel_info.target_shader_mask, slot);
+			const bool blend = context.GetBlendControl(slot).enable && !rt.info.blend_bypass;
+			if (blend || (mapping.ApplyMask(target_mask) & 7u) != 7u ||
+			    (mapping.ApplyMask(shader_mask) & 7u) != 7u ||
+			    pixel_info.target_output_mode[export_index] != 9u) {
+				EXIT("unsupported packed UNorm render-target export: slot=%u export=%u mode=%u "
+				     "target_mask=0x%x shader_mask=0x%x mapping=0x%02x blend=%u\n",
+				     slot, export_index, pixel_info.target_output_mode[export_index], target_mask,
+				     shader_mask, mapping.packed, static_cast<uint32_t>(blend));
+			}
+			pixel_info.target_packed_unorm_mask |= 1u << export_index;
+			pixel_info.target_round_mode |= static_cast<uint8_t>(rt.info.round_mode) << export_index;
+		}
 		if (!mesh_active && !tess_active && Prospero::IsRectList(user_config.GetPrimType())) {
 			pixel_info.parameter_mode = ShaderPixelParameterMode::Rectangle;
 		} else if (context.GetModeControl().provoking_vtx_last) {
@@ -904,6 +927,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		EXIT_IF(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
 		static_params.color_mask[slot] = colors[i].export_mapping.ApplyMask(
 		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
+		if (colors[i].desc.info.guest_format == Prospero::BufferFormat::k11_11_10UNorm) {
+			static_params.color_mask[slot] = 1u;
+		}
 		rendering.color_formats[slot] = colors[i].desc.view_info.format;
 		if (attachment_samples == 0) {
 			attachment_samples = colors[i].desc.info.samples;

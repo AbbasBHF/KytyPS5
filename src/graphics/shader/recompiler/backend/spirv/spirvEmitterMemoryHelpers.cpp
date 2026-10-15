@@ -429,7 +429,9 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 }
 
 uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::BufferFormatInfo& info,
-                                       uint32_t component, uint32_t data, uint32_t data_bits) {
+                                       uint32_t component, uint32_t data, uint32_t data_bits,
+                                       UnormRounding rounding) {
+	EXIT_IF(rounding != UnormRounding::RoundEven && info.type != Format::ComponentType::Unorm);
 	const auto bits = info.component_bits[component];
 	if (data_bits == 16u) {
 		if (info.type == Format::ComponentType::Uint) {
@@ -464,8 +466,12 @@ uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::Buffer
 		value = EmitGlsl<GLSLstd450FClamp, IR::Type::F32>(
 		    state, value, ConstantF32Value(state, lower), ConstantF32Value(state, upper));
 		if (normalized) {
-			value = EmitFPRoundEven32(
-			    state, EmitFPMul32(state, value, ConstantF32Value(state, max_value)));
+			value = EmitFPMul32(state, value, ConstantF32Value(state, max_value));
+			if (rounding == UnormRounding::RoundEven) {
+				value = EmitFPRoundEven32(state, value);
+			} else if (rounding == UnormRounding::HalfUp) {
+				value = EmitFPAdd32(state, value, ConstantF32Value(state, 0.5f));
+			}
 		}
 		// Float-to-integer conversion truncates scaled values toward zero.
 		value = Unary(state, is_signed ? spv::OpConvertFToS : spv::OpConvertFToU,
@@ -481,8 +487,9 @@ uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::Buffer
 }
 
 uint32_t EncodePackedColorComponent(EmitterState& state, const Format::BufferFormatInfo& info,
-                                    uint32_t component, uint32_t data, uint32_t data_bits) {
-	auto value = EncodeFormattedStoreComponent(state, info, component, data, data_bits);
+                                    uint32_t component, uint32_t data, uint32_t data_bits,
+                                    UnormRounding rounding) {
+	auto value = EncodeFormattedStoreComponent(state, info, component, data, data_bits, rounding);
 	if (info.type == Format::ComponentType::Uint) {
 		value = EmitUMin32(state, value,
 		                  ConstantU32(state, (1u << info.component_bits[component]) - 1u));
