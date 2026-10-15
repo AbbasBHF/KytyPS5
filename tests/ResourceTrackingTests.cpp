@@ -5385,7 +5385,10 @@ void TestGuardedWaterfallBufferRecords() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   namespace Prospero = Libs::Graphics::Prospero;
   using Libs::Graphics::DstSel;
-  enum class Guard { Exact, Reversed, NoRange, NoEquality, OtherLocal, UnguardedUse, SeparateVotes };
+  enum class Guard {
+    Exact, Reversed, Greater, GreaterEqual, WrongGreater, SignedGreater,
+    NoRange, NoEquality, OtherLocal, UnguardedUse, SeparateVotes
+  };
   const auto make = [](Guard guard) {
     auto f = std::make_unique<Fixture>();
     const auto count = f->UserData(2u);
@@ -5399,11 +5402,22 @@ void TestGuardedWaterfallBufferRecords() {
     const auto initial = f->Emit(ValueOpcode::ULessThan32, {lane, Value(32u)});
     const auto range_local = guard == Guard::OtherLocal
         ? f->Emit(ValueOpcode::IAdd32, {local, Value(1u)}) : local;
-    // Match the captured ANDN1_SAVEEXEC predicate, including its initial-EXEC witness.
-    const auto excluded = f->Emit(ValueOpcode::LogicalAnd,
-        {initial, f->Emit(ValueOpcode::ULessThanEqual32, {count, range_local})});
-    const auto range = f->Emit(ValueOpcode::LogicalAnd,
-        {initial, f->Emit(ValueOpcode::LogicalNot, {excluded})});
+    Value range;
+    if (guard == Guard::Greater || guard == Guard::GreaterEqual ||
+        guard == Guard::WrongGreater || guard == Guard::SignedGreater) {
+      const auto op = guard == Guard::GreaterEqual ? ValueOpcode::UGreaterThanEqual32
+          : guard == Guard::SignedGreater ? ValueOpcode::SGreaterThan32 : ValueOpcode::UGreaterThan32;
+      const auto compare = f->Emit(op, guard == Guard::WrongGreater
+          ? std::initializer_list<Value>{range_local, count}
+          : std::initializer_list<Value>{count, range_local});
+      range = f->Emit(ValueOpcode::LogicalAnd, {initial, compare});
+    } else {
+      // Match ANDN1_SAVEEXEC, including its initial-EXEC witness.
+      const auto excluded = f->Emit(ValueOpcode::LogicalAnd,
+          {initial, f->Emit(ValueOpcode::ULessThanEqual32, {count, range_local})});
+      range = f->Emit(ValueOpcode::LogicalAnd,
+          {initial, f->Emit(ValueOpcode::LogicalNot, {excluded})});
+    }
     const auto equal = f->Emit(ValueOpcode::IEqual32,
         guard == Guard::Reversed ? std::initializer_list<Value>{local, key}
                                  : std::initializer_list<Value>{key, local});
@@ -5450,7 +5464,8 @@ void TestGuardedWaterfallBufferRecords() {
       .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  for (const auto guard : {Guard::Exact, Guard::Reversed, Guard::NoRange, Guard::NoEquality,
+  for (const auto guard : {Guard::Exact, Guard::Reversed, Guard::Greater, Guard::GreaterEqual,
+                          Guard::WrongGreater, Guard::SignedGreater, Guard::NoRange, Guard::NoEquality,
                           Guard::OtherLocal, Guard::UnguardedUse, Guard::SeparateVotes}) {
     auto fixture = make(guard);
     const auto plan = ExtractResourcePlan(fixture->program);
@@ -5458,14 +5473,14 @@ void TestGuardedWaterfallBufferRecords() {
       return plan.descriptor_sources[buffer.source].indirect_descriptor.has_value();
     });
     Check(root != plan.info.buffers.end(), "waterfall buffer lost its indirect resource");
-    const bool proven = guard == Guard::Exact || guard == Guard::Reversed;
+    const bool proven = guard == Guard::Exact || guard == Guard::Reversed || guard == Guard::Greater;
     const auto& domain = *plan.descriptor_sources[root->source].indirect_descriptor;
     Check(domain.key_count.IsEmpty() != proven && !domain.selector &&
               domain.table_stride == 488u && domain.table_immediate == 216u,
           "waterfall bound mixed different lanes, values or resource uses");
     const auto materialize = [&] { return MaterializeResources(plan, runtime, snapshot, specialization); };
     if (!proven) {
-      Check(!materialize(), "unproved waterfall skipped a reachable unsupported descriptor");
+      Check(!materialize(), "unproved waterfall bypassed conservative descriptor rejection");
       continue;
     }
     for (const uint32_t count : {2u, 0u, 1u, 2u}) {

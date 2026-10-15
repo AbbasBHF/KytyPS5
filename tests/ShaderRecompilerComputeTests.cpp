@@ -37987,11 +37987,15 @@ void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
                             .limits.minStorageBufferOffsetAlignment;
   const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
   constexpr u32 selectors = 256u, table = 512u;
+  for (const bool direct_gt : {false, true})
   for (const auto [wave, upper_only] : {std::pair{32u, false}, std::pair{64u, false},
                                       std::pair{64u, true}}) {
     TestCase test;
-    test.name = upper_only ? "GuardedWaterfallRecordsUpper64" : wave == 32u
-        ? "GuardedWaterfallRecords32" : "GuardedWaterfallRecords64";
+    test.name = direct_gt
+        ? upper_only ? "GuardedWaterfallGtRecordsUpper64" : wave == 32u
+            ? "GuardedWaterfallGtRecords32" : "GuardedWaterfallGtRecords64"
+        : upper_only ? "GuardedWaterfallRecordsUpper64" : wave == 32u
+            ? "GuardedWaterfallRecords32" : "GuardedWaterfallRecords64";
     test.initial.assign((slot * 3u + wave * 16u + 16u) / 4u, 0xdeadbeefu);
     std::fill_n(test.initial.begin() + table / 4u, 976u / 4u, 0u);
     constexpr std::array poison{0x012b6890u, 0x501502f9u, 0x493ba30eu, 0x3ea2f352u};
@@ -38024,8 +38028,10 @@ void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
       AppendSMovLiteral(&code, 127, UINT32_MAX);
     }
     code.insert(code.end(), {EncodeSop1(0x04, 20, 126),
-        EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(5, 1, 30), EncodeSopp(0x0c, 0),
-        EncodeVopc(0xc3, 2, 5), EncodeSop1(0x37, 52, 106)}); // Exclude N <= local key.
+        EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(5, 1, 30), EncodeSopp(0x0c, 0)});
+    if (direct_gt) code.push_back(EncodeVopc(0xd4, 2, 5)); // Keep N > local key in EXEC.
+    else code.insert(code.end(), {EncodeVopc(0xc3, 2, 5),
+                                 EncodeSop1(0x37, 52, 106)}); // Exclude N <= local key.
     const auto empty = code.size();
     code.push_back(0u);
     code.push_back(EncodeSop1(0x04, 54, 126));
@@ -38047,6 +38053,7 @@ void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
     AppendVMovLiteral(&code, 9, 0x76543210u);
     code.insert(code.end(), {EncodeMubuf0(0x1c, 12u, true, false), EncodeMubuf1(9, 4, 30)});
     AppendEnd(&code);
+    test.decoded_counts = {{direct_gt ? "V_CMPX_GT_U32" : "V_CMP_LE_U32", 1u}};
     test.required_spirv = {"OpLoopMerge", "OpGroupNonUniformShuffle", "Volatile"};
     test.forbidden_spirv = {"load_indirect_buffer_", "indirect_buffer_format_geometry"};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
@@ -38064,9 +38071,10 @@ void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
         producer.compute_info.threads_num[2] = 1u;
     producer.compute_info.lds_size_dwords = 0;
     test.expected = test.initial;
+    // Exclude key == N and the key that wraps to the unsupported descriptor at byte 480.
+    constexpr std::array keys{0u, 1u, 2u, 0x029f79b5u};
     for (u32 lane = 0; lane < wave; ++lane) {
-      // This excluded key would wrap to the unsupported descriptor at byte480.
-      const u32 key = lane % 3u == 2u ? 0x029f79b5u : lane % 3u;
+      const u32 key = keys[lane % keys.size()];
       AppendVMovLiteral(&producer.code, 1, key);
       AppendVMovLiteral(&producer.code, 2, selectors + lane * 4u);
       AppendBufferStoreDword(&producer.code, 1, 2);
@@ -38083,7 +38091,7 @@ void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
     auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
     vulkan.Dispatch(producer, producer_shader, buffer);
     vulkan.Dispatch(test, compiled, buffer);
-    CompareWords(test, "same-lane bound, GPU keys, wrapped poison, EXEC restoration and canaries",
+    CompareWords(test, "same-lane bound, key == N, wrapped poison, EXEC restoration and canaries",
                  test.expected, vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
     vulkan.DestroyBuffer(&buffer);
   }
