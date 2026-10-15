@@ -513,7 +513,7 @@ public:
 				}
 			}
 			if (plan.reads[0] != nullptr && !plan.retain_reads) {
-				for (uint32_t word = 0; word < plan.handle->NumArgs(); ++word)
+				for (uint32_t word = 0; word < plan.read_dwords; ++word)
 					m_program.memory_info[plan.memory[word]].planning_only = true;
 			}
 		}
@@ -522,7 +522,7 @@ public:
 		for (const auto& plan: m_indirect_descriptors) {
 			if (plan.handle->GetOpcode() != ValueOpcode::GetImageResource || plan.reads[0] == nullptr)
 				continue;
-			for (const auto* read: plan.reads) {
+			for (const auto* read: std::span(plan.reads).first(plan.read_dwords)) {
 				const auto first = std::ranges::find_if(m_indirect_descriptors, [&](const auto& candidate) {
 					return candidate.reads[0] == read;
 				});
@@ -559,6 +559,7 @@ private:
 	struct IndirectDescriptorPlan {
 		Inst*                      handle = nullptr;
 		uint32_t                   source = 0;
+		uint32_t                   read_dwords = 0;
 		Value                      key;
 		std::array<Value, 8>       roots {};
 		std::array<uint32_t, 8>    memory {};
@@ -2196,7 +2197,8 @@ private:
 	}
 
 	bool MatchScalarMaterialKey(Value key, DescriptorSource::IndirectDescriptor& indirect,
-	                            DescriptorSource& material_source, bool require_bound) {
+	                            DescriptorSource& material_source, bool require_bound,
+	                            bool allow_scalar_domain = false) {
 		DescriptorSource::IndirectDescriptor::SelectorRead selector;
 		const auto* read = SelectorReadValue(key, Value(true), selector);
 		if (read == nullptr) return false;
@@ -2211,9 +2213,10 @@ private:
 		uint32_t offset = 0, stride = 0;
 		if (memory == nullptr || memory->offset > INT32_MAX ||
 		    !MemoryIndexBelongsTo(memory_index, *read)) return false;
-		if (MatchTableOffset(read->Arg(1), index, offset, stride) &&
+		const bool affine = MatchTableOffset(read->Arg(1), index, offset, stride) &&
 		    ((offset | stride | memory->offset) & 3u) == 0u &&
-		    uint64_t {offset} + memory->offset <= UINT32_MAX) {
+		    uint64_t {offset} + memory->offset <= UINT32_MAX;
+		if (affine) {
 			workgroup_axis = WorkgroupAxis(index);
 			if (workgroup_axis == UINT32_MAX) {
 				const auto* sum = index.Resolve().TryInstruction();
@@ -2242,6 +2245,12 @@ private:
 		if (rows) {
 			stride = 4u;
 			offset = 0u;
+		} else if (count.IsEmpty() && workgroup_axis == UINT32_MAX &&
+		           !require_bound && allow_scalar_domain && affine && stride != 0u) {
+			// The bounded selector V# covers this complete U32 address congruence
+			// class, including the zero value of out-of-bounds scalar reads.
+			stride = 1u << std::countr_zero(stride);
+			offset %= stride;
 		} else if (count.IsEmpty() && workgroup_axis == UINT32_MAX) {
 			auto address = read->Arg(1);
 			auto active = Value(true);
@@ -2666,7 +2675,7 @@ private:
 	                          uint32_t& table_stride, uint32_t& table_immediate) {
 		Inst* table_handle = nullptr;
 		Value table_guard;
-		for (uint32_t dword = 0; dword < handle.NumArgs(); ++dword) {
+		for (uint32_t dword = 0; dword < plan.read_dwords; ++dword) {
 			auto* read = descriptor.dwords[dword].Resolve().TryInstruction();
 			if (read == nullptr) {
 				return false;
@@ -2734,9 +2743,9 @@ private:
 			}
 			plan.split_offsets |= !indexed && offset != table_offset;
 			table_handle = current_handle;
-			if (handle.NumArgs() == 8u) {
-				if (memory->kind == ResourceKind::ScalarAddress)
-					plan.retain_reads |= !UsesOnlyImageDescriptors(*read);
+			if (handle.GetOpcode() != ValueOpcode::GetBufferResource) {
+				plan.retain_reads |= handle.GetOpcode() == ValueOpcode::GetSamplerResource ||
+				    (memory->kind == ResourceKind::ScalarAddress && !UsesOnlyImageDescriptors(*read));
 			} else if (std::ranges::any_of(read->Uses(), [&](const Use& use) {
 				return use.user->GetOpcode() != ValueOpcode::GetBufferResource ||
 				       std::ranges::any_of(use.user->Uses(), [&](const Use& consumer) {
@@ -2770,7 +2779,7 @@ private:
 		    handle.GetOpcode() != ValueOpcode::GetSamplerResource) return false;
 		Inst* pointer = nullptr;
 		uint32_t descriptor_offset = 0;
-		for (uint32_t word = 0; word < handle.NumArgs(); ++word) {
+		for (uint32_t word = 0; word < plan.read_dwords; ++word) {
 			const auto* read = descriptor.dwords[word].Resolve().TryInstruction();
 			uint32_t index, offset;
 			const auto* memory = read != nullptr ? ScalarReadMemory(*read, index) : nullptr;
@@ -2789,7 +2798,7 @@ private:
 		}
 		// An out-of-bounds pointer pair is zero. Guest mappings exclude the first
 		// 16 KiB page, so these pointed reads have the existing null-image semantics.
-		if (pointer == nullptr || uint64_t {descriptor_offset} + handle.NumArgs() * 4u > 0x4000u)
+		if (pointer == nullptr || uint64_t {descriptor_offset} + plan.read_dwords * 4u > 0x4000u)
 			return false;
 		const auto* low = pointer->Arg(0).Resolve().TryInstruction();
 		const auto* high = pointer->Arg(1).Resolve().TryInstruction();
@@ -2830,9 +2839,11 @@ private:
 		return true;
 	}
 
-	bool TryMakeIndirectImage(Inst& handle, const DescriptorSource& descriptor,
-	                          IndirectDescriptorPlan& plan) {
-		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) return false;
+	bool TryMakeTableDescriptor(Inst& handle, const DescriptorSource& descriptor,
+	                            IndirectDescriptorPlan& plan) {
+		const bool sampler = handle.GetOpcode() == ValueOpcode::GetSamplerResource;
+		if ((!sampler && handle.GetOpcode() != ValueOpcode::GetImageResource) ||
+		    handle.NumArgs() != (sampler ? 4u : 8u)) return false;
 		DescriptorSource table_source;
 		Value key;
 		uint32_t table_offset = 0;
@@ -2852,7 +2863,7 @@ private:
 			plan.retain_reads = true;
 		} else if (!plan.table_indexed &&
 		           MatchScalarMaterialKey(key, indirect, material_source,
-		                                  table_source.dword_count == 4u)) {
+		                                  !sampler && table_source.dword_count == 4u, sampler)) {
 			// Keep live descriptor payloads, but project descriptor-only SMEM onto
 			// the GPU key using the same plan as other indirect image reads.
 			plan.retain_reads |= table_source.dword_count == 4u;
@@ -2862,11 +2873,11 @@ private:
 			// A runtime count can describe fewer rows than the mask's static bit range.
 			if (guarded_count.IsEmpty()) guarded_count = UnsignedBoundOnEntry(key, handle.Parent(), true);
 			if (!guarded_count.IsEmpty()) {
-				if (table_stride < 32u || (table_stride & 3u) != 0u) return false;
+				if (table_stride < plan.read_dwords * 4u || (table_stride & 3u) != 0u) return false;
 				// Materialization captures the count and descriptor reads; renderer alias
 				// checks reject writes to those ranges while unrelated stores remain valid.
 				indirect.key_count = guarded_count;
-			} else if (table_stride != 32u) {
+			} else if (table_stride != plan.read_dwords * 4u) {
 				return false;
 			} else {
 				uint32_t first = 0;
@@ -2911,31 +2922,31 @@ private:
 		} else {
 			// A bounded V# supplies the complete image table. Leave every GPU selector
 			// and descriptor read in the shader; the host only translates table bytes.
-			if (plan.split_offsets) return false;
+			if (sampler || plan.split_offsets) return false;
 			indirect.table_stride = 0u;
 			indirect.table_offset = 0u;
 			indirect.table_immediate = 0u;
 			indirect.workgroup_axis = UINT32_MAX;
 			plan.table_read = plan.reads[0];
-			if (plan.table_indexed) indirect.table_record_bytes = table_immediate + 32u;
+			if (plan.table_indexed) indirect.table_record_bytes = table_immediate + plan.read_dwords * 4u;
 			else indirect.table_scalar = true;
 			plan.retain_reads = true;
 		}
 
 		if (plan.retain_reads) plan.reads.fill(nullptr);
 		indirect.table_source = InternSource(table_source);
-		DescriptorSource image_source;
-		image_source.dword_count = 8u;
-		image_source.dwords.fill(Value(0u));
+		DescriptorSource source;
+		source.dword_count = handle.NumArgs();
+		source.dwords.fill(Value(0u));
 		std::copy_n(material_source.dwords.begin(), material_source.dword_count,
-		            image_source.dwords.begin());
-		std::copy_n(table_source.dwords.begin(), table_source.dword_count,
-		            image_source.dwords.begin() + 4u);
-		image_source.indirect_descriptor = indirect;
+		            source.dwords.begin());
+		if (!sampler) std::copy_n(table_source.dwords.begin(), table_source.dword_count,
+		                          source.dwords.begin() + 4u);
+		source.indirect_descriptor = indirect;
 		plan.handle = &handle;
-		plan.source = InternSource(image_source);
+		plan.source = InternSource(source);
 		plan.key = key;
-		plan.roots = image_source.dwords;
+		plan.roots = source.dwords;
 		return true;
 	}
 
@@ -3375,8 +3386,8 @@ private:
 		return std::any_of(m_indirect_descriptors.begin(), m_indirect_descriptors.end(),
 		                   [&](const IndirectDescriptorPlan& plan) {
 			return plan.reads[0] != nullptr && !plan.retain_reads &&
-			       std::find(plan.memory.begin(), plan.memory.begin() + plan.handle->NumArgs(), index) !=
-			           plan.memory.begin() + plan.handle->NumArgs();
+			       std::find(plan.memory.begin(), plan.memory.begin() + plan.read_dwords, index) !=
+			           plan.memory.begin() + plan.read_dwords;
 		});
 	}
 
@@ -3398,11 +3409,23 @@ private:
 					uint32_t bad_dword = 0;
 					if (ValidateSource(descriptor, bad_dword)) return;
 					IndirectDescriptorPlan plan;
+					plan.read_dwords = width;
+					if (!sampler && width == 8u && memory.image_r128) {
+						// R128 handles are normalized to eight words; only their low four
+						// words come from memory. Every use must agree on that encoding.
+						if (!std::ranges::all_of(std::span(descriptor.dwords).subspan(4u),
+						        [](Value word) { return word.Resolve() == Value(0u); }) ||
+						    !std::ranges::all_of(handle->Uses(), [&](const Use& use) {
+							    return ImageOpcodeInfoOf(use.user->GetOpcode()).access != ImageAccess::None &&
+							        m_program.memory_info[use.user->Flags<MemoryFlags>().index].image_r128;
+						    })) return;
+						plan.read_dwords = 4u;
+					}
 					if (TryMakeNestedDescriptor(*handle, descriptor, plan) ||
-					    (sampler ? TryMakeFiniteDescriptor(*handle, plan)
-					             : (TryMakeIndirectImage(*handle, descriptor, plan) ||
-					                TryMakeFiniteDescriptor(*handle, plan) ||
-					                TryMakeIndirectBuffer(*handle, descriptor, plan)))) {
+					    (sampler && TryMakeFiniteDescriptor(*handle, plan)) ||
+					    TryMakeTableDescriptor(*handle, descriptor, plan) ||
+					    (!sampler && (TryMakeFiniteDescriptor(*handle, plan) ||
+					                  TryMakeIndirectBuffer(*handle, descriptor, plan)))) {
 						for (const auto& previous: m_indirect_descriptors) {
 							if (plan.reads[0] != nullptr && previous.reads[0] == plan.reads[0] &&
 							    !EquivalentValue(m_program, previous.key, plan.key))

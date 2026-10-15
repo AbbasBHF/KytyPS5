@@ -38696,33 +38696,46 @@ void CheckPointerImageTable(VulkanHarness &vulkan) {
 
 void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
-  constexpr u32 keys_address = 128, table = 256, stride = 592, objects = 4096;
+  constexpr u32 keys_address = 128, list_address = 160, table = 256, objects = 4096;
   constexpr std::array keys{5u, 0u, 3u, 1u, 4u, 2u};
+  constexpr std::array list{2u, 1u, 4u, 0u, 5u, 3u};
+  for (const bool compact : {false, true})
   for (const u32 wave : {32u, 64u}) {
+    const u32 stride = compact ? 0x330u : 592u;
+    const u32 table_bytes = (keys.size() - 1u) * stride + 0x98u + 16u;
     TestCase test;
-    test.name = "NestedPointerImageSamplerTable";
-    test.initial.resize((objects + keys.size() * 0x430u) / 4u, 0);
+    test.name = compact ? "CompactRecordImageSamplerTable" : "NestedPointerImageSamplerTable";
+    test.initial.resize((compact ? table + table_bytes : objects + keys.size() * 0x430u) / 4u,
+                        compact ? 0xdeadbeefu : 0u);
     std::fill_n(test.initial.begin(), keys.size(), 0xdeadbeefu);
     std::fill_n(test.initial.begin() + keys_address / 4u, keys.size(), UINT32_MAX);
+    if (compact) std::copy(list.begin(), list.end(), test.initial.begin() + list_address / 4u);
     for (u32 row = 0; row < keys.size(); ++row) {
-      const u32 object = objects + row * 0x430u;
-      test.initial[(table + row * stride) / 4u] = object;
+      const u32 object = compact ? table + row * stride : objects + row * 0x430u;
+      if (!compact) test.initial[(table + row * stride) / 4u] = object;
       auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
       image[0] = 10u + row;
       image[1] |= 1u << 30u; // Two texels: zero, then the row's value.
       image[3] = DstSel(4, 0, 0, 1) |
           (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
-      std::copy_n(image.begin(), 8, test.initial.begin() + (object + 0x3d0u) / 4u);
+      std::copy_n(image.begin(), compact ? 4u : 8u,
+                  test.initial.begin() + (object + (compact ? 0x98u : 0x3d0u)) / 4u);
       const std::array sampler{0u, 0x00fff000u, (row & 1u) ? 0x0a500000u : 0u, 0u};
       std::copy(sampler.begin(), sampler.end(),
-                test.initial.begin() + (object + 0x3f8u) / 4u);
+                test.initial.begin() + (object + (compact ? 0x88u : 0x3f8u)) / 4u);
     }
-    auto records = MakeStructuredStorageBufferData(stride, keys.size());
+    auto records = MakeStructuredStorageBufferData(compact ? 0u : stride,
+                                                    compact ? table_bytes : keys.size());
     records[0] = table;
     std::copy_n(records.begin(), 4, test.user_data.begin() + 32);
     auto key_buffer = MakeStructuredStorageBufferData(0, keys.size() * 4u);
     key_buffer[0] = keys_address;
     std::copy_n(key_buffer.begin(), 4, test.user_data.begin() + 4);
+    if (compact) {
+      auto indices = MakeStructuredStorageBufferData(0, list.size() * 4u);
+      indices[0] = list_address;
+      std::copy_n(indices.begin(), 4, test.user_data.begin() + 36);
+    }
     const auto output = MakeStructuredStorageBufferData(0, keys.size() * 4u);
     std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
     test.bda_mappings = {{0u, 0u}};
@@ -38739,20 +38752,39 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
     code.insert(code.end(), {EncodeMubuf0(0x0c), EncodeMubuf1(4, 1, 30),
                             EncodeVop2(0x16, 6, InlineU32(16), 4)});
     AppendVop3(&code, 0x360, 22, Vgpr(6), InlineU32(0));
-    code.insert(code.end(), {EncodeSop2(0x26, 23, 22, 255), stride,
+    if (compact) {
+      code.insert(code.end(), {EncodeSop2(0x1e, 23, 22, InlineU32(2)),
+                              EncodeSmem0(0x08, 22, 18), EncodeSmem1(0, 23),
+                              EncodeSop2(0x26, 23, 22, 255), stride,
+                              EncodeSmem0(0x0b, 8, 16), EncodeSmem1(0x88u, 23)});
+      for (u32 reg = 16u; reg < 20u; ++reg) AppendSMovLiteral(&code, reg, 0xdeadbeefu);
+    } else code.insert(code.end(), {EncodeSop2(0x26, 23, 22, 255), stride,
                             EncodeSmem0(0x09, 20, 16), EncodeSmem1(0, 23),
                             EncodeSmem0(0x03, 8, 10), EncodeSmem1(0x3d0, 125),
                             EncodeSmem0(0x02, 16, 10), EncodeSmem1(0x3f8, 125)});
     AppendVMovLiteral(&code, 20, std::bit_cast<u32>(0.5f));
     AppendVMovLiteral(&code, 21, std::bit_cast<u32>(0.5f));
-    code.insert(code.end(), {EncodeMimg0(0x27, 1), EncodeMimg1(5, 20, 2, 4)});
+    code.insert(code.end(), {EncodeMimg0(0x27, 1, 0, false, 1, compact),
+                            EncodeMimg1(5, 20, compact ? 3u : 2u, compact ? 2u : 4u)});
     AppendBufferStoreDword(&code, 5, 30);
     AppendEnd(&code);
     test.opcodes = {O::S_LSHL_B32, O::V_MOV_B32, O::BUFFER_LOAD_DWORD,
         O::V_LSHRREV_B32, O::V_READLANE_B32, O::S_MUL_I32,
-        O::S_BUFFER_LOAD_DWORDX2, O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX4,
         O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    if (compact) {
+      test.opcodes.insert(test.opcodes.end(), {O::S_BUFFER_LOAD_DWORD,
+          O::S_BUFFER_LOAD_DWORDX8, O::S_MOV_B32});
+      test.decoded_counts = {{"r128=1", 1}};
+    } else test.opcodes.insert(test.opcodes.end(),
+        {O::S_BUFFER_LOAD_DWORDX2, O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX4});
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    if (compact) Require(test.name, "physical R128 descriptor boundary",
+        compiled.resources.images.size() == keys.size() + 1u &&
+            std::ranges::all_of(compiled.resources.images, [](const auto &image) {
+              return image.dword_count == 8u &&
+                  std::ranges::all_of(std::span(image.dwords).subspan(4u),
+                                      [](u32 word) { return word == 0u; });
+            }), "compact descriptor copied adjacent poison or omitted the trailing 16-byte image");
     for (const auto &value : compiled.resources.buffers) {
       ShaderBufferResource descriptor{};
       std::copy_n(value.dwords.begin(), 4, descriptor.fields);
@@ -38792,8 +38824,10 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
     vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr,
                      nullptr, images, samplers);
     std::vector<u32> expected;
-    for (const auto key : keys)
+    for (auto key : keys) {
+      if (compact) key = list[key];
       expected.push_back(std::bit_cast<u32>(float(10u + key) * ((key & 1u) ? 0.5f : 1.0f)));
+    }
     CompareWords(test, "GPU-selected nested image and sampler", expected,
                  vulkan.ReadBuffer(test.name, buffer, expected.size()));
     vulkan.DestroyBuffer(&buffer);

@@ -2933,6 +2933,143 @@ void TestUniformScalarBufferImage() {
         "unavailable nested image table was accepted");
 }
 
+void TestCompactScalarImageTable() {
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  constexpr uint32_t stride = 0x330u, image_offset = 0x98u, sampler_offset = 0x88u;
+  const auto make_plan = [&](bool compact, uint32_t invalid = 0u) {
+    Fixture fixture;
+    const auto list = invalid == 1u
+        ? fixture.Address(fixture.UserData(0), fixture.UserData(1))
+        : fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                          fixture.UserData(2), fixture.UserData(3)});
+    const auto table = fixture.Buffer({fixture.UserData(4), fixture.UserData(5),
+                                       fixture.UserData(6), fixture.UserData(7)});
+    // Uniform on the GPU, but no CPU-evaluable row or workgroup-prefix proof.
+    const auto group = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)});
+    const auto index = fixture.Emit(ValueOpcode::BitwiseXor32, {group, Value(1u)});
+    const auto offset = fixture.Emit(invalid == 2u ? ValueOpcode::UDiv32
+                                                  : ValueOpcode::ShiftLeftLogical32,
+                                     {index, Value(2u)});
+    MemoryInfo scalar;
+    scalar.kind = invalid == 1u ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer;
+    const auto key = invalid == 1u
+        ? fixture.Emit(ValueOpcode::LoadAddressU32, {list, offset, Value(0u), Value(true)},
+                       fixture.AddMemory(scalar, 0x570u))
+        : fixture.Emit(ValueOpcode::ReadConstBuffer, {list, offset},
+                       fixture.AddMemory(scalar, 0x570u));
+    const auto record = fixture.Emit(ValueOpcode::IMul32, {key, Value(stride)});
+    scalar.kind = ResourceKind::ScalarBuffer;
+    std::array<Value, 8> image_words;
+    std::array<Value, 4> sampler_words;
+    for (uint32_t word = 0; word < 8u; ++word) {
+      scalar.offset = image_offset + word * 4u;
+      image_words[word] = compact && word >= 4u ? Value(0u)
+          : fixture.Emit(ValueOpcode::ReadConstBuffer, {table, record},
+                          fixture.AddMemory(scalar, 0x590u));
+      if (word < 4u) {
+        scalar.offset = sampler_offset + word * 4u;
+        sampler_words[word] = fixture.Emit(ValueOpcode::ReadConstBuffer, {table, record},
+                                            fixture.AddMemory(scalar, 0x590u));
+      }
+    }
+    if (invalid == 3u) image_words[7] = Value(1u);
+    const auto image = fixture.Image(image_words, 0x59cu);
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    sample.image_r128 = compact;
+    const auto sampler = fixture.Sampler(sampler_words, 0x59cu);
+    fixture.Emit(ValueOpcode::ImageSampleRaw,
+        {image, sampler, fixture.ImageAddress(), Value(true)}, fixture.AddMemory(sample, 0x59cu));
+    if (invalid == 4u) {
+      sample.image_r128 = false;
+      fixture.Emit(ValueOpcode::ImageSampleRaw,
+          {image, sampler, fixture.ImageAddress(), Value(true)}, fixture.AddMemory(sample, 0x5a0u));
+    }
+    fixture.PlanAndTrack();
+    const auto &source = fixture.program.descriptor_sources[fixture.program.info.samplers[0].source];
+    Check(source.indirect_descriptor && source.indirect_descriptor->selector &&
+              source.indirect_descriptor->selector->stride == 4u &&
+              source.indirect_descriptor->selector_first.IsEmpty() &&
+              source.indirect_descriptor->key_count.IsEmpty() &&
+              source.indirect_descriptor->table_stride == stride &&
+              source.indirect_descriptor->table_immediate == sampler_offset,
+          "compact image sampler lost its complete bounded index-list domain");
+    return ExtractResourcePlan(fixture.program);
+  };
+  for (const bool compact : {false, true}) {
+    auto plan = make_plan(compact);
+    const uint32_t width = compact ? 4u : 8u;
+    const auto bytes = 2u * stride + image_offset + width * 4u;
+    std::array<uint32_t, 8> data{0x1000u, 0u, 8u, 0u, 0x2000u, 0u, bytes, 0u};
+    struct Memory : LinearTestMemory { uint32_t selector_attempts = 0; } memory;
+    memory.words.resize((0x1000u + bytes) / 4u, 0xdeadbeefu);
+    memory.words[0] = 2u;
+    memory.words[1] = 1u;
+    for (uint32_t row = 0; row < 3u; ++row) {
+      auto at = memory.words.begin() + (0x1000u + row * stride + sampler_offset) / 4u;
+      std::fill_n(at, 4u, 0u);
+      at[0] = row;
+      at += 4;
+      std::fill_n(at, width, 0u);
+      at[0] = 0x100u + row;
+      at[1] = static_cast<uint32_t>(F::k32_32_32_32Float) << 20u;
+      at[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+      if (!compact) at[5] = 0x00700000u;
+    }
+    memory.fail_address = 0x2000u + bytes; // Last descriptor ends at the readable boundary.
+    SrtRuntime runtime{.user_data = data, .userdata = &memory,
+        .read_specialization_memory = [](void *userdata, uint64_t address,
+                                         std::span<uint32_t> words) {
+          auto &memory = *static_cast<Memory *>(userdata);
+          if (address == memory.base) ++memory.selector_attempts;
+          return ReadLinearTestMemory(&memory, address, words);
+        }};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const auto materialize = [&] {
+      Check(MaterializeResources(plan, runtime, snapshot, specialization),
+            "paired compact image/sampler table did not materialize");
+      Check(snapshot.images.size() == 4u && snapshot.samplers.size() == 3u,
+            "paired table omitted an image, index-list value or OOB zero key");
+      for (const auto &image : snapshot.images) {
+        Check(image.dword_count == 8u, "compact image escaped normalized eight-DWORD ABI");
+        if (compact) Check(std::ranges::all_of(std::span(image.dwords).subspan(4u),
+                                              [](uint32_t word) { return word == 0u; }),
+                           "R128 image copied poisoned adjacent record fields");
+      }
+    };
+    materialize();
+    const auto original = specialization;
+    memory.words[(0x1000u + stride + image_offset) / 4u] = 0x201u;
+    materialize();
+    Check(specialization == original && std::ranges::any_of(snapshot.images,
+              [](const auto &image) { return image.dwords[0] == 0x201u; }),
+          "compact descriptor payload refresh changed specialization or stayed stale");
+    data[2] = 4u;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.samplers.size() == 2u,
+          "index-list count refresh retained a stale sampler candidate");
+    data[2] = 0u;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.samplers.size() == 1u &&
+              snapshot.samplers[0].dwords[0] == 0u,
+          "empty index list lost the scalar OOB zero key");
+    data[2] = 8u;
+    memory.fail_address = 0x1004u;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "unreadable selected index-list bytes were accepted");
+    memory.fail_address = UINT64_MAX;
+    data[2] = (MaxIndirectDescriptorProbes + 1u) * 4u;
+    memory.selector_attempts = 0u;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.selector_attempts == 0u,
+          "oversized index list was read before the existing probe cap");
+  }
+  for (uint32_t invalid : {1u, 2u, 3u, 4u})
+    CheckFatal([&] { make_plan(true, invalid); }, "not a valid runtime value",
+               "compact table accepted an unproved selector or inconsistent descriptor width");
+}
+
 void TestScalarBufferSelectorDomain() {
   const auto make_plan = [](bool active = true, bool sparse = false, bool uniformize_first = false) {
     Fixture fixture;
@@ -7313,6 +7450,7 @@ int main() {
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
+    Run("compact scalar image table", TestCompactScalarImageTable);
     Run("scalar buffer selector domain", TestScalarBufferSelectorDomain);
     Run("private LDS forwarding", TestPrivateLdsForwarding);
     Run("counted row image selector", TestCountedRowImageSelector);
