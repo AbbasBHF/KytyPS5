@@ -336,9 +336,9 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
   };
   put(16u, 0u);
   put(64u, 1u);
-  // Captured sampler/T# overlap: valid-looking format149 at an unreachable DWORD start.
+  // A structurally valid but unsupported format at an unreachable DWORD start.
   const std::array<uint32_t, 8> unreachable{
-      0x00fff000u, 0x09500000u, 0u, 0x900672b0u, 0u, 0u, 0u, 0u};
+      0x00fff000u, 0x09500000u, 0u, 0x900003acu, 0u, 0u, 0u, 0u};
   std::copy(unreachable.begin(), unreachable.end(), memory.words.begin() + 0x1064u / 4u);
   SrtRuntime runtime{.user_data = data, .userdata = &memory,
                      .read_specialization_memory = ReadLinearTestMemory};
@@ -471,6 +471,21 @@ void TestBoundedImageViewEligibility() {
             snapshot.images[2].dwords == descriptor(0x23u, Type::kColor2DArray) &&
             snapshot.images[3].dwords == descriptor(0x24u, Type::kColor2D),
         "typed table eligibility changed byte offsets or discarded compatible views");
+
+  // CS127daf PC0x163c: an overlapping heap tuple is not a valid texture view.
+  const std::array<uint32_t, 8> invalid_view{
+      0x00fff000u, 0x09503fccu, 0u, 0x900672c0u, 0u, 0u, 0u, 0u};
+  std::copy(invalid_view.begin(), invalid_view.end(), memory.words.begin() + 0x1040u / 4u);
+  for (const bool r128 : {false, true}) {
+    plan.info.images[0].r128 = r128;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == (r128 ? 3u : 4u) &&
+              snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset + 17u] == 0u &&
+              snapshot.images[1].dwords == descriptor(0x20u, Type::kColor2D) &&
+              snapshot.images.back().dwords == descriptor(0x24u, Type::kColor2D),
+          "invalid heap texture view survived normalization or removed valid neighbors");
+  }
+  plan.info.images[0].r128 = false;
 
   // An explicitly selected descriptor is not an unrelated entry in a broad heap.
   const auto image_source = plan.info.images[0].source;
@@ -3186,6 +3201,41 @@ void TestImageDescriptorFields() {
               snapshot.images[0].dwords == user_data,
           "valid texture descriptor was rejected");
     const auto valid_descriptor = user_data;
+    for (const auto mode : {ImageMipMode::None, ImageMipMode::Dynamic}) {
+      plan.info.images[0].mip_mode = mode;
+      for (const auto [base, last] : {std::pair{0u, 0u}, {1u, 1u}, {2u, 3u},
+                                      {15u, 15u}, {7u, 6u}}) {
+        user_data = valid_descriptor;
+        user_data[3] |= (base << 12u) | (last << 16u);
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                  (base <= last ? snapshot.images[0].dwords == user_data : is_null()),
+              "texture view mip-range validity depended on the image instruction");
+      }
+    }
+    plan.info.images[0].mip_mode = ImageMipMode::None;
+    for (uint32_t shift = 0u; shift < 12u; shift += 3u) {
+      for (uint32_t channel = 0u; channel < 8u; ++channel) {
+        user_data = valid_descriptor;
+        user_data[3] = (user_data[3] & ~(7u << shift)) | (channel << shift);
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                  (channel == 2u || channel == 3u ? is_null()
+                      : snapshot.images[0].dwords == user_data),
+              "texture view accepted an undefined channel selector or rejected a defined one");
+      }
+    }
+    for (uint32_t fragments = 0u; fragments <= 4u; ++fragments) {
+      user_data = valid_descriptor;
+      user_data[3] = (user_data[3] & 0xfffu) | (fragments << 16u) |
+          (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2DMsaa) << 28u);
+      user_data[5] = fragments << 4u;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                (fragments >= 1u && fragments <= 3u
+                    ? snapshot.images[0].dwords == user_data : is_null()),
+            "MSAA fragment encoding was confused with a mip range");
+      user_data[3] |= 1u << 12u;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) && is_null(),
+            "MSAA view accepted a nonzero base mip");
+    }
     // Keep RESOURCE_LEVEL set in this valid texture descriptor.
     user_data = {0x0208a200u, 0xca900000u, 0x800fc00fu, 0x90960facu,
                  0u, 0x60u, 0u, 0u};
@@ -3454,7 +3504,7 @@ void TestCompactScalarImageTable() {
           (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
       if (!compact) at[5] = 0x00700000u;
     }
-    const std::array poison{0x00fff000u, 0x09500000u, 0u, 0x900672b0u};
+    const std::array poison{0x00fff000u, 0x09500000u, 0u, 0x900003acu};
     if (member == 0x16cu)
       std::copy(poison.begin(), poison.end(), memory.words.begin() + (0x1000u + 0x17cu) / 4u);
     memory.fail_address = 0x2000u + bytes; // Last descriptor ends at the readable boundary.
@@ -5181,9 +5231,15 @@ void TestDynamicStorageMipTracking() {
   changed_user_data[3] =
       (changed_user_data[3] & ~((0xfu << 12u) | (0xfu << 16u))) |
       (4u << 12u) | (3u << 16u);
-  Check(!MaterializeResources(resource_plan, {.user_data = changed_user_data},
-                              changed_snapshot, changed_specialization),
-        "an inverted dynamic storage mip range was accepted");
+  Check(MaterializeResources(resource_plan, {.user_data = changed_user_data},
+                             changed_snapshot, changed_specialization) &&
+            changed_snapshot.images.size() == 2u &&
+            std::ranges::all_of(changed_snapshot.images, [](const auto& image) {
+              return std::ranges::all_of(image.dwords, [](uint32_t word) { return word == 0u; });
+            }) && changed_specialization.images[0].mip_count == 1u &&
+            changed_specialization.images[1].mip_count == 1u &&
+            changed_specialization != specialization,
+        "an inverted mip range was not normalized consistently for plain and dynamic views");
 }
 
 void TestSrtFlatteningAndRuntimeMemoization() {
