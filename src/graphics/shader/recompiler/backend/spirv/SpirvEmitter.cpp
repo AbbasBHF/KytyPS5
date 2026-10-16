@@ -81,8 +81,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 						}
 						uses_gds |= memory.kind == IR::ResourceKind::Gds;
 						uses_lds |= memory.kind == IR::ResourceKind::Lds;
-					} else if (memory.kind == IR::ResourceKind::Buffer ||
-					           memory.kind == IR::ResourceKind::ScalarBuffer) {
+					} else if (memory.kind == IR::ResourceKind::Buffer) {
 						if (memory.resource >= program.info.buffers.size()) {
 							Fail(program, "typed shader contains an invalid buffer resource");
 						}
