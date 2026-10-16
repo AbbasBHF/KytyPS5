@@ -5281,6 +5281,85 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckBdaSyncUploads() {
+    constexpr const char *name = "BdaSyncUploads";
+    constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    EnsureRuntimeContext();
+    const auto base = LibKernel::Memory::AllocateRuntimeMemory(
+        0, 3 * page, Common::VirtualMemory::Mode::ReadWrite, "bda_sync_uploads");
+    Require(name, "allocation", base != 0, "guest allocation failed");
+    auto *words = reinterpret_cast<u32 *>(base);
+    std::fill_n(words, 3 * page / sizeof(u32), 0x12345678u);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.MapMemory(base, page);
+    context.MapMemory(base + 2 * page, page);
+    const auto id = cache.FindBuffer(base, 3 * page);
+    auto &buffer = cache.GetBuffer(id);
+    auto readback = CreateHostBuffer(name, 6 * sizeof(u32),
+                                     vk::BufferUsageFlagBits::eTransferDst, {});
+    const auto snapshot = [&](uint64_t offset, uint32_t index) {
+      const vk::BufferCopy copy{offset, index * sizeof(u32), sizeof(u32)};
+      scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
+    };
+    context.PrepareBda();
+    Require(name, "mapped intersection",
+            !cache.IsRegionCpuModified(base, page) &&
+                cache.IsRegionCpuModified(base + page, page) &&
+                !cache.IsRegionCpuModified(base + 2 * page, page),
+            "BDA upload missed a mapped range or uploaded an unmapped hole");
+    snapshot(0, 0);
+    snapshot(2 * page, 1);
+
+    cache.InvalidateMemory(base + 17, 1);
+    words[4] = 0x87654321u;
+    words[TRACKER_PAGE_SIZE / sizeof(u32) - 1] = 0xabcdef01u;
+    context.PrepareBda();
+    snapshot(16, 2);
+    snapshot(TRACKER_PAGE_SIZE - sizeof(u32), 3);
+    Require(name, "whole-page upload", !cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
+            "one-byte invalidation did not upload and consume its whole page");
+
+    context.MapMemory(base + page, page);
+    context.PrepareBda();
+    snapshot(page, 4);
+    Require(name, "new mapping", !cache.IsRegionCpuModified(base + page, page),
+            "mapping into an existing buffer did not queue its dirty pages");
+    context.UnmapMemory(base + 2 * page, page);
+    words[2 * page / sizeof(u32)] = 0xfedcba98u;
+    context.PrepareBda();
+    Require(name, "unmapped dirty page", cache.IsRegionCpuModified(base + 2 * page, page),
+            "BDA synchronization consumed dirtiness outside mapped memory");
+    context.MapMemory(base + 2 * page, page);
+    context.PrepareBda();
+    snapshot(2 * page, 5);
+
+    vk::BufferMemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = readback.buffer;
+    barrier.size = readback.size;
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+    scheduler.Finish();
+    Require(name, "GPU contents", ReadBuffer(name, readback, 6) ==
+        std::vector<u32>{0x12345678u, 0x12345678u, 0x87654321u, 0xabcdef01u,
+                        0x12345678u, 0xfedcba98u},
+        "initial, re-dirtied, newly mapped or remapped bytes were stale on the GPU");
+    context.UnmapMemory(base, 3 * page);
+    scheduler.Finish();
+    DestroyBuffer(&readback);
+    Require(name, "release", LibKernel::Memory::FreeGuestMemory(base, 3 * page),
+            "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBdaPageTableUploads() {
     constexpr const char *name = "BdaPageTableUploads";
     constexpr uintptr_t base = 0x0000000207b00000ull;
@@ -48472,6 +48551,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bda-page-table-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
+    vulkan.CheckBdaSyncUploads();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
@@ -48702,6 +48782,7 @@ int main(int argc, char **argv) {
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
+  vulkan.CheckBdaSyncUploads();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
