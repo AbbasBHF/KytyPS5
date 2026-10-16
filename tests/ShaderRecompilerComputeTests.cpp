@@ -1383,6 +1383,7 @@ struct GraphicsCase {
   std::vector<u32> vertices;
   bool pixel_ancillary = false;
   bool pixel_front_face = false;
+  bool pixel_front_face_all_bits = false;
   u32 layers = 1;
   vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1;
   bool pixel_position_w = false;
@@ -1834,6 +1835,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
                                                     : ShaderPixelParameterMode::FirstVertex;
   pixel_info.ps_ancillary = test.pixel_ancillary;
   pixel_info.ps_front_face = test.pixel_front_face;
+  pixel_info.ps_front_face_all_bits = test.pixel_front_face_all_bits;
   pixel_info.ps_pos_w = test.pixel_position_w;
   pixel_info.ps_depth_export_enable = test.pixel_depth_export;
   pixel_info.ps_system_input_base = 2;
@@ -41299,6 +41301,83 @@ GraphicsCase GraphicsAncillarySampleId() {
   return test;
 }
 
+// SPI_BARYC_CNTL[24] selects all-bits mode for uint/bool S_FRONT_FACE;
+// float S_FRONT_FACE and __getSpecialVgprFloat(__v_front_face) leave it clear.
+GraphicsCase GraphicsFrontFaceBits(bool reversed, bool all_bits) {
+  GraphicsCase test;
+  test.name = all_bits ? (reversed ? "GraphicsFrontFaceUintFront" : "GraphicsFrontFaceUintBack")
+                       : (reversed ? "GraphicsFrontFaceFloatFront" : "GraphicsFrontFaceFloatBack");
+  test.pixel_front_face = true;
+  test.pixel_front_face_all_bits = all_bits;
+  // Preserve every raw bit as two finite, exactly representable integer-to-float
+  // results. Directly exporting the integer front value would export a NaN.
+  AppendVop3(&test.fragment_code, 0x148, 4, Vgpr(2), InlineU32(0), InlineU32(16));
+  AppendVop3(&test.fragment_code, 0x148, 5, Vgpr(2), InlineU32(16), InlineU32(16));
+  test.fragment_code.push_back(EncodeVop1(0x06, 0, Vgpr(4)));
+  test.fragment_code.push_back(EncodeVop1(0x06, 1, Vgpr(5)));
+  // Integer inputs test raw zero; float inputs test the sign.
+  test.fragment_code.push_back(EncodeVopc(all_bits ? 0xc2 : 0x04, InlineU32(0), 2));
+  AppendVMovLiteral(&test.fragment_code, 3, 0x3f800000u);
+  test.fragment_code.push_back(EncodeVop2(0x01, 2, InlineU32(0), 3));
+  test.fragment_code.push_back(EncodeExp0(0x00, 0xf));
+  test.fragment_code.push_back(EncodeExp1(0, 1, 2, 3));
+  AppendEnd(&test.fragment_code);
+  test.opcodes = {ShaderOpcode::V_BFE_U32, ShaderOpcode::V_CVT_F32_U32,
+                  all_bits ? ShaderOpcode::V_CMP_EQ_U32 : ShaderOpcode::V_CMP_GT_F32,
+                  ShaderOpcode::V_CNDMASK_B32, ShaderOpcode::V_MOV_B32,
+                  ShaderOpcode::EXP, ShaderOpcode::S_ENDPGM};
+  test.vertices = {
+      0xbf800000u, 0xbf800000u, 0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u,
+      0x40400000u, 0xbf800000u, 0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u,
+      0xbf800000u, 0x40400000u, 0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u};
+  if (reversed) {
+    std::swap_ranges(test.vertices.begin() + 6, test.vertices.begin() + 12,
+                    test.vertices.begin() + 12);
+  }
+  // With the harness's positive-height viewport, the default triangle faces back.
+  const u32 bits = all_bits ? (reversed ? UINT32_MAX : 0u)
+                            : (reversed ? 0x3f800000u : 0xbf800000u);
+  test.expected_pixel = {
+      std::bit_cast<u32>(static_cast<float>(bits & 0xffffu)),
+      std::bit_cast<u32>(static_cast<float>(bits >> 16u)),
+      reversed ? 0u : 0x3f800000u, 0x3f800000u};
+  return test;
+}
+
+void CheckPixelFrontFaceModes() {
+  constexpr const char *name = "PixelFrontFaceModes";
+  static const std::array<u32, 1> code = {EncodeSopp(0x01)};
+  HW::PixelShaderInfo regs{};
+  regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+  ShaderMapUserData(regs.ps_regs.data_addr,
+      {.type = Prospero::ShaderBinaryType::kPs,
+       .code_size_bytes = static_cast<u32>(sizeof(code))});
+  HW::ShaderRegisters sh{};
+  sh.ps_input_ena = sh.ps_input_addr = 0x1002u;
+  const std::array<Prospero::ColorComponentMapping, 8> export_mapping{};
+  std::vector<u32> float_key;
+  for (bool all_bits : {false, true}) {
+    for (u32 other_bits : {0u, 0x120u}) {
+      sh.baryc_cntl = (all_bits ? 0x01000000u : 0u) | other_bits;
+      ShaderPixelInputInfo pixel{};
+      (void)PrepareProgram(regs, sh, export_mapping, pixel);
+      Require(name, "register format decoding",
+              pixel.ps_front_face && pixel.ps_front_face_all_bits == all_bits &&
+                  pixel.ps_system_input_base == 2u,
+              "SPI_BARYC_CNTL[24] did not select the front-face format");
+      std::vector<u32> key;
+      BuildStageStaticKey(pixel, key);
+      if (!all_bits && other_bits == 0u) {
+        float_key = key;
+      }
+      Require(name, "format specialization",
+              (key != float_key) == all_bits,
+              "front-face formats must have distinct shader keys and ignore unrelated bits");
+    }
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 GraphicsCase GraphicsFlatInterpolatorExport() {
   using O = ShaderOpcode;
 
@@ -42179,6 +42258,10 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsAncillaryLayer(false),
       GraphicsAncillaryLayer(true),
       GraphicsAncillarySampleId(),
+      GraphicsFrontFaceBits(false, false),
+      GraphicsFrontFaceBits(true, false),
+      GraphicsFrontFaceBits(false, true),
+      GraphicsFrontFaceBits(true, true),
       GraphicsFlatInterpolatorExport(),
       GraphicsDsAddtidScratchExport(),
       GraphicsDirectSgprPushConstantExport(),
@@ -47959,6 +48042,17 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, SiblingSharedExitKeepsCapturedConditions());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--front-face-only") == 0) {
+    CheckPixelFrontFaceModes();
+    VulkanHarness vulkan;
+    for (bool all_bits : {false, true}) {
+      for (bool reversed : {false, true}) {
+        RunGraphicsCase(&vulkan, GraphicsFrontFaceBits(reversed, all_bits));
+      }
+    }
+    RunGraphicsCase(&vulkan, GraphicsAncillaryLayer(true));
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--position-w-only") == 0) {
     VulkanHarness vulkan;
     RunGraphicsCase(&vulkan, GraphicsPositionWExport());
@@ -48574,6 +48668,7 @@ int main(int argc, char **argv) {
   CheckEmbeddedFetchLaneSpill();
   CheckTessellationPrograms();
   CheckPixelParameterAliases();
+  CheckPixelFrontFaceModes();
   CheckRectListShaders();
   CheckSigned16ImageStore(vulkan);
   CheckBoundedFormattedBufferCopy(vulkan);
