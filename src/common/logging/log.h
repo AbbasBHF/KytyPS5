@@ -22,6 +22,10 @@ struct Lifecycle {
 enum class Direction { Silent, Console, File };
 enum class Level { Trace, Debug, Info, Warning, Error, Critical };
 
+// Set by LoadExec for the program it starts, which continues the log file of the one it replaces
+// instead of starting it over.
+inline constexpr const char* RelaunchedVariable = "KYTY_RELAUNCHED";
+
 Direction GetDirection();
 bool      IsSilent();
 void      Write(Level level, std::string_view text);
