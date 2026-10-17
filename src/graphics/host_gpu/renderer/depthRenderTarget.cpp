@@ -311,7 +311,6 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	}
 	r.desc = MakeDepthTargetDesc(buffer, z);
 	r.depth_clear_enable      = rc.depth_clear_enable;
-	r.depth_load_clear_enable = r.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();
 	r.depth_test_enable       = dc.z_enable;
 	r.depth_write_enable      = r.depth_test_enable && dc.z_write_enable &&
@@ -322,6 +321,9 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 
 	r.stencil_clear_enable =
 	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;
+	r.load_clear_aspects = {};
+	if (r.depth_clear_enable) r.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
+	if (r.stencil_clear_enable) r.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
 	r.stencil_clear_value = hw.GetStencilClearValue();
 	r.stencil_test_enable = has_stencil && dc.stencil_enable;
 	if (r.stencil_test_enable) {
@@ -421,9 +423,9 @@ vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {
 	}
 
 	const auto           available = ImageViewOps::DepthAspectMask(format);
-	vk::ImageAspectFlags writes {};
+	vk::ImageAspectFlags writes = load_clear_aspects & available;
 	if ((available & vk::ImageAspectFlagBits::eDepth) &&
-	    (depth_load_clear_enable || depth_write_enable)) {
+	    depth_write_enable) {
 		writes |= vk::ImageAspectFlagBits::eDepth;
 	}
 	if (!(available & vk::ImageAspectFlagBits::eStencil)) {
@@ -461,8 +463,7 @@ vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {
 		       (can_pass && depth_pass && state.passOp != vk::StencilOp::eKeep) ||
 		       (can_pass && depth_fail && state.depthFailOp != vk::StencilOp::eKeep);
 	};
-	if (stencil_clear_enable ||
-	    (stencil_test_enable && (face_writes(stencil_front) || face_writes(stencil_back)))) {
+	if (stencil_test_enable && (face_writes(stencil_front) || face_writes(stencil_back))) {
 		writes |= vk::ImageAspectFlagBits::eStencil;
 	}
 	return writes;
