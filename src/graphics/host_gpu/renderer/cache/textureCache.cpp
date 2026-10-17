@@ -716,6 +716,13 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
 	}
+	if (info.IsDepth() && info.metadata.kind == ImageMetadataKind::Htile) {
+		// Copied depth supersedes pending clears from the previous native image.
+		const auto metadata = m_surface_metas.find(info.metadata.range.address);
+		if (metadata != m_surface_metas.end()) {
+			metadata->second.clear_mask.reset();
+		}
+	}
 	FreeImage(cached_id);
 	return replacement_id;
 }
