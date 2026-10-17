@@ -14540,6 +14540,7 @@ void TestPatternFill() {
   const PatternCase cases[] = {
       {bounded_shader, 64, true, 10},
       {thread_dimension_shader, 32, false, 8},
+      {thread_dimension_shader, 64, false, 8},
       {thread_dimension_wave64_shader, 64, false, 9},
       {thread_dimension_wave64_scalar_shader, 64, false, 8},
       {thread_dimension_wave64_vector_shader, 64, false, 8},
@@ -14616,6 +14617,8 @@ void TestPatternFill() {
     Check(Build(changed).uniform_fill.fill.kind == UniformFillKind::None,
           "pattern recognition accepted modified executable instructions");
     for (const uint32_t invalid_input : {0u, 1u, 2u, 3u}) {
+      // Both wave sizes are covered above for this executable.
+      if (invalid_input == 1 && shader.data() == thread_dimension_shader) continue;
       const auto saved_compute = compute;
       const auto saved_wave = options.wave_size;
       if (invalid_input == 0) compute.workgroup_register = 11;

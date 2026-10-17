@@ -4047,18 +4047,18 @@ UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& d
 	struct Pattern {
 		size_t code_words;
 		uint64_t hash;
-		uint32_t wave_size;
+		uint32_t wave_size_mask;
 		bool bounded;
 	};
 	constexpr std::array patterns {
 		// Bounded 64-lane variant.
-		Pattern {.code_words = 69, .hash = 0x0704b9818e3cba06ull, .wave_size = 64, .bounded = true},
+		Pattern {.code_words = 69, .hash = 0x0704b9818e3cba06ull, .wave_size_mask = 64, .bounded = true},
 		// Dispatch thread dimensions, 64-lane variants.
-		Pattern {.code_words = 42, .hash = 0x92ce57f21310ef02ull, .wave_size = 64, .bounded = false},
-		Pattern {.code_words = 40, .hash = 0x374161027f58bee7ull, .wave_size = 64, .bounded = false},
-		Pattern {.code_words = 40, .hash = 0x7d7172c56c2e296dull, .wave_size = 64, .bounded = false},
-		// Dispatch thread dimensions, 32-lane variant.
-		Pattern {.code_words = 38, .hash = 0xacbda1a1ccdd4198ull, .wave_size = 32, .bounded = false},
+		Pattern {.code_words = 42, .hash = 0x92ce57f21310ef02ull, .wave_size_mask = 64, .bounded = false},
+		Pattern {.code_words = 40, .hash = 0x374161027f58bee7ull, .wave_size_mask = 64, .bounded = false},
+		Pattern {.code_words = 40, .hash = 0x7d7172c56c2e296dull, .wave_size_mask = 64, .bounded = false},
+		// Dispatch thread dimensions, valid in both wave sizes.
+		Pattern {.code_words = 38, .hash = 0xacbda1a1ccdd4198ull, .wave_size_mask = 32 | 64, .bounded = false},
 	};
 	if (program.stage != ShaderType::Compute || input.compute == nullptr ||
 	    decoded.instructions.empty() || program.user_data_base != 0 || program.user_data_count < 10 ||
@@ -4078,7 +4078,7 @@ UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& d
 	const auto pattern = std::ranges::find_if(patterns, [&](const Pattern& candidate) {
 		return candidate.code_words == words && candidate.hash == hash;
 	});
-	if (pattern == patterns.end() || program.wave_size != pattern->wave_size ||
+	if (pattern == patterns.end() || (program.wave_size & pattern->wave_size_mask) == 0 ||
 	    cs.dispatch_thread_dimensions != !pattern->bounded) return {};
 	std::array<Value, 10> userdata;
 	for (auto* block: program.blocks) {
