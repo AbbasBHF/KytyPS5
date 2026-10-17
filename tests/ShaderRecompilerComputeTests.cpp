@@ -14943,12 +14943,48 @@ public:
               "single high slice was rejected or changed the backing layer layout");
       auto high_slice_readback = CreateHostBuffer(
           name, 4 * sizeof(uint32_t), vk::BufferUsageFlagBits::eTransferDst, {});
+      auto high_slice_metadata = CreateHostBuffer(
+          name, 6 * sizeof(uint32_t), vk::BufferUsageFlagBits::eTransferDst, {});
+      const auto htile_slice_size = high_slice.desc.info.metadata.range.size / 87;
+      const auto htile_slice_address =
+          high_slice_target.htile_data_base_addr + 86 * htile_slice_size;
+      Require(name, "ZMask support default", !Config::SupportZmaskEnabled(),
+              "ZMask support should be disabled by default");
+      const auto copy_htile = [&](uint32_t pass) {
+        const auto program = make_buffer_program(
+            ShaderType::Compute, {.read = true, .written = pass != 0});
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(high_slice_target.htile_data_base_addr);
+        descriptor.fields[2] = high_slice.desc.info.metadata.range.size;
+        ShaderRecompiler::IR::ResourceSnapshot snapshot;
+        auto &value = snapshot.buffers.emplace_back();
+        std::copy_n(descriptor.fields, 4, value.dwords.begin());
+        value.dword_count = 4;
+        ShaderStageRuntime runtime{&program, &snapshot};
+        for (const bool support_zmask : {false, true}) {
+          Config::Load({.support_zmask = support_zmask});
+          PreparedBindings bindings;
+          executor.PrepareBindings(runtime, bindings);
+          std::array<PreparedBindings *, 1> stages{&bindings};
+          executor.FindBuffers(stages);
+          executor.RebindBuffers(bindings);
+          const auto &source = bindings.buffers[0];
+          const vk::BufferCopy copy{source.offset + 86 * htile_slice_size,
+              (pass * 2 + support_zmask) * sizeof(uint32_t), sizeof(uint32_t)};
+          scheduler.Current().Handle().copyBuffer(source.buffer,
+              high_slice_metadata.buffer, 1, &copy);
+        }
+      };
       for (uint32_t pass = 0; pass < 2; ++pass) {
         vk::ClearValue prior_depth{};
         prior_depth.depthStencil.depth = 0.625f;
         TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(),
             high_slice.image_id, {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 87},
             prior_depth);
+        if (pass == 1) {
+          resources.GetBufferCache().FillBuffer(
+              htile_slice_address, htile_slice_size, 0, false);
+        }
         RenderDepthInfo acquired_high_slice{};
         RenderExecutorTestAccess::ResolveRenderDepthTarget(
             executor, scheduler.Current(), acquired_high_slice);
@@ -14968,7 +15004,22 @@ public:
             {vk::ImageAspectFlagBits::eDepth, 0, 85, 2}, {}, {1, 1, 1}};
         texture_cache.GetImage(high_slice.image_id).Download(
             std::span{&copy, 1}, high_slice_readback.buffer, 0, high_slice_readback.size);
+        copy_htile(pass);
       }
+      auto high_slice_storage = high_slice.desc;
+      high_slice_storage.type = BindingType::Storage;
+      high_slice_storage.info.pixel_format = vk::Format::eR32Sfloat;
+      high_slice_storage.info.metadata = {};
+      high_slice_storage.view_info.format = vk::Format::eR32Sfloat;
+      high_slice_storage.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      high_slice_storage.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      Require(name, "HTile depth replacement before raw buffer read",
+              texture_cache.FindImage(high_slice_storage) != high_slice.image_id,
+              "R32 storage binding retained the native depth backing");
+      resources.GetBufferCache().FillBuffer(
+          htile_slice_address, htile_slice_size, 0, false);
+      copy_htile(2);
+      Config::Load({});
       scheduler.Current().Handle().pipelineBarrier2(bounds_dependency);
       scheduler.Finish();
       Require(name, "high HTile slice contents and neighbor",
@@ -14976,7 +15027,11 @@ public:
                   std::bit_cast<uint32_t>(0.625f), std::bit_cast<uint32_t>(0.375f),
                   std::bit_cast<uint32_t>(0.625f), std::bit_cast<uint32_t>(0.625f)},
               "layer86 clear missed, repeated, or changed adjacent layer85");
+      Require(name, "GPU-visible opt-in ZMask support",
+              ReadBuffer(name, high_slice_metadata, 6) == std::vector<uint32_t>{0, 15, 0, 15, 0, 15},
+              "raw HTile binding ignored the ZMask setting or lost it after depth replacement");
       DestroyBuffer(&high_slice_readback);
+      DestroyBuffer(&high_slice_metadata);
       registers.SetDepthClearValue(0.0f);
 
       // DB override copies run with depth and stencil tests disabled.
@@ -48945,6 +49000,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
+    vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--dcc-clear-only") == 0) {

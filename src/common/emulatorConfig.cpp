@@ -189,6 +189,10 @@ bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
 }
 
+bool SupportZmaskEnabled() {
+	return g_config->support_zmask;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }

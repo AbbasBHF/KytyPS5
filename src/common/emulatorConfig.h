@@ -86,6 +86,7 @@ struct ConfigOptions {
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
 	bool                   sync_raw_image_buffers      = false;
+	bool                   support_zmask               = false;
 	bool                   tessellation_enabled        = false;
 	bool                   skip_bvh_intersections      = false;
 	bool                   skip_mesh_fallback_draws    = false;
@@ -153,6 +154,7 @@ bool GpuAssistedValidationEnabled();
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool SyncRawImageBuffersEnabled();
+bool SupportZmaskEnabled();
 bool TessellationEnabled();
 bool SkipBvhIntersections();
 bool SkipMeshFallbackDraws();

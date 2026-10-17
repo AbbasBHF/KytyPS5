@@ -94,6 +94,8 @@ static void PrintUsage() {
 	::printf(
 	    "  --sync-raw-image-buffers <true|false> Synchronize raw reads of GPU images. Default: false.\n");
 	::printf(
+	    "  --support-zmask <true|false>         Fill HTILE buffers with uncompressed ZMask. Default: false.\n");
+	::printf(
 	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
@@ -494,6 +496,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--sync-raw-image-buffers") {
 			if (!ParseBool(value, options.config.sync_raw_image_buffers)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--support-zmask") {
+			if (!ParseBool(value, options.config.support_zmask)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

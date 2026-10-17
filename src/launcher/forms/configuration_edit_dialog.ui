@@ -174,12 +174,6 @@
              </widget>
             </item>
             <item row="7" column="1">
-             <widget class="QCheckBox" name="checkBox_sync_raw_image_buffers">
-              <property name="toolTip"><string>Can fix missing textures and incorrect transparency in some games. May reduce performance.</string></property>
-              <property name="text"><string>Accurate texture synchronization</string></property>
-             </widget>
-            </item>
-            <item row="8" column="1">
              <widget class="QCheckBox" name="checkBox_hdr">
               <property name="toolTip"><string>Enable HDR10 output for supported games. Requires HDR enabled on the host display.</string></property>
               <property name="text"><string>Enable HDR display support</string></property>
@@ -490,6 +484,25 @@
            <widget class="MandatoryLineEdit" name="lineEdit_cmd_dump_folder">
             <property name="toolTip"><string>Specify directory to dump command buffers</string></property>
             <property name="clearButtonEnabled"><bool>true</bool></property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="rendering_compatibility_group">
+         <property name="title"><string>Rendering compatibility</string></property>
+         <layout class="QVBoxLayout" name="renderingCompatibilityLayout">
+          <item>
+           <widget class="QCheckBox" name="checkBox_sync_raw_image_buffers">
+            <property name="toolTip"><string>Can fix missing textures and incorrect transparency (Resident Evil 2).</string></property>
+            <property name="text"><string>Accurate texture synchronization</string></property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QCheckBox" name="checkBox_support_zmask">
+            <property name="toolTip"><string>Can restore missing geometry (High on Life 2).</string></property>
+            <property name="text"><string>Support ZMask</string></property>
            </widget>
           </item>
          </layout>
