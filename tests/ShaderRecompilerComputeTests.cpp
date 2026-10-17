@@ -6572,6 +6572,11 @@ public:
       htile_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
       htile_depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
       const auto htile_depth_image = texture_cache.FindImage(htile_depth);
+      (void)texture_cache.FindDepthTarget(htile_depth_image, htile_depth);
+      Require(name, "HTile depth metadata registration",
+              texture_cache.ClearMeta(htile_depth.info.metadata.range.address) &&
+                  texture_cache.TouchMeta(htile_depth.info.metadata.range.address, 0, false),
+              "depth target did not register independent slice clear state");
       vk::ClearValue htile_clear{};
       htile_clear.depthStencil.depth = 0.25f;
       TextureCacheTestAccess::ClearImage(
@@ -6605,6 +6610,11 @@ public:
         Require(name, "HTile depth storage prefix view",
                 texture_cache.FindTexture(id, htile_storage) != nullptr,
                 "converted depth prefix has no storage view");
+        Require(name, "HTile metadata survives native depth replacement",
+                texture_cache.IsMeta(htile_depth.info.metadata.range.address) &&
+                    !texture_cache.IsMetaCleared(htile_depth.info.metadata.range.address, 0) &&
+                    texture_cache.IsMetaCleared(htile_depth.info.metadata.range.address, 1),
+                "storage conversion discarded guest metadata or its slice clear state");
         htile_storage_image = id;
       }
       auto htile_readback = CreateHostBuffer(
@@ -6625,6 +6635,11 @@ public:
                   std::vector<u32>(htile_layers, std::bit_cast<u32>(0.25f)),
               "partial storage conversion lost native depth data outside its view");
       DestroyBuffer(&htile_readback);
+      texture_cache.UnmapMemory(htile_depth.info.metadata.range.address,
+                                htile_depth.info.metadata.range.size);
+      Require(name, "HTile metadata allocation unmap",
+              !texture_cache.IsMeta(htile_depth.info.metadata.range.address),
+              "unmapped guest metadata retained its registration");
 
       auto layered_stencil_desc = MakeLinearDesc(
           base + 0x27d4000, 6 * 4 * sizeof(float),
@@ -7898,9 +7913,16 @@ public:
           "retiring the old DCC image erased the live HTile slice state");
       texture_cache.UnmapMemory(reused_depth.info.data.address,
                                 reused_depth.info.data.size);
+      Require(name, "HTile allocation outlives native depth retirement",
+              texture_cache.IsMeta(base + 0x28000) &&
+                  !texture_cache.IsMetaCleared(base + 0x28000, 0) &&
+                  texture_cache.IsMetaCleared(base + 0x28000, 1),
+              "retiring depth data erased an independent metadata allocation");
+      texture_cache.UnmapMemory(reused_depth.info.metadata.range.address,
+                                reused_depth.info.metadata.range.size);
       Require(name, "reused metadata final retirement",
               !texture_cache.IsMeta(base + 0x28000),
-              "retiring the HTile image left its metadata registered");
+              "unmapping the HTile allocation left its metadata registered");
 
       constexpr uint64_t partial_unmap_image_offset = 0x2700000;
       auto partial_unmap_image =

@@ -263,15 +263,6 @@ void TextureCache::DeleteImage(ImageId id) {
 		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
 	}
 	m_download_images.erase(id);
-	if (image->info.HasMetadata()) {
-		const auto metadata = m_surface_metas.find(image->info.metadata.range.address);
-		if (metadata != m_surface_metas.end() &&
-		    image->info.metadata.kind == ImageMetadataKind::Htile &&
-		    metadata->second.type == MetaDataInfo::Type::HTile) {
-			// A later binding may have reused this address for another metadata type.
-			m_surface_metas.erase(metadata);
-		}
-	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
@@ -1885,6 +1876,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
 	std::scoped_lock lock {m_lock};
+	// HTILE belongs to guest memory, independently of native image replacements.
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {
