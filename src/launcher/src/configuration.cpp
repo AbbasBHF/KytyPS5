@@ -19,6 +19,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(skip_mesh_fallback_draws);
 	KYTY_CFG_SET(trophy_enabled);
 	KYTY_CFG_SET(trophy_duration_seconds);
+	KYTY_CFG_SET(perf_overlay_enabled);
 	KYTY_CFG_SET(skip_notice_screen);
 	KYTY_CFG_SET(network_connected);
 	KYTY_CFG_SET(vblank_frequency);
@@ -69,6 +70,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(skip_mesh_fallback_draws);
 	trophy_enabled   = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(trophy_duration_seconds);
+	KYTY_CFG_GET(perf_overlay_enabled);
 	KYTY_CFG_GET(skip_notice_screen);
 	KYTY_CFG_GET(network_connected);
 	vblank_frequency = s.value("vblank_frequency", vblank_frequency).toInt();

@@ -1,7 +1,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
-#include "common/logging/log.h"
+#include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <cinttypes>
@@ -52,20 +52,10 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	uint32_t timeout_count = 0;
-	for (;;) {
-		const auto result = m_graphics.device.waitSemaphores(&wait_info, 1'000'000'000);
-		if (result == vk::Result::eSuccess) {
-			break;
-		}
-		EXIT_NOT_IMPLEMENTED(result != vk::Result::eTimeout);
-		Refresh();
-		if (++timeout_count == 5) {
-			LOGW("Vulkan timeline semaphore wait stalled for 5 seconds: target_tick=%" PRIu64
-			     ", completed_tick=%" PRIu64 ", submitted_tick=%" PRIu64 "\n",
-			     tick, KnownGpuTick(), CurrentTick() - 1);
-		}
-	}
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
+	                                         Common::DebugCounters::Counter::GpuWaitNs);
+	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
 }
 
