@@ -510,17 +510,14 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
 		const auto& metadata   = depth.desc.info.metadata;
-		if (metadata.kind == ImageMetadataKind::Htile && depth.depth_clear_enable &&
-		    !cache.ClearMeta(metadata.range.address)) {
-			EXIT("failed to acquire HTile metadata for a depth clear\n");
-		}
 		const bool meta_clear =
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
 		depth.load_clear_aspects = {};
 		if (depth.depth_clear_enable || meta_clear)
 			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
-		if (depth.stencil_clear_enable)
+		// Apply pending clears to compressed stencil as well as depth.
+		if (depth.stencil_clear_enable || (meta_clear && metadata.stencil_compressed))
 			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
 		if (meta_clear &&
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {

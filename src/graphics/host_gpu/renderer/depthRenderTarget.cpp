@@ -321,9 +321,6 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 
 	r.stencil_clear_enable =
 	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;
-	r.load_clear_aspects = {};
-	if (r.depth_clear_enable) r.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
-	if (r.stencil_clear_enable) r.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
 	r.stencil_clear_value = hw.GetStencilClearValue();
 	r.stencil_test_enable = has_stencil && dc.stencil_enable;
 	if (r.stencil_test_enable) {

@@ -14709,6 +14709,8 @@ public:
       RenderDepthInfo depth_only{};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
           executor, scheduler.Current(), depth_only);
+      (void)RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &no_color, 0, depth_only);
       Require(
           name, "depth-only target with stale stencil state",
           depth_only.image_id && depth_only.desc.view_info.format == vk::Format::eD32Sfloat &&
@@ -17912,7 +17914,7 @@ public:
       registers.SetTargetOutputMode(1, 4);
       stencil_target.z_info.htile_acceleration = true;
       stencil_target.htile_data_base_addr = depth_address + 0x30000;
-      registers.SetDepthRenderTarget(stencil_target);
+      registers.SetStencilClearValue(5);
       registers.SetDepthClearValue(1);
       stencil_control = {};
       stencil_control.stencil_enable = true;
@@ -17922,35 +17924,60 @@ public:
       registers.SetStencilMask({0x80, 0, 0x80, 1, 0x80, 0, 0x80, 1});
       user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
       shaders.SetEsShaderBase(vertex_address);
-      for (uint32_t discard = 0; discard < null_pixels.size(); discard++) {
-        const auto &code = null_pixels[discard];
-        const auto address = reinterpret_cast<uint64_t>(code.data());
-        ShaderMapUserData(address,
-            {.type = Prospero::ShaderBinaryType::kPs,
-             .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
-        shaders.SetPsShaderBase(address);
-        RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
-        (void)cache.FindDepthTarget(depth.image_id, depth.desc);
-        vk::ClearValue zero{};
-        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth.image_id,
-            {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
-             0, 1, 0, 1}, zero);
-        Require(name, "pending stencil-pass HTile clear",
-                cache.ClearMeta(stencil_target.htile_data_base_addr),
-                "the stencil pass did not retain its HTile metadata");
-        RenderExecutorTestAccess::DrawAuto(
-            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
-        const auto depth_pixels = ReadCachedTexel(name, context, depth.image_id,
-                                                  {}, {extent, extent, 1});
-        Require(name, "NULL-export full depth clear",
-                std::ranges::all_of(depth_pixels, [](u32 v) { return v == 0x3f800000u; }),
-                "an unexported color target clipped the pending depth clear");
-        const auto stencil = read_stencil();
-        const auto expected = discard == 0 ? 0x80808080u : 0u;
-        Require(name, "NULL-export stencil coverage and discard",
-                std::ranges::all_of(stencil, [=](u32 v) { return v == expected; }),
-                "a stale color target clipped stencil coverage or the NULL-export shader was skipped");
+      // Compressed metadata clears stencil; an uncompressed plane and an explicit
+      // depth-only clear preserve its previous contents. Match Suikoden's stale mask 2.
+      for (uint32_t clear_mode = 0; clear_mode < 3; clear_mode++) {
+        stencil_target.stencil_info.htile_stencil_disabled = clear_mode == 0;
+        registers.SetDepthRenderTarget(stencil_target);
+        registers.SetRenderControl({.depth_clear_enable = clear_mode == 2});
+        for (uint32_t discard = 0; discard < null_pixels.size(); discard++) {
+          const auto &code = null_pixels[discard];
+          const auto address = reinterpret_cast<uint64_t>(code.data());
+          ShaderMapUserData(address,
+              {.type = Prospero::ShaderBinaryType::kPs,
+               .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+          shaders.SetPsShaderBase(address);
+          RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+          (void)cache.FindDepthTarget(depth.image_id, depth.desc);
+          vk::ClearValue zero{};
+          zero.depthStencil.stencil = 2;
+          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth.image_id,
+              {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
+               0, 1, 0, 1}, zero);
+          Require(name, "pending stencil-pass HTile clear",
+                  clear_mode == 2
+                      ? cache.TouchMeta(stencil_target.htile_data_base_addr, 0, false)
+                      : cache.ClearMeta(stencil_target.htile_data_base_addr),
+                  "the stencil pass did not retain its HTile metadata");
+          RenderExecutorTestAccess::DrawAuto(
+              executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+          const auto depth_pixels = ReadCachedTexel(name, context, depth.image_id,
+                                                    {}, {extent, extent, 1});
+          Require(name, "NULL-export full depth clear",
+                  std::ranges::all_of(depth_pixels, [](u32 v) { return v == 0x3f800000u; }),
+                  "an unexported color target clipped the pending depth clear");
+          const auto stencil = read_stencil();
+          const auto cleared = clear_mode == 1 ? 0x05050505u : 0x02020202u;
+          const auto expected = cleared | (discard == 0 ? 0x80808080u : 0u);
+          Require(name, "NULL-export stencil coverage and discard",
+                  std::ranges::all_of(stencil, [=](u32 v) { return v == expected; }),
+                  "a stale color target clipped stencil coverage or the NULL-export shader was skipped");
+          Require(name, "HTile clear consumed once",
+                  !cache.IsMetaCleared(stencil_target.htile_data_base_addr, 0),
+                  "the draw retained a pending metadata clear");
+          if (clear_mode == 1 && discard == 1) {
+            zero.depthStencil.stencil = 9;
+            TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth.image_id,
+                {vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1}, zero);
+            RenderExecutorTestAccess::DrawAuto(
+                executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+            Require(name, "consumed HTile clear preserves later stencil",
+                    std::ranges::all_of(read_stencil(), [](u32 v) { return v == 0x09090909u; }),
+                    "a consumed metadata clear ran again on the next draw");
+          }
+        }
       }
+      registers.SetRenderControl({});
 
       // A depth-only draw retains the previous PS address and write masks, but
       // SPI_SHADER_COL_FORMAT disables its exports. Compiling this stale PS
