@@ -95,7 +95,7 @@ public:
 		const AVCodec* decoder = avcodec_find_decoder(GetAvCodecId(m_config.codec_type));
 		if (decoder == nullptr) {
 			if (m_config.codec_type == CODEC_TYPE_VP9) {
-				Log::WriteToConsoleAndLog(
+				Log::WriteWarningToConsoleAndLog(
 				    "WARNING: Videodec2: The game requested VP9 video, but FFmpeg has no VP9 "
 				    "decoder. Use FFmpeg with VP9 decoding enabled.\n");
 			}
@@ -105,7 +105,7 @@ public:
 		}
 		m_codec = avcodec_alloc_context3(decoder);
 		if (m_codec == nullptr) {
-			LOGF("Videodec2: avcodec_alloc_context3 failed\n");
+			LOGE("Videodec2: avcodec_alloc_context3 failed\n");
 			return false;
 		}
 
@@ -113,7 +113,7 @@ public:
 		m_codec->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
 		const int result = avcodec_open2(m_codec, decoder, nullptr);
 		if (result < 0) {
-			LOGF("Videodec2: avcodec_open2 failed: %s (%d)\n", AvErrorString(result), result);
+			LOGE("Videodec2: avcodec_open2 failed: %s (%d)\n", AvErrorString(result), result);
 			return false;
 		}
 		return true;
@@ -194,7 +194,7 @@ private:
 				av_frame_free(&frame);
 				if (result == AVERROR_EOF) m_eof = true;
 				if (result == AVERROR(EAGAIN) || m_eof) return Result::Ok;
-				LOGF("Video decoder: avcodec_receive_frame failed: %s (%d)\n",
+				LOGE("Video decoder: avcodec_receive_frame failed: %s (%d)\n",
 				     AvErrorString(result), result);
 				return Result::AccessUnit;
 			}
@@ -232,7 +232,7 @@ private:
 		av_packet_free(&packet);
 		if (result == AVERROR(EAGAIN)) return Result::InputFull; // The AU was not accepted.
 		if (result < 0) {
-			LOGF("Video decoder: submitting an AU failed: %s (%d)\n", AvErrorString(result), result);
+			LOGE("Video decoder: submitting an AU failed: %s (%d)\n", AvErrorString(result), result);
 			return Result::AccessUnit;
 		}
 		// Once accepted, a full output queue cannot turn this AU into a retry.

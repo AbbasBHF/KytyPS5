@@ -186,6 +186,18 @@
               <property name="text"><string>Enable HDR display support</string></property>
              </widget>
             </item>
+            <item row="9" column="1">
+             <widget class="QCheckBox" name="checkBox_skip_bvh_intersections">
+              <property name="toolTip"><string>Diagnostic only: make BVH ray queries report no intersections. Ray-traced lighting and reflections may be missing or incorrect.</string></property>
+              <property name="text"><string>Skip BVH ray intersections (diagnostic)</string></property>
+             </widget>
+            </item>
+            <item row="10" column="1">
+             <widget class="QCheckBox" name="checkBox_skip_mesh_fallback_draws">
+              <property name="toolTip"><string>Diagnostic only: skip mesh shader draws that need the compute fallback. This will remove some scene geometry.</string></property>
+              <property name="text"><string>Skip mesh fallback draws (diagnostic)</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>
@@ -416,12 +428,12 @@
           </item>
           <item row="3" column="2">
            <widget class="QLabel" name="label_printf_file">
-            <property name="text"><string>Printf output file:</string></property>
+            <property name="text"><string>General log file:</string></property>
            </widget>
           </item>
           <item row="3" column="3">
            <widget class="MandatoryLineEdit" name="lineEdit_printf_file">
-            <property name="toolTip"><string>Specify file to dump logs</string></property>
+            <property name="toolTip"><string>Specify the general log file. Warning, error, and critical messages are written to a sibling file with -warnings before the extension.</string></property>
             <property name="clearButtonEnabled"><bool>true</bool></property>
            </widget>
           </item>

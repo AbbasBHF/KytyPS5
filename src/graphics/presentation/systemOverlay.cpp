@@ -742,18 +742,18 @@ struct SystemOverlay::Impl {
 			trophy_sound_attempted   = true;
 			trophy_sound_initialized = SDL_InitSubSystem(SDL_INIT_AUDIO);
 			if (!trophy_sound_initialized) {
-				LOGF("[Trophy] could not initialize audio: %s\n", SDL_GetError());
+				LOGW("[Trophy] could not initialize audio: %s\n", SDL_GetError());
 				return;
 			}
 			const char* base_path = SDL_GetBasePath();
 			if (base_path == nullptr) {
-				LOGF("[Trophy] could not locate sound: %s\n", SDL_GetError());
+				LOGW("[Trophy] could not locate sound: %s\n", SDL_GetError());
 				return;
 			}
 			const std::string path = std::string(base_path) + "assets/sounds/trophy-unlock.wav";
 			SDL_AudioSpec     spec {};
 			if (!SDL_LoadWAV(path.c_str(), &spec, &trophy_sound_data, &trophy_sound_size)) {
-				LOGF("[Trophy] could not load %s: %s\n", path.c_str(), SDL_GetError());
+				LOGW("[Trophy] could not load %s: %s\n", path.c_str(), SDL_GetError());
 				return;
 			}
 			if (trophy_sound_size > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
@@ -763,7 +763,7 @@ struct SystemOverlay::Impl {
 			trophy_sound_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
 			                                                &spec, nullptr, nullptr);
 			if (trophy_sound_stream == nullptr) {
-				LOGF("[Trophy] could not open audio stream: %s\n", SDL_GetError());
+				LOGW("[Trophy] could not open audio stream: %s\n", SDL_GetError());
 				return;
 			}
 		}
@@ -771,7 +771,7 @@ struct SystemOverlay::Impl {
 		    (!SDL_PutAudioStreamData(trophy_sound_stream, trophy_sound_data,
 		                             static_cast<int>(trophy_sound_size)) ||
 		     !SDL_ResumeAudioStreamDevice(trophy_sound_stream))) {
-			LOGF("[Trophy] could not play sound: %s\n", SDL_GetError());
+			LOGW("[Trophy] could not play sound: %s\n", SDL_GetError());
 		}
 	}
 

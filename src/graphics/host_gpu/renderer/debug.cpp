@@ -482,7 +482,7 @@ static void BcCheck(const HW::BlendColor& color, const HW::ColorControl& cc) {
 	    cc.mode != 6) {
 		static bool logged = false;
 		if (!logged) {
-			LOGF("BlendControl: temporary: accepting unsupported color-control mode %" PRIu8 "\n",
+			LOGW("BlendControl: temporary: accepting unsupported color-control mode %" PRIu8 "\n",
 			     cc.mode);
 			logged = true;
 		}
@@ -490,7 +490,7 @@ static void BcCheck(const HW::BlendColor& color, const HW::ColorControl& cc) {
 	if (cc.op != 0xCC) {
 		static bool logged = false;
 		if (!logged) {
-			LOGF("BlendControl: temporary: accepting unsupported raster op 0x%02" PRIx8 "\n",
+			LOGW("BlendControl: temporary: accepting unsupported raster op 0x%02" PRIx8 "\n",
 			     cc.op);
 			logged = true;
 		}
@@ -560,7 +560,7 @@ static void EqaaCheck(const HW::EqaaControl& c, const HW::AaConfig& cf) {
 	    c.incoherent_eqaa_reads || c.interpolate_comp_z || c.static_anchor_associations) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1) < 16) {
-			LOGF("\t warning: unsupported PS5 EQAA controls use native Vulkan MSAA defaults\n");
+			LOGW("\t warning: unsupported PS5 EQAA controls use native Vulkan MSAA defaults\n");
 		}
 	}
 }
@@ -590,7 +590,7 @@ static void AaCheck(const HW::AaSampleControl& c, const HW::AaConfig& cf) {
 	    cf.max_sample_dist != 0 || cf.msaa_exposed_samples != 0) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1) < 16) {
-			LOGF("\t warning: unsupported PS5 sample locations use native Vulkan locations: "
+			LOGW("\t warning: unsupported PS5 sample locations use native Vulkan locations: "
 			     "samples=%" PRIu8 ", exposed=%" PRIu8 ", max_dist=%" PRIu8 "\n",
 			     cf.msaa_num_samples, cf.msaa_exposed_samples, cf.max_sample_dist);
 		}
@@ -684,7 +684,7 @@ static void VpCheck(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc
 
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1) < 16) {
-			LOGF("\t warning: unsupported PS5 MSAA raster controls use native Vulkan defaults\n");
+			LOGW("\t warning: unsupported PS5 MSAA raster controls use native Vulkan defaults\n");
 		}
 	}
 	// EXIT_NOT_IMPLEMENTED(smc.vport_scissor_enable);
@@ -699,7 +699,7 @@ static void VpCheck(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc
 	if (vp.transform_control != 1087) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-			LOGF("\t warning: non-default viewport transform control = 0x%08" PRIx32
+			LOGW("\t warning: non-default viewport transform control = 0x%08" PRIx32
 			     ", applying enabled scale/offset bits\n",
 			     vp.transform_control);
 		}
@@ -712,7 +712,7 @@ static void VpCheck(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc
 	if (vp.guard_band_horz_discard != 1.0f || vp.guard_band_vert_discard != 1.0f) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1) < 16) {
-			LOGF("\t warning: unsupported PS5 guard band discard = %f, %f, continuing\n",
+			LOGW("\t warning: unsupported PS5 guard band discard = %f, %f, continuing\n",
 			     vp.guard_band_horz_discard, vp.guard_band_vert_discard);
 		}
 	}
@@ -824,7 +824,7 @@ ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeC
 		} else {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
-				LOGF("unsupported clip-rect rule 0x%04" PRIx16 ", leaving scissor unchanged\n",
+				LOGW("unsupported clip-rect rule 0x%04" PRIx16 ", leaving scissor unchanged\n",
 				     vp.clip_rect_rule);
 			}
 		}

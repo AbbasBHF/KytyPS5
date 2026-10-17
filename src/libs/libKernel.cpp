@@ -1159,7 +1159,7 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 		if (status != 0) {
 			PthreadTakePendingSignal(thread, signum);
 			CloseHandle(target_thread);
-			LOGF("\t NtQueueApcThreadEx failed: target_os_thread=%" PRIu64 ", status=0x%016" PRIx64
+			LOGE("\t NtQueueApcThreadEx failed: target_os_thread=%" PRIu64 ", status=0x%016" PRIx64
 			     "\n",
 			     target_thread_id, status);
 			return KERNEL_ERROR_EINVAL;
@@ -1185,7 +1185,7 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 		PthreadQueuePendingSignal(thread, signum);
 		if (!PthreadKillHost(thread, SignalDispatchHostSignal())) {
 			PthreadTakePendingSignal(thread, signum);
-			LOGF("\t pthread_kill failed for target thread\n");
+			LOGE("\t pthread_kill failed for target thread\n");
 			return KERNEL_ERROR_EINVAL;
 		}
 
@@ -2095,8 +2095,8 @@ uint64_t KYTY_SYSV_ABI cfwBSQyr5Ys(uint64_t a1, uint64_t a2, uint64_t a3, uint64
 
 static void LogExperimentalSyncOnAddress(std::atomic_bool& logged, const char* function_name) {
 	if (!logged.exchange(true, std::memory_order_relaxed)) {
-		::printf("WARNING: %s is experimental\n", function_name);
-		LOGF("WARNING: %s is experimental\n", function_name);
+		Log::WriteWarningToConsoleAndLog(
+		    fmt::sprintf("WARNING: %s is experimental\n", function_name));
 	}
 }
 

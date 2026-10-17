@@ -121,7 +121,7 @@ public:
 
 		m_codec = avcodec_find_decoder(AV_CODEC_ID_MP3);
 		if (m_codec == nullptr) {
-			LOGF("AJM MP3: avcodec_find_decoder failed\n");
+			LOGE("AJM MP3: avcodec_find_decoder failed\n");
 			return;
 		}
 
@@ -129,7 +129,7 @@ public:
 		m_parser        = av_parser_init(m_codec->id);
 		if (m_codec_context == nullptr || m_parser == nullptr ||
 		    avcodec_open2(m_codec_context, m_codec, nullptr) < 0) {
-			LOGF("AJM MP3: decoder initialization failed\n");
+			LOGE("AJM MP3: decoder initialization failed\n");
 			Release();
 		}
 	}

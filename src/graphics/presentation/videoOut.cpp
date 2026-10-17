@@ -1103,7 +1103,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	}
 	static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 	if (hdr && !m_presenter.IsHdrSupported() && !warned.test_and_set(std::memory_order_relaxed)) {
-		Log::WriteToConsoleAndLog(
+		Log::WriteWarningToConsoleAndLog(
 		    "Warning: HDR output is unavailable; HDR-to-SDR conversion is not implemented, "
 		    "displaying PQ video-out pixels unchanged.\n");
 	}
@@ -1180,6 +1180,7 @@ void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
 
 void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	Common::LockGuard lock(m_mutex);
+	uint32_t          timeout_count = 0;
 
 	auto has_request = [this, &cfg, index] {
 		auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
@@ -1187,7 +1188,31 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	};
 	while (has_request()) {
-		m_done_cond_var.Wait(&m_mutex);
+		if (m_done_cond_var.WaitFor(&m_mutex, 1'000'000)) {
+			continue;
+		}
+		if (++timeout_count != 5) {
+			continue;
+		}
+
+		auto log_stalled_request = [&cfg, index](const auto& queue, const char* queue_name) {
+			auto request = std::find_if(queue.begin(), queue.end(), [&cfg, index](const auto& r) {
+				return r.cfg == &cfg && r.index == index;
+			});
+			if (request != queue.end()) {
+				LOGW("video-out WaitFlipDone stalled for 5 seconds: queue=%s request=%" PRIu64
+				     " group=%" PRIu64 " index=%d state=%u source=%u\n",
+				     queue_name, request->id, request->group, index,
+				     static_cast<unsigned>(request->state), static_cast<unsigned>(request->source));
+				return true;
+			}
+			return false;
+		};
+		if (!log_stalled_request(m_requests, "gpu") &&
+		    !log_stalled_request(m_cpu_requests, "cpu")) {
+			LOGW("video-out WaitFlipDone stalled for 5 seconds: index=%d, pending gpu=%zu cpu=%zu\n",
+			     index, m_requests.size(), m_cpu_requests.size());
+		}
 	}
 }
 
@@ -1581,7 +1606,7 @@ KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64
 	const int result     = ReserveFlipRequest(DriverState(), handle, index, flip_mode, flip_arg,
 	                                          FlipRequestSource::Cpu, request_id);
 	if (result == VIDEO_OUT_ERROR_INVALID_FLIP_MODE) {
-		LOGF("\t unsupported flip_mode = %d\n", flip_mode);
+		LOGW("\t unsupported flip_mode = %d\n", flip_mode);
 	}
 	if (result != OK) {
 		return result;

@@ -65,7 +65,7 @@ namespace {
 			} else {
 				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 				if (!warned.test_and_set(std::memory_order_relaxed)) {
-					Log::WriteToConsoleAndLog(fmt::format(
+					Log::WriteWarningToConsoleAndLog(fmt::format(
 					    "Warning: format {} does not support storage access; block-compressed "
 					    "textures written by the guest will not render.\n",
 					    vk::to_string(info.pixel_format)));

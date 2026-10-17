@@ -252,7 +252,7 @@ void RefreshDevice(Stream* stream, int controller, bool wireless) {
 		DualSenseBluetooth::Close(bluetooth);
 		SDL_DestroyAudioStream(sdl);
 		if (!wireless) {
-			LOGF("DualSenseHaptics: cannot open quad output: %s\n", SDL_GetError());
+			LOGE("DualSenseHaptics: cannot open quad output: %s\n", SDL_GetError());
 		}
 	}
 }

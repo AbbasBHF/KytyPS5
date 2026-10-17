@@ -22,7 +22,11 @@ struct CompileOptions {
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
 	bool                        maintenance8_enabled       = false;
+	// Lower guest mesh shaders to a workgroup compute shader when the Vulkan device lacks
+	// VK_EXT_mesh_shader. The renderer supplies the generated-output buffer in push data.
+	bool                        mesh_shader_fallback       = false;
 	const char*                 dump_label                 = nullptr;
+	bool						fsb = false;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;

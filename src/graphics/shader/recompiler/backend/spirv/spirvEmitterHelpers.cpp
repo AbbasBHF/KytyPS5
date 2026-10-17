@@ -167,6 +167,15 @@ uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uin
 	if (variable == 0) {
 		return ConstantU32(state, 0);
 	}
+	if (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex ||
+	    kind == IR::StageInputKind::InvocationId || kind == IR::StageInputKind::PrimitiveId ||
+	    kind == IR::StageInputKind::Layer || kind == IR::StageInputKind::SampleId) {
+		const auto value = state.builder.AllocateId();
+		const auto bits  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeI32(state), value, variable);
+		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+		return bits;
+	}
 	const auto pointer = state.builder.AllocateId();
 	const auto value   = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain,

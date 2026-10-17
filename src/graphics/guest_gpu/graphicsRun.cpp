@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <deque>
 #include <memory>
@@ -743,6 +744,25 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
+			const auto now = std::chrono::steady_clock::now();
+			if (execution.m_suspended_packet != packet) {
+				execution.m_suspended_packet         = packet;
+				execution.m_suspended_since          = now;
+				execution.m_suspended_warning_logged = false;
+			} else if (!execution.m_suspended_warning_logged &&
+			           now - execution.m_suspended_since >= std::chrono::seconds(5)) {
+				execution.m_suspended_warning_logged = true;
+				std::array<uint32_t, 8> words {};
+				std::copy_n(packet, std::min<size_t>(remaining_dw, words.size()), words.begin());
+				LOGW("PM4 command remained suspended for 5 seconds: submit=%" PRIu64
+				     ", queue=%d, opcode=0x%02" PRIx32 ", buffer=0x%016" PRIx64
+				     ", offset_dw=0x%05" PRIx32
+				     ", words=%08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32
+				     " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 "\n",
+				     m_submit_id, m_interrupt_event_id, opcode,
+				     reinterpret_cast<uint64_t>(cursor.commands.data()), cursor.offset_dw, words[0],
+				     words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+			}
 			return;
 		}
 		cursor.offset_dw += packet_dw;
@@ -869,6 +889,7 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters registers,
                                      uint32_t vertex_offset, uint32_t instance_offset,
                                      uint32_t first_index) {
+	KYTY_PROFILER_FUNCTION();
 	const auto write = [&](uint32_t location, uint32_t value) {
 		if (location == Pm4::SH_NOP) {
 			return;
@@ -884,6 +905,7 @@ static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
                                     uint32_t draw_initiator, bool indexed) {
+	KYTY_PROFILER_FUNCTION();
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
 }
@@ -892,6 +914,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, IndirectDrawRegisters registers,
                                          uint32_t draw_initiator, bool indexed) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
@@ -925,45 +948,65 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		                       static_cast<uint64_t>(i) * stride_in_bytes;
 
 		if (!indexed) {
-			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
-			PatchIndirectDrawOffsets(*this, registers, args->start_vertex_location,
-			                         args->start_instance_location, 0);
-			m_num_instances = args->instance_count;
-			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
-			               .instance_count = args->instance_count,
-			               .first_vertex   = args->start_vertex_location,
-			               .first_instance = args->start_instance_location,
-			               .offset_source  = DrawOffsetSource::IndirectArgs});
+			DrawIndirectArgs args {};
+			{
+				KYTY_PROFILER_BLOCK("DrawIndirectMulti: ReadArgs", profiler::colors::Blue300);
+				args = *reinterpret_cast<const DrawIndirectArgs*>(args_addr);
+			}
+			{
+				KYTY_PROFILER_BLOCK("DrawIndirectMulti: PatchOffsets", profiler::colors::CyanA700);
+				PatchIndirectDrawOffsets(*this, registers, args.start_vertex_location,
+				                         args.start_instance_location, 0);
+			}
+			m_num_instances = args.instance_count;
+			{
+				KYTY_PROFILER_BLOCK("DrawIndirectMulti: EmitDraw", profiler::colors::Green300);
+				DrawIndexAuto({.vertex_count   = args.vertex_count_per_instance,
+				               .instance_count = args.instance_count,
+				               .first_vertex   = args.start_vertex_location,
+				               .first_instance = args.start_instance_location,
+				               .offset_source  = DrawOffsetSource::IndirectArgs});
+			}
 			continue;
 		}
 
-		auto* args = reinterpret_cast<const DrawIndexedIndirectArgs*>(args_addr);
-		PatchIndirectDrawOffsets(*this, registers, args->base_vertex_location,
-		                         args->start_instance_location, args->start_index_location);
+		DrawIndexedIndirectArgs args {};
+		{
+			KYTY_PROFILER_BLOCK("DrawIndirectMulti: ReadArgs", profiler::colors::Blue300);
+			args = *reinterpret_cast<const DrawIndexedIndirectArgs*>(args_addr);
+		}
+		{
+			KYTY_PROFILER_BLOCK("DrawIndirectMulti: PatchOffsets", profiler::colors::CyanA700);
+			PatchIndirectDrawOffsets(*this, registers, args.base_vertex_location,
+			                         args.start_instance_location, args.start_index_location);
+		}
 
 		auto* index_addr = reinterpret_cast<const void*>(
-		    m_index_base_addr + static_cast<uint64_t>(args->start_index_location) * index_size);
+		    m_index_base_addr + static_cast<uint64_t>(args.start_index_location) * index_size);
 
 		const uint32_t index_count =
 		    (m_index_buffer_size != 0
-		         ? std::min(args->index_count_per_instance, m_index_buffer_size)
-		         : args->index_count_per_instance);
-		if (GraphicsRunDebugDumpEnabled() && index_count != args->index_count_per_instance) {
+		         ? std::min(args.index_count_per_instance, m_index_buffer_size)
+		         : args.index_count_per_instance);
+		if (GraphicsRunDebugDumpEnabled() && index_count != args.index_count_per_instance) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
 				LOGF("\t DrawIndexIndirectMulti: clamped index_count from %" PRIu32 " to %" PRIu32
 				     " using INDEX_BUFFER_SIZE\n",
-				     args->index_count_per_instance, index_count);
+				     args.index_count_per_instance, index_count);
 			}
 		}
 
-		m_num_instances = args->instance_count;
-		DrawIndex({.index_count    = index_count,
-		           .index_addr     = index_addr,
-		           .instance_count = args->instance_count,
-		           .base_vertex    = static_cast<int32_t>(args->base_vertex_location),
-		           .first_instance = args->start_instance_location,
-		           .offset_source  = DrawOffsetSource::IndirectArgs});
+		m_num_instances = args.instance_count;
+		{
+			KYTY_PROFILER_BLOCK("DrawIndirectMulti: EmitDraw", profiler::colors::Green300);
+			DrawIndex({.index_count    = index_count,
+			           .index_addr     = index_addr,
+			           .instance_count = args.instance_count,
+			           .base_vertex    = static_cast<int32_t>(args.base_vertex_location),
+			           .first_instance = args.start_instance_location,
+			           .offset_source  = DrawOffsetSource::IndirectArgs});
+		}
 	}
 }
 
@@ -1290,7 +1333,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		case 0x0000001b:
 		case 0x00000038:
 		case 0x0000003a:
-			LOGF("\t temporary: ignoring unsupported event_write type 0x%08" PRIx32
+			LOGW("\t temporary: ignoring unsupported event_write type 0x%08" PRIx32
 			     ", index 0x%08" PRIx32 "\n",
 			     event_type, event_index);
 			break;
@@ -1302,8 +1345,9 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			}
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {
-				std::printf("Warning: game uses occlusion queries, which are currently treated as "
-				            "always visible; GPU usage may be higher and FPS may be lower.\n");
+				Log::WriteWarningToConsoleAndLog(
+				    "Warning: game uses occlusion queries, which are currently treated as "
+				    "always visible; GPU usage may be higher and FPS may be lower.\n");
 			});
 
 			// Until host occlusion queries are implemented, publish an always-visible result. The

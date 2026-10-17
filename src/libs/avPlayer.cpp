@@ -396,7 +396,7 @@ static bool codec_is_supported_for_source(AvPlayerSourceType source_type, AVMedi
 static const AVCodec* find_decoder(AVCodecID codec_id) {
 	const auto* decoder = avcodec_find_decoder(codec_id);
 	if (decoder == nullptr && codec_id == AV_CODEC_ID_VP9) {
-		Log::WriteToConsoleAndLog(
+		Log::WriteWarningToConsoleAndLog(
 		    "WARNING: AvPlayer: The game requested VP9 video, but FFmpeg has no VP9 "
 		    "decoder. Use FFmpeg with VP9 decoding enabled.\n");
 	}
@@ -713,12 +713,12 @@ public:
 		if (const auto rc = avformat_open_input(&raw, file.open == nullptr ? path.c_str() : nullptr,
 		                                        nullptr, nullptr);
 		    rc < 0) {
-			LOGF("\t avformat_open_input failed: %s path=%s\n", fferr(rc).c_str(), path.c_str());
+			LOGE("\t avformat_open_input failed: %s path=%s\n", fferr(rc).c_str(), path.c_str());
 			return AVPLAYER_ERROR_OPERATION_FAILED;
 		}
 		fmt = raw;
 		if (auto rc = avformat_find_stream_info(fmt, nullptr); rc < 0) {
-			LOGF("\t avformat_find_stream_info failed: %s\n", fferr(rc).c_str());
+			LOGE("\t avformat_find_stream_info failed: %s\n", fferr(rc).c_str());
 			return AVPLAYER_ERROR_OPERATION_FAILED;
 		}
 		return 0;
@@ -1106,7 +1106,7 @@ private:
 			return true;
 		}
 		if (!codec_is_supported_for_source(source_type, t, s->codecpar->codec_id)) {
-			LOGF("\t unsupported codec for source type: stream=%d codec=%d source=%u\n", id,
+			LOGW("\t unsupported codec for source type: stream=%d codec=%d source=%u\n", id,
 			     static_cast<int>(s->codecpar->codec_id), static_cast<uint32_t>(source_type));
 			return false;
 		}
@@ -1121,7 +1121,7 @@ private:
 		auto* s   = fmt->streams[id];
 		auto* dec = find_decoder(s->codecpar->codec_id);
 		if (dec == nullptr) {
-			LOGF("\t avcodec_find_decoder failed: stream=%d codec=%d\n", id,
+			LOGE("\t avcodec_find_decoder failed: stream=%d codec=%d\n", id,
 			     static_cast<int>(s->codecpar->codec_id));
 			return false;
 		}
@@ -1296,7 +1296,7 @@ private:
 					continue;
 				}
 				if (result != AVERROR_EOF && !worker_stop) {
-					LOGF("\t av_read_frame failed: %s\n", fferr(result).c_str());
+				LOGE("\t av_read_frame failed: %s\n", fferr(result).c_str());
 					FailPipeline();
 				}
 				break;
@@ -1377,7 +1377,7 @@ private:
 			return true;
 		}
 		if (result < 0) {
-			LOGF("\t avcodec_send_packet %s failed: %s\n", kind, fferr(result).c_str());
+			LOGE("\t avcodec_send_packet %s failed: %s\n", kind, fferr(result).c_str());
 			return false;
 		}
 		return ReceiveFrames(codec, timestamp_offset, buffers, frames, prepare, kind);
@@ -1396,7 +1396,7 @@ private:
 				return true;
 			}
 			if (result < 0) {
-				LOGF("\t avcodec_receive_frame %s failed: %s\n", kind, fferr(result).c_str());
+				LOGE("\t avcodec_receive_frame %s failed: %s\n", kind, fferr(result).c_str());
 				av_frame_free(&frame);
 				return false;
 			}

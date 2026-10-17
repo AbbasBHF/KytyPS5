@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -47,6 +48,8 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+RenderExecutor::~RenderExecutor() = default;
 
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	                                           const ShaderVertexInputInfo& vs_input_info) {
@@ -1100,15 +1103,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
+	const bool mesh_fallback = mesh_active && state.programs.mesh_fallback;
+	if (mesh_fallback && Config::SkipMeshFallbackDraws()) {
+		return;
+	}
 	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.IsIndexed() || primitive_restart_enable));
 		static std::atomic_bool restart_warned = false;
 		if (primitive_restart_enable && !restart_warned.exchange(true, std::memory_order_relaxed)) {
-			std::printf("Warning: primitive restart is not implemented for mesh shaders; "
-			            "continuing draw (primitive=%u indexed=%u)\n",
-			            static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed());
+			Log::WriteWarningToConsoleAndLog(fmt::format(
+			    "Warning: primitive restart is not implemented for mesh shaders; "
+			    "continuing draw (primitive={} indexed={})\n",
+			    static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed()));
 		}
 		if (mesh.primitives_per_group == 0) {
 			EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
@@ -1119,28 +1127,131 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			return;
 		}
 		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
-		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
-		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
-		        limits.maxMeshWorkGroupTotalCount) {
-			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
-			     draw.instance_count);
+		if (draw.IsIndexed()) {
+			// Mesh shaders read the original index stream through guest memory. Register the
+			// range before fallback compute is recorded so PrepareBda can publish its mapping.
+			(void)m_context.GetBufferCache().FindBuffer(
+			    index_source.address, static_cast<uint64_t>(draw.index_count) *
+			                              index_source.guest_element_size);
+		}
+		if (!mesh_fallback) {
+			const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+			if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
+			    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
+			    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
+			        limits.maxMeshWorkGroupTotalCount) {
+				EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
+				     draw.instance_count);
+			}
+		} else {
+			const auto& compute_limits = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
+			if (mesh_groups > compute_limits.maxComputeWorkGroupCount[0] ||
+			    draw.instance_count > compute_limits.maxComputeWorkGroupCount[1]) {
+				EXIT("mesh fallback dispatch exceeds host compute limits: %ux%u\n", mesh_groups,
+				     draw.instance_count);
+			}
+			const auto layout = ShaderMeshFallbackLayout::Create(
+			    mesh.max_vertices, mesh.max_primitives,
+			    static_cast<uint32_t>(state.vertex_info[0].stage.program->info.outputs.size()));
+			const uint64_t total_groups = static_cast<uint64_t>(mesh_groups) * draw.instance_count;
+			const uint64_t max_storage_range = m_context.GetGraphics().GetPhysicalDeviceProperties()
+			                                      .limits.maxStorageBufferRange;
+			EXIT_IF(layout.group_stride_dwords == 0 || total_groups == 0 ||
+			        total_groups > max_storage_range / sizeof(uint32_t) /
+			                           layout.group_stride_dwords);
+			const uint64_t bytes = total_groups * layout.group_stride_dwords * sizeof(uint32_t);
+			auto& scheduler = m_context.GetCommandScheduler();
+			if (!m_mesh_fallback_buffer || m_mesh_fallback_buffer->Size() < bytes) {
+				auto replacement = std::make_unique<Buffer>(
+				    m_context.GetGraphics(), scheduler, MemoryUsage::DeviceLocal, 0,
+				    vk::BufferUsageFlagBits::eStorageBuffer |
+				        vk::BufferUsageFlagBits::eShaderDeviceAddress,
+				    bytes);
+				if (m_mesh_fallback_buffer) {
+					scheduler.DeferOperation([owner = std::move(m_mesh_fallback_buffer)]() mutable {
+						owner.reset();
+					});
+				}
+				m_mesh_fallback_buffer = std::move(replacement);
+			}
+			ShaderComputeInputInfo compute_info {};
+			compute_info.stage = state.vertex_info[0].stage;
+			std::copy(std::begin(mesh.threads_num), std::end(mesh.threads_num),
+			          std::begin(compute_info.threads_num));
+			compute_info.lds_size_dwords = mesh.lds_size_dwords;
+			compute_info.scratch_size_dwords = mesh.scratch_size_dwords;
+			compute_info.wave_size = mesh.wave_size;
+			compute_info.host_subgroup_size = mesh.host_subgroup_size;
+			compute_info.workgroup_counts[0] = mesh_groups;
+			compute_info.workgroup_counts[1] = draw.instance_count;
+			compute_info.workgroup_counts[2] = 1;
+			buffer.EndRendering();
+			auto& compute_pipeline = m_context.GetPipelineCache().GetComputePipeline(
+			    compute_info, state.programs.vertex[0]);
+			auto& compute_bindings = m_compute_bindings;
+			PrepareBindings(compute_info.stage, compute_bindings);
+			PreparedBindings* compute_stage = &compute_bindings;
+			FindBuffers(std::span {&compute_stage, 1u});
+			if (compute_info.stage.program->info.uses_dma || draw.IsIndexed()) {
+				m_context.PrepareBda();
+			}
+			RebindImages(compute_bindings);
+			RebindBuffers(compute_bindings);
+			auto command = buffer.Handle();
+			CommitBindings(buffer, vk::PipelineBindPoint::eCompute, compute_pipeline,
+			               std::span {&compute_stage, 1u});
+			const auto address = m_mesh_fallback_buffer->BufferDeviceAddress();
+			const uint32_t push_data[10] {
+			    draw.index_count,
+			    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
+			    emit.first_instance, index_source.guest_element_size,
+			    static_cast<uint32_t>(index_source.address),
+			    static_cast<uint32_t>(index_source.address >> 32u),
+			    static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
+			    mesh_groups, layout.group_stride_dwords};
+			command.bindPipeline(vk::PipelineBindPoint::eCompute, compute_pipeline.pipeline);
+			command.pushConstants(compute_pipeline.pipeline_layout,
+			                      vk::ShaderStageFlagBits::eCompute, 0, sizeof(push_data), push_data);
+			vk::BufferMemoryBarrier output_hazard {};
+			output_hazard.srcAccessMask = vk::AccessFlagBits::eShaderRead |
+			                              vk::AccessFlagBits::eShaderWrite;
+			output_hazard.dstAccessMask = vk::AccessFlagBits::eShaderWrite;
+			output_hazard.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			output_hazard.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			output_hazard.buffer = m_mesh_fallback_buffer->Handle();
+			output_hazard.offset = 0;
+			output_hazard.size = bytes;
+			command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+			                        vk::PipelineStageFlagBits::eComputeShader,
+			                        vk::DependencyFlags {}, 0, nullptr, 1, &output_hazard, 0, nullptr);
+			buffer.SetMeshFallbackDebugInfo(submit_id, mesh_groups, draw.instance_count,
+			                                draw.index_count, layout.group_stride_dwords, bytes);
+			command.dispatch(mesh_groups, draw.instance_count, 1);
+			static std::atomic<uint32_t> fallback_dispatch_log_count {0};
+			const auto fallback_dispatch_log_id =
+			    fallback_dispatch_log_count.fetch_add(1, std::memory_order_relaxed);
+			if (fallback_dispatch_log_id < 16) {
+				LOGF("MeshFallbackDispatch[%u]: groups=%ux%u primitives_per_group=%u "
+				     "slot_dwords=%u bytes=%" PRIu64 " indexed=%u draw_indices=%u\n",
+				     fallback_dispatch_log_id, mesh_groups, draw.instance_count,
+				     mesh.primitives_per_group, layout.group_stride_dwords, bytes,
+				     draw.IsIndexed() ? 1u : 0u, draw.index_count);
+			}
+			output_hazard.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+			output_hazard.dstAccessMask = vk::AccessFlagBits::eShaderRead;
+			command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+			                        vk::PipelineStageFlagBits::eVertexShader,
+			                        vk::DependencyFlags {}, 0, nullptr, 1, &output_hazard, 0, nullptr);
+			ShaderAccessBarrier(command, vk::PipelineStageFlagBits::eComputeShader);
 		}
 	}
 
-	if (mesh_active && draw.IsIndexed()) {
-		// Register the original guest indices for shader reads; PrepareGraphicsBindings
-		// synchronizes registered BDA ranges before any draw commands are committed.
-		(void)m_context.GetBufferCache().FindBuffer(
-		    index_source.address, static_cast<uint64_t>(draw.index_count) *
-		                              index_source.guest_element_size);
-	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
 	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+		if (mesh_fallback) break;
 		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
 		descriptor_stages[stage_count++] = &bindings.vertex[i];
 	}
@@ -1183,17 +1294,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (mesh_active) {
-		const uint32_t draw_data[] {
-		    draw.index_count,
-		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
-		    emit.first_instance, index_source.guest_element_size,
-		    static_cast<uint32_t>(index_source.address),
-		    static_cast<uint32_t>(index_source.address >> 32u)};
-		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
-		vk_buffer.pushConstants(pipeline.pipeline_layout,
-		                        vk::ShaderStageFlagBits::eMeshEXT |
-		                            vk::ShaderStageFlagBits::eFragment,
-		                        0, sizeof(draw_data), draw_data);
+		if (!mesh_fallback) {
+			const uint32_t draw_data[] {
+			    draw.index_count,
+			    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
+			    emit.first_instance, index_source.guest_element_size,
+			    static_cast<uint32_t>(index_source.address),
+			    static_cast<uint32_t>(index_source.address >> 32u)};
+			static_assert(std::size(draw_data) ==
+			              ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+			vk_buffer.pushConstants(pipeline.pipeline_layout,
+			                        vk::ShaderStageFlagBits::eMeshEXT |
+			                            vk::ShaderStageFlagBits::eFragment,
+			                        0, sizeof(draw_data), draw_data);
+		}
 	} else {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
@@ -1214,7 +1328,22 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
 	if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		if (mesh_fallback) {
+			const auto layout = ShaderMeshFallbackLayout::Create(
+			    state.vertex_info[0].mesh.max_vertices, state.vertex_info[0].mesh.max_primitives,
+			    static_cast<uint32_t>(state.vertex_info[0].stage.program->info.outputs.size()));
+			const auto address = m_mesh_fallback_buffer->BufferDeviceAddress();
+			const uint32_t push_data[5] {static_cast<uint32_t>(address),
+			                             static_cast<uint32_t>(address >> 32u),
+			                             layout.group_stride_dwords, mesh_groups,
+			                             state.vertex_info[0].mesh.max_primitives};
+			vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eVertex,
+			                        0, sizeof(push_data), push_data);
+			vk_buffer.draw(mesh_groups * state.vertex_info[0].mesh.max_primitives * 3u,
+			               draw.instance_count, 0, 0);
+		} else {
+			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		}
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
@@ -1225,7 +1354,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	vk::PipelineStageFlags shader_write_stages = {};
 	for (const auto& stage: vertex_stages) {
 		if (HasShaderBufferWrites(stage.stage)) {
-			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
+			shader_write_stages |= mesh_fallback && stage.logical_stage == ShaderType::Mesh
+			                           ? vk::PipelineStageFlagBits::eComputeShader
+			                           : ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
 		}
 	}
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
@@ -1298,42 +1429,49 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	DrawIndexBufferSource index_source {};
-	index_source.address = reinterpret_cast<uint64_t>(args.index_addr);
-	switch (static_cast<Prospero::IndexType>(args.index_type_and_size)) {
-		case Prospero::IndexType::kIndex16:
-			index_source.type               = vk::IndexType::eUint16;
-			index_source.guest_element_size = 2;
-			break;
-		case Prospero::IndexType::kIndex32:
-			index_source.type               = vk::IndexType::eUint32;
-			index_source.guest_element_size = 4;
-			break;
-		case Prospero::IndexType::kIndex8:
-			index_source.guest_element_size = 1;
-			break;
-		default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
-	}
-	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
-	const bool primitive_restart = ResolvePrimitiveRestart(buffer, index_source);
-
 	std::vector<uint16_t> expanded_indices;
-	if (index_source.guest_element_size == 1) {
-		EXIT_NOT_IMPLEMENTED(args.index_addr == nullptr);
-		const auto* src = static_cast<const uint8_t*>(args.index_addr);
-		expanded_indices.resize(args.index_count);
-		for (uint32_t i = 0; i < args.index_count; i++) {
-			expanded_indices[i] = primitive_restart && src[i] == 0xffu ? 0xffffu : src[i];
+	bool primitive_restart = false;
+	{
+		KYTY_PROFILER_BLOCK("DrawIndex: PrepareIndexSource", profiler::colors::Blue300);
+		index_source.address = reinterpret_cast<uint64_t>(args.index_addr);
+		switch (static_cast<Prospero::IndexType>(args.index_type_and_size)) {
+			case Prospero::IndexType::kIndex16:
+				index_source.type               = vk::IndexType::eUint16;
+				index_source.guest_element_size = 2;
+				break;
+			case Prospero::IndexType::kIndex32:
+				index_source.type               = vk::IndexType::eUint32;
+				index_source.guest_element_size = 4;
+				break;
+			case Prospero::IndexType::kIndex8:
+				index_source.guest_element_size = 1;
+				break;
+			default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
 		}
-		index_source.host_data = expanded_indices.data();
-		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
+		index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
+		primitive_restart = ResolvePrimitiveRestart(buffer, index_source);
+
+		if (index_source.guest_element_size == 1) {
+			EXIT_NOT_IMPLEMENTED(args.index_addr == nullptr);
+			const auto* src = static_cast<const uint8_t*>(args.index_addr);
+			expanded_indices.resize(args.index_count);
+			for (uint32_t i = 0; i < args.index_count; i++) {
+				expanded_indices[i] = primitive_restart && src[i] == 0xffu ? 0xffffu : src[i];
+			}
+			index_source.host_data = expanded_indices.data();
+			index_source.size      = expanded_indices.size() * sizeof(uint16_t);
+		}
 	}
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
-		ResetBindings();
-		return;
+	{
+		KYTY_PROFILER_BLOCK("DrawIndex: PrepareRenderState", profiler::colors::CyanA700);
+		if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+			ResetBindings();
+			return;
+		}
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
@@ -1350,8 +1488,11 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	emit.vertex_offset  = native_indirect ? 0 : vertex_offset + args.base_vertex;
 	emit.first_instance = native_indirect ? 0 : instance_offset;
 
-	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
-	                    primitive_restart);
+	{
+		KYTY_PROFILER_BLOCK("DrawIndex: ExecutePreparedDraw", profiler::colors::Green300);
+		ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
+		                    primitive_restart);
+	}
 	ResetBindings();
 }
 

@@ -131,6 +131,12 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Config::Lifecycle>();
 	Config::Load(cfg);
 	subsystems.Initialize<Log::Lifecycle>();
+	if (Config::SkipBvhIntersections()) {
+		LOGW("Diagnostic mode: guest BVH ray intersections are treated as misses; lighting/reflections may be incorrect.\n");
+	}
+	if (Config::SkipMeshFallbackDraws()) {
+		LOGW("Diagnostic mode: mesh draws using the compute fallback are skipped; scene geometry will be missing.\n");
+	}
 
 	if (Common::File::IsFileExisting(param_json)) {
 		Loader::SystemContentLoadParamSfo(param_json);

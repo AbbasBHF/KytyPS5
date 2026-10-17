@@ -3031,27 +3031,27 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
 	const bool                   log_warning = (warning_log_count.fetch_add(1) < 64);
 	if (!no_size && (size_bytes & 0xffu) != 0) {
 		if (log_warning) {
-			LOGF_COLOR(Log::Color::Red, "\t warning: size_bytes is not 256-byte aligned\n");
+			LOGW_COLOR(Log::Color::Red, "\t warning: size_bytes is not 256-byte aligned\n");
 		}
 	}
 	if (!no_size && (size_bytes >> 40u) != 0) {
 		if (log_warning) {
-			LOGF_COLOR(Log::Color::Red, "\t warning: size_bytes is too large\n");
+			LOGW_COLOR(Log::Color::Red, "\t warning: size_bytes is too large\n");
 		}
 	}
 	if ((vaddr & 0xffu) != 0) {
 		if (log_warning) {
-			LOGF_COLOR(Log::Color::Red, "\t warning: base is not 256-byte aligned\n");
+			LOGW_COLOR(Log::Color::Red, "\t warning: base is not 256-byte aligned\n");
 		}
 	}
 	if ((vaddr >> 40u) != 0) {
 		if (log_warning) {
-			LOGF_COLOR(Log::Color::Red, "\t warning: base is too high\n");
+			LOGW_COLOR(Log::Color::Red, "\t warning: base is too high\n");
 		}
 	}
 	if (engine > 1) {
 		if (log_warning) {
-			LOGF_COLOR(Log::Color::Red, "\t warning: unsupported engine 0x%02" PRIx8 "\n", engine);
+			LOGW_COLOR(Log::Color::Red, "\t warning: unsupported engine 0x%02" PRIx8 "\n", engine);
 		}
 	}
 
@@ -3994,13 +3994,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	if (size != 0 && size != 1) {
-		LOGF_COLOR(Log::Color::Red,
+		LOGW_COLOR(Log::Color::Red,
 		           "\t warning: unsupported size 0x%02" PRIx8 ", expected 0 (32b) or 1 (64b)\n",
 		           size);
 		return nullptr;
 	}
 	if (cache_policy > 3) {
-		LOGF_COLOR(Log::Color::Red,
+		LOGW_COLOR(Log::Color::Red,
 		           "\t warning: unsupported cache_policy 0x%02" PRIx8 ", expected 0..3\n",
 		           cache_policy);
 	}

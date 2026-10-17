@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
@@ -37,13 +38,23 @@ public:
 
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const bool should_flush = [&] {
+				KYTY_PROFILER_BLOCK("InvalidateRegion: Lock and dirty checks");
 				// Perform both the GPU modification check and CPU state change with the lock in
 				// case the GPU thread is racing to mark the page modified. If a flush is needed,
 				// on_flush performs the CPU state change.
 				std::scoped_lock lock(manager->lock);
+				// Write faults can also originate from another cache watching this page. If this
+				// tracker already considers it CPU-dirty, setting that state again is redundant;
+				// ChangeState would otherwise rescan the full region's protection mask. CPU and GPU
+				// dirty ranges are mutually exclusive, enforced by RegionManager::ChangeState, so
+				// check CPU dirtiness first and avoid scanning the GPU bitmap for these pages.
+				if (manager->IsModified<DirtySource::Cpu>(offset, bytes)) {
+					return false;
+				}
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
+				KYTY_PROFILER_BLOCK("InvalidateRegion: ChangeState CPU");
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 				return false;
 			}();

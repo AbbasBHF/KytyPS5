@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <chrono>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -46,6 +47,9 @@ private:
 	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
+	const uint32_t*                       m_suspended_packet         = nullptr;
+	std::chrono::steady_clock::time_point m_suspended_since          {};
+	bool                                  m_suspended_warning_logged = false;
 };
 
 class CommandProcessor {

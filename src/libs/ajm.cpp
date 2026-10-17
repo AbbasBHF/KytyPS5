@@ -668,7 +668,7 @@ int KYTY_SYSV_ABI AjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t f
 	     "\t instance = 0x%08" PRIx32 "\n",
 	     context, codec, flags, *instance);
 	if (!supported) {
-		LOGF("\t unsupported codec instance created without decoder\n");
+		LOGW("\t unsupported codec instance created without decoder\n");
 	}
 
 	return OK;
@@ -1043,7 +1043,7 @@ int KYTY_SYSV_ABI AjmBatchJobRunSplit(AjmBatchInfo* info, uint32_t instance, uin
 
 const char* KYTY_SYSV_ABI AjmStrError(int error) {
 	PRINT_NAME();
-	LOGF("\t error = %d\n", error);
+	LOGE("\t error = %d\n", error);
 	return "AJM";
 }
 

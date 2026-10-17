@@ -168,6 +168,14 @@ bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
 
+bool SkipBvhIntersections() {
+	return g_config->skip_bvh_intersections;
+}
+
+bool SkipMeshFallbackDraws() {
+	return g_config->skip_mesh_fallback_draws;
+}
+
 bool TrophyEnabled() {
 	return g_config->trophy_enabled;
 }

@@ -264,7 +264,7 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 	EXIT_IF(port == nullptr);
 
 	if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-		LOGF("AudioOut: SDL audio init failed: %s\n", SDL_GetError());
+		LOGE("AudioOut: SDL audio init failed: %s\n", SDL_GetError());
 		return false;
 	}
 
@@ -276,12 +276,12 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 	port->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired, nullptr,
 	                                         nullptr);
 	if (port->stream == nullptr) {
-		LOGF("AudioOut: SDL_OpenAudioDeviceStream failed: %s\n", SDL_GetError());
+		LOGE("AudioOut: SDL_OpenAudioDeviceStream failed: %s\n", SDL_GetError());
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
 		return false;
 	}
 	if (!SDL_ResumeAudioStreamDevice(port->stream)) {
-		LOGF("AudioOut: SDL_ResumeAudioStreamDevice failed: %s\n", SDL_GetError());
+		LOGE("AudioOut: SDL_ResumeAudioStreamDevice failed: %s\n", SDL_GetError());
 		CloseSdlDevice(port);
 		return false;
 	}
@@ -408,7 +408,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 	}
 
 	if (!SDL_PutAudioStreamData(port->stream, prepared_data, static_cast<int>(prepared_size))) {
-		LOGF("AudioOut: SDL_PutAudioStreamData failed: %s\n", SDL_GetError());
+		LOGE("AudioOut: SDL_PutAudioStreamData failed: %s\n", SDL_GetError());
 		port->queue_primed = false;
 		return false;
 	}
@@ -635,7 +635,7 @@ void Audio::OpenSdlDevice(PortIn* port, Format format) {
 		return;
 	}
 	if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-		LOGF("AudioIn: SDL init failed: %s\n", SDL_GetError());
+		LOGE("AudioIn: SDL init failed: %s\n", SDL_GetError());
 		return;
 	}
 	int                device_count = 0;
@@ -660,7 +660,7 @@ void Audio::OpenSdlDevice(PortIn* port, Format format) {
 	desired.channels = static_cast<int>(port->bytes_per_frame / BytesPerSample(format));
 	port->stream     = SDL_OpenAudioDeviceStream(device, &desired, nullptr, nullptr);
 	if (port->stream == nullptr) {
-		LOGF("AudioIn: cannot open '%s': %s; using silence\n", name.c_str(), SDL_GetError());
+		LOGE("AudioIn: cannot open '%s': %s; using silence\n", name.c_str(), SDL_GetError());
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
 		return;
 	}

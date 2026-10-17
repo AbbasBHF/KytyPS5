@@ -430,7 +430,7 @@ struct Ngs2SamplerFilter {
 			enabled = false;
 			history.clear();
 			if (!warned) {
-				Log::WriteToConsoleAndLog(fmt::sprintf(
+				Log::WriteWarningToConsoleAndLog(fmt::sprintf(
 				    "warning: unsupported NGS2 sampler filter (location=%u, type=%u)\n",
 				    param.location, param.type));
 				warned = true;
@@ -1798,7 +1798,7 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 			for (size_t m = 0; m < voice.modules.size(); ++m) {
 				if (custom.module[m].module_id != 0x1f) {
 					if (!voice.modules[m].render_warned) {
-						Log::WriteToConsoleAndLog(fmt::sprintf(
+						Log::WriteWarningToConsoleAndLog(fmt::sprintf(
 						    "warning: NGS2 custom module 0x%02x at index %zu is ignored during render\n",
 						    custom.module[m].module_id, m));
 						voice.modules[m].render_warned = true;
@@ -2235,7 +2235,7 @@ int KYTY_SYSV_ABI Ngs2RackGetVoiceHandle(uintptr_t rack_handle, uint32_t voice_i
 	auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(rack_handle + sizeof(Ngs2RackInternal));
 
 	if (voice_id >= rack->option.common.max_voices) {
-		LOGF("\t warning: voice_id %u >= max_voices %u, using last available stub voice\n",
+		LOGW("\t warning: voice_id %u >= max_voices %u, using last available stub voice\n",
 		     voice_id, rack->option.common.max_voices);
 		if (rack->option.common.max_voices == 0) {
 			return -1;
@@ -2394,7 +2394,7 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				    voice->rack->option.custom_sampler.custom_rack_option.module[index].module_id !=
 				        0x1f) {
 					if (!voice->modules[index].control_warned) {
-						Log::WriteToConsoleAndLog(fmt::sprintf(
+						Log::WriteWarningToConsoleAndLog(fmt::sprintf(
 						    "warning: NGS2 custom control 0x%08" PRIx32 " is ignored\n",
 						    param->id));
 						voice->modules[index].control_warned = true;
@@ -2594,7 +2594,7 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 		}
 		case Ngs2RackType::Sampler: {
 			if (state_size != sizeof(Ngs2SamplerVoiceState)) {
-				LOGF("\t warning: sampler state_size = 0x%016" PRIx64 ", expected 0x%016" PRIx64
+				LOGW("\t warning: sampler state_size = 0x%016" PRIx64 ", expected 0x%016" PRIx64
 				     "\n",
 				     static_cast<uint64_t>(state_size),
 				     static_cast<uint64_t>(sizeof(Ngs2SamplerVoiceState)));

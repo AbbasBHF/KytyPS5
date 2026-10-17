@@ -43,7 +43,7 @@ public:
 	    : AjmDecoder(0, sample_rate, encoding), m_max_channels(max_channels), m_flags(flags) {
 		m_codec = avcodec_find_decoder(AV_CODEC_ID_AAC);
 		if (m_codec == nullptr) {
-			LOGF("AJM AAC: avcodec_find_decoder failed\n");
+			LOGE("AJM AAC: avcodec_find_decoder failed\n");
 			return;
 		}
 	}
@@ -195,7 +195,7 @@ private:
 		}
 
 		if (avcodec_open2(m_codec_context, m_codec, nullptr) < 0) {
-			LOGF("AJM AAC: decoder initialization failed\n");
+			LOGE("AJM AAC: decoder initialization failed\n");
 			Release();
 		}
 	}

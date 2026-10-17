@@ -6,7 +6,7 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 // Collects the shader interface, resource usage and instruction features after resource tracking.
-void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info);
+void CollectShaderInfo(Program& program, bool fsb, ShaderStageInputInfo input_info);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

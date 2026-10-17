@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
@@ -55,6 +56,7 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 }
 
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	KYTY_PROFILER_FUNCTION();
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
@@ -62,9 +64,17 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		KYTY_PROFILER_BLOCK("HandleFault: Write", profiler::colors::Amber300);
+		{
+			KYTY_PROFILER_BLOCK("HandleFault: InvalidateBuffer", profiler::colors::Blue300);
+			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
+		{
+			KYTY_PROFILER_BLOCK("HandleFault: InvalidateTexture", profiler::colors::CyanA700);
+			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
 	} else {
+		KYTY_PROFILER_BLOCK("HandleFault: Read", profiler::colors::Blue300);
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;

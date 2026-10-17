@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -23,6 +24,7 @@ class Shader;
 } // namespace HW
 
 struct GraphicContext;
+struct TracyGpuCommandBufferZone;
 struct ShaderBufferResource;
 struct ShaderComputeInputInfo;
 struct RenderDepthInfo;
@@ -33,6 +35,7 @@ struct DrawIndexBufferSource;
 struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
+class Buffer;
 struct RenderExecutorTestAccess;
 
 enum class CommandBufferDebugOp : uint32_t {
@@ -96,7 +99,7 @@ struct SubmitInfo {
 
 class CommandBuffer {
 public:
-	~CommandBuffer() = default;
+	~CommandBuffer();
 
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
@@ -104,6 +107,9 @@ public:
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
+	void SetDebugShaderHash(uint64_t shader_hash) noexcept { m_debug_shader_hash = shader_hash; }
+	void SetMeshFallbackDebugInfo(uint64_t submit_id, uint32_t groups_x, uint32_t groups_y,
+	                              uint32_t index_count, uint32_t group_stride_dwords, uint64_t bytes);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
@@ -124,6 +130,7 @@ private:
 
 	void Begin();
 	void End() const;
+	void BeginGpuProfileZone(void* tracy_gpu_context) const;
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
@@ -135,8 +142,17 @@ private:
 	uint32_t            m_debug_arg2      = 0;
 	uint32_t            m_debug_arg3      = 0;
 	uint64_t            m_debug_arg4      = 0;
+	uint64_t            m_debug_shader_hash = 0;
+	bool                m_mesh_fallback_debug_valid = false;
+	uint64_t            m_mesh_fallback_submit_id = 0;
+	uint32_t            m_mesh_fallback_groups_x = 0;
+	uint32_t            m_mesh_fallback_groups_y = 0;
+	uint32_t            m_mesh_fallback_index_count = 0;
+	uint32_t            m_mesh_fallback_stride_dwords = 0;
+	uint64_t            m_mesh_fallback_bytes = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	mutable std::unique_ptr<TracyGpuCommandBufferZone> m_gpu_profile_zone;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
@@ -147,6 +163,7 @@ private:
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
@@ -210,6 +227,7 @@ private:
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
+	std::unique_ptr<Buffer>               m_mesh_fallback_buffer;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;

@@ -466,7 +466,7 @@ void Swapchain::Create() {
 	}
 	if (std::find(surface.present_modes.begin(), surface.present_modes.end(),
 	              create_info.presentMode) == surface.present_modes.end()) {
-		LOGF("warning: requested present mode is unavailable; falling back to Fifo\n");
+		LOGW("warning: requested present mode is unavailable; falling back to Fifo\n");
 		create_info.presentMode = vk::PresentModeKHR::eFifo;
 	}
 	create_info.clipped = VK_TRUE;
@@ -612,13 +612,13 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eSuboptimalKHR\n");
 			return Status::Recreate;
 		case vk::Result::eErrorOutOfDateKHR:
-			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorOutOfDateKHR\n");
+			LOGW("vkAcquireNextImageKHR returned vk::Result::eErrorOutOfDateKHR\n");
 			return Status::Recreate;
 		case vk::Result::eErrorUnknown:
-			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorUnknown\n");
+			LOGE("vkAcquireNextImageKHR returned vk::Result::eErrorUnknown\n");
 			return Status::Recreate;
 		case vk::Result::eErrorSurfaceLostKHR:
-			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorSurfaceLostKHR\n");
+			LOGW("vkAcquireNextImageKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
 		default: EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
 	}
@@ -900,10 +900,10 @@ Swapchain::Status Swapchain::Present() {
 			LOGF("vkQueuePresentKHR returned vk::Result::eSuboptimalKHR\n");
 			return Status::Recreate;
 		case vk::Result::eErrorOutOfDateKHR:
-			LOGF("vkQueuePresentKHR returned vk::Result::eErrorOutOfDateKHR\n");
+			LOGW("vkQueuePresentKHR returned vk::Result::eErrorOutOfDateKHR\n");
 			return Status::Recreate;
 		case vk::Result::eErrorSurfaceLostKHR:
-			LOGF("vkQueuePresentKHR returned vk::Result::eErrorSurfaceLostKHR\n");
+			LOGW("vkQueuePresentKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
 		default: EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
 	}

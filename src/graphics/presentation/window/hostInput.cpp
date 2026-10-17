@@ -82,8 +82,13 @@ struct MouseJoystickState {
 };
 
 MouseJoystickState g_mouse;
-SDL_Window*        g_mouse_window   = nullptr;
-uint64_t           g_cursor_hide_at = 0;
+SDL_Window*        g_mouse_window              = nullptr;
+uint64_t           g_cursor_hide_at            = 0;
+bool               g_touchpad_mouse_left_down  = false;
+bool               g_touchpad_mouse_right_down = false;
+float              g_touchpad_mouse_x          = 0.5f;
+float              g_touchpad_mouse_y          = 0.5f;
+int                g_touchpad_finger           = 0;
 
 std::size_t ControlFromName(std::string_view name) {
 	const auto info = std::find_if(CONTROL_INFO.begin(), CONTROL_INFO.end(),
@@ -207,8 +212,8 @@ void SetButton(uint32_t button, bool down) {
 	}
 }
 
-void SetTouchPad(float x, bool down) {
-	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 0, down, x, 0.5f);
+void SetTouchPad(int finger, float x, float y, bool down) {
+	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, finger, down, x, y);
 }
 
 uint32_t DefaultKeyboardButton(int key_code) {
@@ -263,7 +268,7 @@ void SetControl(std::size_t control, bool down) {
 
 	const auto& info = CONTROL_INFO[control];
 	if (info.button == Controller::PAD_BUTTON_TOUCH_PAD) {
-		SetTouchPad(info.touch_x, down);
+		SetTouchPad(0, info.touch_x, 0.5f, down);
 		return;
 	}
 	if (info.button != 0) {
@@ -296,8 +301,8 @@ void DefaultKeyboardInput(int key_code, bool down) {
 	static StickKeys right;
 
 	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
-		case SDLK_BACKSPACE: SetTouchPad(0.25f, down); return;
-		case SDLK_TAB: SetTouchPad(0.75f, down); return;
+		case SDLK_BACKSPACE: SetTouchPad(0, 0.25f, 0.5f, down); return;
+		case SDLK_TAB: SetTouchPad(0, 0.75f, 0.5f, down); return;
 		case SDLK_1: CycleSettingOnPress(Controller::Setting::SpeakerVolume, down); return;
 		case SDLK_2: CycleSettingOnPress(Controller::Setting::VibrationIntensity, down); return;
 		case SDLK_3: CycleSettingOnPress(Controller::Setting::TriggerEffectIntensity, down); return;
@@ -360,7 +365,7 @@ bool SetRelativeMouseMode(bool enabled) {
 	if (SDL_SetWindowRelativeMouseMode(g_mouse_window, enabled)) {
 		return true;
 	}
-	LOGF("Mouse-to-joystick relative mode failed: %s\n", SDL_GetError());
+	LOGW("Mouse-to-joystick relative mode failed: %s\n", SDL_GetError());
 	return false;
 }
 
@@ -432,6 +437,35 @@ void HostInputKey(int key_code, bool down) {
 }
 
 void HostInputMouseButton(uint8_t mouse_button, bool down) {
+	if (mouse_button == SDL_BUTTON_LEFT) {
+		g_touchpad_mouse_left_down = down;
+	}
+
+	if (mouse_button == SDL_BUTTON_RIGHT) {
+		g_touchpad_mouse_right_down = down;
+
+		if (down) {
+			g_touchpad_finger = 1;
+		} else {
+			g_touchpad_finger = 0;
+		}
+	}
+
+	if (mouse_button == SDL_BUTTON_LEFT || mouse_button == SDL_BUTTON_RIGHT) {
+		if (down) {
+			g_touchpad_mouse_x = 0.5f;
+			g_touchpad_mouse_y = 0.5f;
+		}
+
+		SetTouchPad(
+			g_touchpad_finger,
+			g_touchpad_mouse_x,
+			g_touchpad_mouse_y,
+			down
+		);
+		return;
+	}
+
 	const auto& map = GetInputMap();
 	if (map.Custom() && mouse_button != 0) {
 		SetControl(map.FindMouseButton(mouse_button), down);
@@ -475,6 +509,31 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 	}
 	timeout              = timeout < 0 ? max_wait_ms : std::min(timeout, max_wait_ms);
 	const bool has_event = SDL_WaitEventTimeout(event, timeout);
+
+	if (has_event && event->type == SDL_EVENT_MOUSE_MOTION && g_touchpad_mouse_left_down && event->motion.windowID == SDL_GetWindowID(g_mouse_window)) {
+		int width = 0;
+		int height = 0;
+		SDL_GetWindowSize(g_mouse_window, &width, &height);
+
+		if (width > 0 && height > 0) {
+			g_touchpad_mouse_x = std::clamp(
+				g_touchpad_mouse_x + event->motion.xrel / static_cast<float>(width),
+				0.0f, 1.0f
+			);
+
+			g_touchpad_mouse_y = std::clamp(
+				g_touchpad_mouse_y + event->motion.yrel / static_cast<float>(height),
+				0.0f, 1.0f
+			);
+
+			SetTouchPad(
+				g_touchpad_finger,
+				g_touchpad_mouse_x,
+				g_touchpad_mouse_y,
+				true
+			);
+		}
+	}
 
 	if (Config::HideCursorEnabled()) {
 		const auto now_ms = SDL_GetTicks();

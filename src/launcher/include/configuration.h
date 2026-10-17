@@ -122,6 +122,8 @@ public:
 	bool                   readback_linear_images      = false;
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
+	bool                   skip_bvh_intersections      = false;
+	bool                   skip_mesh_fallback_draws    = false;
 	bool                   trophy_enabled              = true;
 	bool                   skip_notice_screen          = false;
 	bool                   network_connected           = false;
@@ -159,6 +161,8 @@ public:
 		readback_linear_images      = other.readback_linear_images;
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
 		tessellation_enabled        = other.tessellation_enabled;
+		skip_bvh_intersections      = other.skip_bvh_intersections;
+		skip_mesh_fallback_draws    = other.skip_mesh_fallback_draws;
 		trophy_enabled              = other.trophy_enabled;
 		skip_notice_screen          = other.skip_notice_screen;
 		network_connected           = other.network_connected;

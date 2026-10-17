@@ -113,6 +113,27 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	}
 };
 
+// Fixed per-workgroup layout shared by the compute lowering and its generated vertex stage.
+// All offsets are in 32-bit words. Each logical output owns one vec4-sized slot; scalar clip
+// and cull distances occupy its first word. Primitive slots hold packed triangle indices and
+// one word for each logical output (used by per-primitive Layer exports).
+struct ShaderMeshFallbackLayout {
+	uint32_t vertex_stride_dwords      = 0;
+	uint32_t primitive_stride_dwords   = 0;
+	uint32_t primitive_data_offset     = 0;
+	uint32_t group_stride_dwords       = 0;
+
+	[[nodiscard]] static constexpr ShaderMeshFallbackLayout Create(uint32_t max_vertices,
+	                                                               uint32_t max_primitives,
+	                                                               uint32_t output_count) {
+		const uint32_t vertex_stride = output_count * 4u;
+		const uint32_t primitive_stride = output_count + 1u;
+		const uint32_t primitive_offset = 2u + max_vertices * vertex_stride;
+		return {vertex_stride, primitive_stride, primitive_offset,
+		        primitive_offset + max_primitives * primitive_stride};
+	}
+};
+
 struct ShaderTessellationInputInfo {
 	uint32_t input_control_points  = 0;
 	uint32_t output_control_points = 0;

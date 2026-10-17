@@ -14,6 +14,8 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -26,6 +28,7 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+std::atomic<uint64_t> g_download_diagnostic_count {0};
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -159,6 +162,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_FUNCTION();
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -216,8 +220,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	after.size          = total_size;
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands |
-	                           vk::PipelineStageFlagBits::eHost,
+	                       vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
+	const auto copy_count = copies.size();
 	auto publish = [this, mapped, offset, total_size, buffer_address,
 	                copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
@@ -230,8 +235,29 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
-		m_scheduler.Wait(tick);
-		m_scheduler.WaitPriorityOperations(tick);
+		{
+			KYTY_PROFILER_BLOCK("DownloadBufferMemory: Wait GPU");
+			const auto wait_start = std::chrono::steady_clock::now();
+			m_scheduler.Wait(tick);
+			const auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+			                         std::chrono::steady_clock::now() - wait_start)
+			                         .count();
+			const auto diagnostic_index =
+			    g_download_diagnostic_count.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (diagnostic_index % 128 == 0) {
+				LOGD("GPU readback wait sample #%" PRIu64
+				     ": buffer=0x%016" PRIx64 " buffer_size=%" PRIu64
+				     " request=0x%016" PRIx64 "+%" PRIu64 " copies=%zu bytes=%" PRIu64
+				     " tick=%" PRIu64 " wait=%" PRId64 " us\n",
+				     diagnostic_index, buffer_address, buffer.Size(), vaddr, size, copy_count,
+				     total_size, tick, wait_us);
+				m_scheduler.LogRecentSubmissionsForReadback(tick);
+			}
+		}
+		{
+			KYTY_PROFILER_BLOCK("DownloadBufferMemory: Wait priority ops");
+			m_scheduler.WaitPriorityOperations(tick);
+		}
 		publish();
 	}
 	return true;
@@ -294,6 +320,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	KYTY_PROFILER_FUNCTION();
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",

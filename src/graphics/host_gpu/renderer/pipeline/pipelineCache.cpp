@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -38,6 +39,10 @@
 namespace Libs::Graphics {
 
 namespace {
+
+constexpr uint64_t DiagnosticComputeShaderHash = 0x7d6ab87e6c984bb7ull;
+constexpr uint64_t ReadbackSuspectComputeShaderHash = 0xe0351f757c67c5f9ull;
+constexpr uint64_t ReadbackStallComputeShaderHash = 0x400fe8bf533bc575ull;
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -97,10 +102,15 @@ std::string PipelineCacheTitleId() {
 }
 
 template <typename... Args>
-void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
+void PipelineCacheLogAt(Log::Level level, fmt::format_string<Args...> format, Args&&... args) {
 	auto message = fmt::format(format, std::forward<Args>(args)...);
 	message += '\n';
-	Log::WriteToConsoleAndLog(message);
+	Log::WriteToConsoleAndLog(level, message);
+}
+
+template <typename... Args>
+void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
+	PipelineCacheLogAt(Log::Level::Info, format, std::forward<Args>(args)...);
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
@@ -111,8 +121,8 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
-                     const std::vector<uint32_t>& spirv) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+                     const std::vector<uint32_t>& spirv, bool force = false) {
+	if (!force && !Config::GraphicsDebugDumpEnabled()) {
 		return;
 	}
 	static std::atomic_int id = 0;
@@ -126,11 +136,15 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 		return;
 	}
 	file.Write(spirv.data(), spirv.size() * sizeof(uint32_t));
+	if (force) {
+		const auto path_text = Common::PathToString(path);
+		LOGE("Saved SPIR-V shader dump: %s", path_text.c_str());
+	}
 }
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
-                        std::span<const uint32_t> code) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+                        std::span<const uint32_t> code, bool force = false) {
+	if (!force && !Config::GraphicsDebugDumpEnabled()) {
 		return;
 	}
 	EXIT_IF(code.empty());
@@ -145,11 +159,16 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 		return;
 	}
 	file.Write(code.data(), code.size_bytes());
+	if (force) {
+		const auto path_text = Common::PathToString(path);
+		LOGE("Saved original shader dump: %s", path_text.c_str());
+	}
 }
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
-                         const std::vector<uint32_t>& spirv, bool maintenance8_enabled) {
-	if (!Config::ShaderValidationEnabled()) {
+                         const std::vector<uint32_t>& spirv, bool maintenance8_enabled,
+                         bool force = false) {
+	if (!force && !Config::ShaderValidationEnabled()) {
 		return true;
 	}
 	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
@@ -173,8 +192,8 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_COMMENT) |
 	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_INDENT) |
 	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_COLOR));
-	LOGF_COLOR(Log::Color::BrightRed, "%s SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s",
-	           label, shader_hash, messages.c_str());
+	LOGE("%s SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s", label, shader_hash,
+	     messages.c_str());
 	LOGF("%s\n", text.c_str());
 	return false;
 }
@@ -223,6 +242,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
+		ShaderProgram                                mesh_fallback_vertex;
 	};
 
 	struct SourceEntry {
@@ -298,13 +318,18 @@ struct PipelineCache::ProgramCache {
 	                               std::span<const uint32_t> function_code) {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
-		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
-		                         options.maintenance8_enabled)) {
-			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+	if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
+	                         options.maintenance8_enabled, options.mesh_shader_fallback)) {
+			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv, true);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
 		}
-		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		const bool diagnostic_shader =
+		    options.stage == ShaderType::Compute &&
+		    (options.shader_hash == DiagnosticComputeShaderHash ||
+		     options.shader_hash == ReadbackSuspectComputeShaderHash ||
+		     options.shader_hash == ReadbackStallComputeShaderHash);
+		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv, diagnostic_shader);
 
 		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
@@ -312,11 +337,28 @@ struct PipelineCache::ProgramCache {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
+		auto compiled_program = std::move(result.program).TakeCompiledInfo();
+		ShaderProgram fallback_vertex {};
+		if (options.mesh_shader_fallback) {
+			const auto fallback_spirv = ShaderRecompiler::Spirv::Emitter::EmitMeshFallbackVertexProgram(
+			    compiled_program, options.input_info.vertex->mesh);
+			if (!ValidateShaderSpirv("ShaderRecompiler MFBVS", options.shader_hash,
+			                         fallback_spirv, options.maintenance8_enabled, true)) {
+				DumpShaderSpirv("mfbvs", options.shader_hash, fallback_spirv, true);
+				EXIT("mesh fallback vertex shader failed hash=0x%016" PRIx64
+				     ": SPIR-V validation failed\n", options.shader_hash);
+			}
+			DumpShaderSpirv("mfbvs", options.shader_hash, fallback_spirv);
+			const auto fallback_module = CompileSPV(fallback_spirv, graphics.device);
+			EXIT_IF(fallback_module == nullptr);
+			fallback_vertex = {.id = ++next_shader_id, .module = fallback_module};
+		}
 		return {
 		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = std::move(specialization),
-		    .program        = std::move(result.program).TakeCompiledInfo(),
+		    .program        = std::move(compiled_program),
 		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .mesh_fallback_vertex = fallback_vertex,
 		};
 	}
 
@@ -388,6 +430,8 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
 		options.maintenance8_enabled = graphics.maintenance8_enabled;
+		options.mesh_shader_fallback = stage == ShaderType::Mesh && !graphics.mesh_shader_enabled;
+		options.fsb = false;
 		options.shader_hash = params.hash;
 		options.user_data   = user_data;
 		options.back_code      = params.back_code;
@@ -406,7 +450,12 @@ struct PipelineCache::ProgramCache {
 		} else {
 			options.wave_size = input_info.wave_size;
 		}
-		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
+		const bool diagnostic_shader =
+		    stage == ShaderType::Compute &&
+		    (options.shader_hash == DiagnosticComputeShaderHash ||
+		     options.shader_hash == ReadbackSuspectComputeShaderHash ||
+		     options.shader_hash == ReadbackStallComputeShaderHash);
+		DumpShaderOriginal(stage_name, options.shader_hash, params.code, diagnostic_shader);
 		ShaderRecompiler::ShaderSource source;
 		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
@@ -441,6 +490,12 @@ struct PipelineCache::ProgramCache {
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
 		const auto& permutation = entry->second.permutations.back();
+		if (permutation.mesh_fallback_vertex) {
+			const auto [iter, inserted] = mesh_fallback_vertices.emplace(
+			    permutation.handle.id, permutation.mesh_fallback_vertex);
+			(void)iter;
+			EXIT_IF(!inserted);
+		}
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
@@ -460,7 +515,15 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(GraphicContext& graphics): graphics(graphics) {
+	ShaderProgram GetMeshFallbackVertex(uint64_t mesh_program_id) const {
+		if (const auto found = mesh_fallback_vertices.find(mesh_program_id);
+		    found != mesh_fallback_vertices.end()) {
+			return found->second;
+		}
+		EXIT("mesh fallback vertex module is missing for shader id=%" PRIu64 "\n", mesh_program_id);
+	}
+
+	explicit ProgramCache(GraphicContext& graphics): graphics(graphics), fsb(graphics.fsb_enabled) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -468,13 +531,18 @@ struct PipelineCache::ProgramCache {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
 				graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
+				if (permutation.mesh_fallback_vertex.module != nullptr) {
+					graphics.device.destroyShaderModule(permutation.mesh_fallback_vertex.module, nullptr);
+				}
 			}
 		}
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	std::unordered_map<uint64_t, ShaderProgram>                 mesh_fallback_vertices;
 	ProgramKey                                                  lookup_key;
 	GraphicContext&                                             graphics;
+	bool fsb;
 	uint64_t                                                    next_shader_id = 0;
 };
 
@@ -567,15 +635,17 @@ void PipelineCache::InitializeDriverCache() {
 	create.pInitialData    = initial_data.empty() ? nullptr : initial_data.data();
 	auto result = m_graphics.device.createPipelineCache(&create, nullptr, &m_driver_cache);
 	if (result != vk::Result::eSuccess && !initial_data.empty()) {
-		PipelineCacheLog("Vulkan pipeline cache: driver rejected {} ({}); starting empty", path,
-		                 vk::to_string(result));
+		PipelineCacheLogAt(Log::Level::Warning,
+		                   "Vulkan pipeline cache: driver rejected {} ({}); starting empty", path,
+		                   vk::to_string(result));
 		initial_data.clear();
 		create.initialDataSize = 0;
 		create.pInitialData    = nullptr;
 		result = m_graphics.device.createPipelineCache(&create, nullptr, &m_driver_cache);
 	}
 	if (result != vk::Result::eSuccess) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled ({})", vk::to_string(result));
+		PipelineCacheLogAt(Log::Level::Error, "Vulkan pipeline cache: disabled ({})",
+		                   vk::to_string(result));
 		m_driver_cache = nullptr;
 		return;
 	}
@@ -610,8 +680,9 @@ void PipelineCache::Save() {
 	}
 	if (result != vk::Result::eSuccess || size == 0 ||
 	    size > std::numeric_limits<uint32_t>::max()) {
-		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
-		                 vk::to_string(result), size);
+		PipelineCacheLogAt(Log::Level::Error,
+		                   "Vulkan pipeline cache: save failed ({}, {} bytes)",
+		                   vk::to_string(result), size);
 		return;
 	}
 	payload.resize(size);
@@ -619,7 +690,8 @@ void PipelineCache::Save() {
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
-		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
+		PipelineCacheLogAt(Log::Level::Error,
+		                   "Vulkan pipeline cache: failed to create cache directory");
 		return;
 	}
 	auto temp_path = m_driver_cache_path;
@@ -635,8 +707,8 @@ void PipelineCache::Save() {
 	file.Close();
 	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
 	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
-		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
-		                 Common::PathToString(m_driver_cache_path));
+		PipelineCacheLogAt(Log::Level::Error, "Vulkan pipeline cache: failed to write {}",
+		                   Common::PathToString(m_driver_cache_path));
 		return;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
@@ -657,11 +729,30 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
+	GraphicsPrograms result;
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
-		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
+		result.mesh_fallback = !m_graphics.mesh_shader_enabled;
+		if (result.mesh_fallback) {
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				LOGF("Mesh shader fallback active: lowering mesh workgroups to compute and vertex stages\n");
+			}
+		}
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
+		const auto& device_limits = m_graphics.GetPhysicalDeviceProperties().limits;
+		if (result.mesh_fallback) {
+			const auto logical_threads = mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
+			if (logical_threads > device_limits.maxComputeWorkGroupInvocations ||
+			    mesh.threads_num[0] > device_limits.maxComputeWorkGroupSize[0] ||
+			    mesh.threads_num[1] > device_limits.maxComputeWorkGroupSize[1] ||
+			    mesh.threads_num[2] > device_limits.maxComputeWorkGroupSize[2] ||
+			    mesh.lds_size_dwords * sizeof(uint32_t) > device_limits.maxComputeSharedMemorySize) {
+				EXIT("mesh fallback exceeds host compute limits: threads=%u LDS=%u\n",
+				     logical_threads, mesh.lds_size_dwords);
+			}
+		} else {
 		const auto& limits      = m_graphics.mesh_shader_properties;
 		const auto  logical_threads =
 		    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
@@ -674,6 +765,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
 			EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
 			     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+		}
 		}
 	}
 	ShaderParams pixel_params;
@@ -736,13 +828,18 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		clip.enabled = true;
 	}
 	uint32_t          push_data_cursor =
-	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
-	GraphicsPrograms  result;
+	    mesh_active ? (m_graphics.mesh_shader_enabled
+	                       ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount
+	                       : ShaderRecompiler::IR::PushData::MeshFallbackDrawDwordCount)
+	                : 0;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+	}
+	if (result.mesh_fallback) {
+		result.mesh_fallback_vertex = m_program_cache->GetMeshFallbackVertex(result.vertex[0].id);
 	}
 	return result;
 }
@@ -786,8 +883,12 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	const auto ps_id = ps_active ? pixel_program.id : 0;
 
 	GraphicsPipelineKey key {};
-	for (uint32_t i = 0; i < programs.vertex.size(); i++) {
-		key.vertex_shader_ids[i] = programs.vertex[i].id;
+	if (programs.mesh_fallback) {
+		key.vertex_shader_ids[0] = programs.mesh_fallback_vertex.id;
+	} else {
+		for (uint32_t i = 0; i < programs.vertex.size(); i++) {
+			key.vertex_shader_ids[i] = programs.vertex[i].id;
+		}
 	}
 	key.ps_shader_id            = ps_id;
 	auto& static_params         = key.static_params;
@@ -820,7 +921,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 			static_params.blend_enable[slot] = false;
 			static std::atomic_bool warned = false;
 			if (!warned.exchange(true, std::memory_order_relaxed)) {
-				Log::WriteToConsoleAndLog(fmt::format(
+				Log::WriteWarningToConsoleAndLog(fmt::format(
 				    "Warning: blending disabled for unsupported color mapping "
 				    "(slot={} mapping=0x{:02x} color={}/{} alpha={}/{} separate={}).\n",
 				    slot, colors[i].export_mapping.packed, bc.color_srcblend, bc.color_destblend,
@@ -892,8 +993,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	const auto& clip_control               = ctx.GetClipControl();
 	static_params.negative_one_to_one      = !clip_control.dx_clip_space;
 	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
-	static_params.topology                 = topology;
-	static_params.primitive_restart_enable = primitive_restart_enable;
+	static_params.topology                 = programs.mesh_fallback
+	                                            ? vk::PrimitiveTopology::eTriangleList
+	                                            : topology;
+	static_params.primitive_restart_enable = programs.mesh_fallback ? false : primitive_restart_enable;
 	static_params.samples                  = attachment_samples;
 	static_params.sample_shading_enable =
 	    ps_active && attachment_samples > 1 && ps_input_info->ps_sample_shading;

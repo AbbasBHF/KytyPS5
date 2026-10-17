@@ -183,7 +183,7 @@ static void ToggleDesktopFullscreen() {
 	const auto flags = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
 	const bool fullscreen = (flags & SDL_WINDOW_FULLSCREEN) != 0u;
 	if (!SDL_SetWindowFullscreen(g_window->window, !fullscreen)) {
-		LOGF("Toggle fullscreen failed: %s\n", SDL_GetError());
+		LOGW("Toggle fullscreen failed: %s\n", SDL_GetError());
 	}
 }
 

@@ -141,7 +141,7 @@ static int GetAvailableSpaceKb(const AppContentMountPoint* mount_point,
 	std::error_code ec;
 	const auto      space = std::filesystem::space(std::filesystem::current_path(), ec);
 	if (ec) {
-		LOGF("\t filesystem::space failed: %s\n", ec.message().c_str());
+		LOGW("\t filesystem::space failed: %s\n", ec.message().c_str());
 		*available_space_kb = 1024u * 1024u;
 	} else {
 		*available_space_kb = static_cast<size_t>(space.available / 1024u);

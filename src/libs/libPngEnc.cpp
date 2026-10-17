@@ -305,7 +305,7 @@ static int32_t KYTY_SYSV_ABI PngEncEncode(void* handle, const PngEncEncodeParam*
 	}
 
 	if (ok == 0) {
-		LOGF("\t encode failed\n");
+		LOGE("\t encode failed\n");
 		return PNG_ENC_ERROR_FATAL;
 	}
 

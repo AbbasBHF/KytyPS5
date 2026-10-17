@@ -93,7 +93,7 @@ int LoadExec(const char* path, const char* const argv[]) {
 	PROCESS_INFORMATION process {};
 	if (!CreateProcessW(executable, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
 	                    nullptr, nullptr, &startup, &process)) {
-		LOGF("LoadExec: process creation failed: %lu\n", GetLastError());
+		LOGE("LoadExec: process creation failed: %lu\n", GetLastError());
 		return SYSTEM_SERVICE_ERROR_INTERNAL;
 	}
 	CloseHandle(process.hThread);
@@ -119,7 +119,7 @@ int LoadExec(const char* path, const char* const argv[]) {
 	if (close_range(3, ~0u, CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) == 0) {
 		execvp(host_argv[0], host_argv.data());
 	}
-	LOGF("LoadExec failed: %s\n", std::strerror(errno));
+	LOGE("LoadExec failed: %s\n", std::strerror(errno));
 #endif
 	return SYSTEM_SERVICE_ERROR_INTERNAL;
 #else

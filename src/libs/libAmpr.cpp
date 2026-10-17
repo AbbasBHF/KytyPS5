@@ -411,7 +411,7 @@ static int KYTY_SYSV_ABI GetFileStat(uint32_t file_id, LibKernel::FileSystem::Fi
 
 	std::filesystem::path host_path;
 	if (!AprShared::TryGetHostPath(file_id, &host_path)) {
-		LOGF("\tAPR stat failed for unknown file id: 0x%08" PRIx32 "\n", file_id);
+		LOGE("\tAPR stat failed for unknown file id: 0x%08" PRIx32 "\n", file_id);
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_ENOENT);
 	}
 	if (!AprShared::IsValidGuestRange(reinterpret_cast<uint64_t>(st), sizeof(*st), true)) {
@@ -433,7 +433,7 @@ static int KYTY_SYSV_ABI GetFileSize(uint32_t file_id, uint64_t* size) {
 
 	std::filesystem::path host_path;
 	if (!AprShared::TryGetHostPath(file_id, &host_path)) {
-		LOGF("\tAPR size failed for unknown file id: 0x%08" PRIx32 "\n", file_id);
+		LOGE("\tAPR size failed for unknown file id: 0x%08" PRIx32 "\n", file_id);
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_ENOENT);
 	}
 
@@ -1174,7 +1174,7 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 		const auto& command = *payload;
 		std::filesystem::path host_path;
 		if (!AprShared::TryGetHostPath(command.file_id, &host_path)) {
-			LOGF("\tAPR submit failed for unknown file id: 0x%08" PRIx32 "\n", command.file_id);
+			LOGE("\tAPR submit failed for unknown file id: 0x%08" PRIx32 "\n", command.file_id);
 			return LibKernel::KERNEL_ERROR_ENOENT;
 		}
 
@@ -1182,7 +1182,7 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 		auto     result = ReadHostFileToGuest(host_path, command.file_offset, command.destination,
 		                                      command.size, &bytes_read);
 		if (result != OK) {
-			LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32 ", path=%s\n",
+			LOGE("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32 ", path=%s\n",
 			     command.file_id, static_cast<uint32_t>(result), Common::PathToString(host_path).c_str());
 			return result;
 		}
@@ -1194,7 +1194,7 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 		    eq, static_cast<uintptr_t>(command.id), LibKernel::EventQueue::KERNEL_EVFILT_AMPR,
 		    reinterpret_cast<void*>(command.data));
 		if (result != OK) {
-			LOGF("\tAPR submit event failed: eq=0x%016" PRIx64 ", id=%" PRId32
+			LOGE("\tAPR submit event failed: eq=0x%016" PRIx64 ", id=%" PRId32
 			     ", result=0x%08" PRIx32 "\n",
 			     command.eq, command.id, static_cast<uint32_t>(result));
 			return result;
@@ -1217,7 +1217,7 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 		}
 
 		if (result != OK) {
-			LOGF("\tAMM submit command failed: kind=%u va=0x%016" PRIx64 " dmem=0x%016" PRIx64
+			LOGE("\tAMM submit command failed: kind=%u va=0x%016" PRIx64 " dmem=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " type=%" PRId32 " prot=0x%08" PRIx32 " result=0x%08" PRIx32
 			     "\n",
 			     static_cast<uint32_t>(command.kind), command.va, command.dmem_offset, command.size,

@@ -20,12 +20,17 @@ struct Lifecycle {
 };
 
 enum class Direction { Silent, Console, File };
+enum class Level { Trace, Debug, Info, Warning, Error, Critical };
 
 Direction GetDirection();
 bool      IsSilent();
+void      Write(Level level, std::string_view text);
+void      Write(Level level, fmt::text_style style, std::string_view text);
 void      Write(std::string_view text);
 void      Write(fmt::text_style style, std::string_view text);
 void      WriteToConsoleAndLog(std::string_view text);
+void      WriteToConsoleAndLog(Level level, std::string_view text);
+void      WriteWarningToConsoleAndLog(std::string_view text);
 void      WriteFatal(std::string_view text);
 void      WriteFatal(fmt::text_style style, std::string_view text);
 void      Flush();
@@ -53,7 +58,37 @@ inline constexpr auto BrightWhite   = fmt::fg(fmt::terminal_color::bright_white)
 #define LOGF(...)                                                                                  \
 	do {                                                                                           \
 		if (!::Log::IsSilent()) {                                                                  \
-			::Log::Write(::fmt::sprintf(__VA_ARGS__));                                             \
+			::Log::Write(::Log::Level::Info, ::fmt::sprintf(__VA_ARGS__));                        \
+		}                                                                                          \
+	} while (false)
+#define LOGD(...)                                                                                  \
+	do {                                                                                           \
+		if (!::Log::IsSilent()) {                                                                  \
+			::Log::Write(::Log::Level::Debug, ::fmt::sprintf(__VA_ARGS__));                        \
+		}                                                                                          \
+	} while (false)
+#define LOGT(...)                                                                                  \
+	do {                                                                                           \
+		if (!::Log::IsSilent()) {                                                                  \
+			::Log::Write(::Log::Level::Trace, ::fmt::sprintf(__VA_ARGS__));                        \
+		}                                                                                          \
+	} while (false)
+#define LOGW(...)                                                                                  \
+	do {                                                                                           \
+		if (!::Log::IsSilent()) {                                                                  \
+			::Log::Write(::Log::Level::Warning, ::fmt::sprintf(__VA_ARGS__));                      \
+		}                                                                                          \
+	} while (false)
+#define LOGE(...)                                                                                  \
+	do {                                                                                           \
+		if (!::Log::IsSilent()) {                                                                  \
+			::Log::Write(::Log::Level::Error, ::fmt::sprintf(__VA_ARGS__));                        \
+		}                                                                                          \
+	} while (false)
+#define LOGW_COLOR(style, ...)                                                                    \
+	do {                                                                                           \
+		if (!::Log::IsSilent()) {                                                                  \
+			::Log::Write(::Log::Level::Warning, (style), ::fmt::sprintf(__VA_ARGS__));              \
 		}                                                                                          \
 	} while (false)
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)

@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include "common/emulatorConfig.h"
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
@@ -223,7 +225,7 @@ uint32_t Boxes(EmitterState& s, uint32_t first, uint32_t second, uint32_t half,
 } // namespace
 
 void DefineBvhIntersect(EmitterState& s) {
-	if (!s.program.info.bvh) return;
+	if (!s.program.info.bvh || Config::SkipBvhIntersections()) return;
 	const auto u = TypeU32(s), f = TypeF32(s), b = TypeBool(s), wide = TypeU64(s);
 	const auto vec4 = TypeU32Vector(s, 4), vec3 = TypeF32Vector(s, 3);
 	const auto signature = s.builder.Type(spv::OpTypeFunction, vec4, vec4, wide, f, vec3, vec3, vec3);
@@ -329,8 +331,23 @@ uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto* ray = ctx.ImageAddress(inst.Arg(1));
 	const auto node_words = inst.Flags<uint32_t>();
 	if (ray == nullptr || (node_words != 1u && node_words != 2u) ||
-	    ray->NumArgs() < node_words + 10u || s.bvh_intersect_function == 0)
+	    ray->NumArgs() < node_words + 10u ||
+	    (!Config::SkipBvhIntersections() && s.bvh_intersect_function == 0))
 		ctx.Fail(inst, "BVH intersection requires its node pointer, ray components and shared function");
+	if (Config::SkipBvhIntersections()) {
+		const auto u = TypeU32(s), b = TypeBool(s);
+		const auto kind = Binary(s, spv::OpBitwiseAnd, u,
+		                         Unary(s, spv::OpUConvert, u, ctx.Arg(*ray, 0)), ConstantU32(s, 7));
+		const auto triangle = Binary(s, spv::OpULessThan, b, kind, ConstantU32(s, 4));
+		const std::array miss_words {
+		    Select(s, u, triangle, ConstantU32(s, 0x7f800000), ConstantU32(s, ~0u)),
+		    Select(s, u, triangle, ConstantU32(s, 0x3f800000), ConstantU32(s, ~0u)),
+		    ConstantU32(s, ~0u),
+		    Select(s, u, triangle, ConstantU32(s, 0), ConstantU32(s, ~0u))};
+		const auto miss = Vector(s, TypeU32Vector(s, 4), miss_words);
+		return EmitValueOrDefaultIfCondition(s, ctx.Arg(inst, 2), TypeU32Vector(s, 4),
+		                                     ConstantU32CompositeZero(s, 4), [&] { return miss; });
+	}
 	const auto vector = [&](uint32_t first) {
 		Vec3 values;
 		for (uint32_t i = 0; i < 3; ++i)

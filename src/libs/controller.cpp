@@ -434,7 +434,7 @@ void GameController::Connect(int id) {
 			for (auto sensor: {SDL_SENSOR_ACCEL, SDL_SENSOR_GYRO}) {
 				if (SDL_GamepadHasSensor(pad, sensor) &&
 				    !SDL_SetGamepadSensorEnabled(pad, sensor, true)) {
-					LOGF("\t enabling controller sensor failed: %s\n", SDL_GetError());
+					LOGE("\t enabling controller sensor failed: %s\n", SDL_GetError());
 				}
 			}
 		}
@@ -767,7 +767,7 @@ void GameController::ApplyVibration() {
 	const auto large = static_cast<uint16_t>(large_motor * 0x101U);
 	const auto small = static_cast<uint16_t>(small_motor * 0x101U);
 	if (!SDL_RumbleGamepad(pad, large, small, duration)) {
-		LOGF("\t rumble failed: %s\n", SDL_GetError());
+		LOGE("\t rumble failed: %s\n", SDL_GetError());
 	}
 }
 

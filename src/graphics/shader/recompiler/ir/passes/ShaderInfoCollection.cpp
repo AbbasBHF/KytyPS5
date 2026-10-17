@@ -141,7 +141,7 @@ void CollectComputeInputs(const ShaderComputeInputInfo* compute, ShaderInfo& inf
 	}
 }
 
-void AddBuiltinInput(ShaderInfo& info, StageInputKind kind) {
+void AddBuiltinInput(ShaderInfo& info, StageInputKind kind, bool fsb) {
 	switch (kind) {
 		case StageInputKind::VertexIndex:
 			AddInput(info, kind, 0, 1, "gl_VertexIndex");
@@ -167,10 +167,14 @@ void AddBuiltinInput(ShaderInfo& info, StageInputKind kind) {
 			[[fallthrough]];
 		case StageInputKind::BaryCoordSmooth:
 		case StageInputKind::BaryCoordSmoothCentroid:
-			AddInput(info, StageInputKind::BaryCoordSmooth, 0, 3, "gl_BaryCoordKHR");
+			if (fsb) {
+				AddInput(info, StageInputKind::BaryCoordSmooth, 0, 3, "gl_BaryCoordKHR");
+			}
 			break;
 		case StageInputKind::BaryCoordNoPerspective:
-			AddInput(info, kind, 0, 3, "gl_BaryCoordNoPerspKHR");
+			if (fsb) {
+				AddInput(info, kind, 0, 3, "gl_BaryCoordNoPerspKHR");
+			}
 			break;
 		case StageInputKind::WorkgroupId:
 			AddInput(info, kind, 0, 3, "gl_WorkGroupID");
@@ -284,7 +288,7 @@ struct InputUsage {
 	}
 };
 
-void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs,
+void Visit(Program& program, bool fsb, ShaderStageInputInfo input_info, InputUsage& inputs,
            const Inst& inst) {
 	auto& info = program.info;
 	const auto op = inst.GetOpcode();
@@ -399,6 +403,9 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			break;
 		}
 		case ValueOpcode::GetInterpolationParameter: {
+			if (!fsb) {
+				break;
+			}
 			if (program.stage != ShaderType::Pixel || !inst.Arg(0).IsImmediate() ||
 			    inst.Arg(0).GetType() != Type::U32 || !inst.Arg(1).IsImmediate() ||
 			    inst.Arg(1).GetType() != Type::U32 || !inst.Arg(2).IsImmediate() ||
@@ -551,7 +558,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 
 } // namespace
 
-void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
+void CollectShaderInfo(Program& program, bool fsb, ShaderStageInputInfo input_info) {
 	if (!program.resource_tracking_complete || program.shader_info_complete) {
 		return Fail(!program.resource_tracking_complete ? "shader resources were not tracked"
 		                                                : "shader info already collected");
@@ -574,7 +581,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	InputUsage inputs;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
-			Visit(program, input_info, inputs, inst);
+			Visit(program, fsb, input_info, inputs, inst);
 		}
 	}
 	for (uint32_t index = 0; index < inputs.user_data.size(); index++) {
@@ -598,7 +605,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		default: return Fail("unsupported shader stage for info collection");
 	}
 	for (uint32_t i = 0; i < inputs.builtin_count; i++) {
-		AddBuiltinInput(info, inputs.builtins[i]);
+		AddBuiltinInput(info, inputs.builtins[i], fsb);
 	}
 	program.shader_info_complete = true;
 }

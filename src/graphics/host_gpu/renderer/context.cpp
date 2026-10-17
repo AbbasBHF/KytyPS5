@@ -14,7 +14,30 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+
+#if defined(TRACY_ENABLE)
+#  define TRACY_VK_USE_SYMBOL_TABLE
+#  include <tracy/TracyVulkan.hpp>
+#endif
+
 namespace Libs::Graphics {
+
+#if defined(TRACY_ENABLE)
+struct TracyGpuCommandBufferZone {
+	static constexpr tracy::SourceLocationData source_location {
+	    "Emulator command buffer", "CommandBuffer", __FILE__,
+	    static_cast<uint32_t>(__LINE__), 0};
+	std::optional<tracy::VkCtxScope> scope;
+
+	TracyGpuCommandBufferZone(TracyVkCtx context, VkCommandBuffer command_buffer) {
+		scope.emplace(context, &source_location, command_buffer, true);
+	}
+};
+#else
+struct TracyGpuCommandBufferZone {};
+#endif
+
+CommandBuffer::~CommandBuffer() = default;
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
     : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
@@ -30,6 +53,15 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
+	m_debug_op        = static_cast<uint32_t>(CommandBufferDebugOp::Unknown);
+	m_debug_submit_id = 0;
+	m_debug_arg0      = 0;
+	m_debug_arg1      = 0;
+	m_debug_arg2      = 0;
+	m_debug_arg3      = 0;
+	m_debug_arg4      = 0;
+	m_debug_shader_hash = 0;
+	m_mesh_fallback_debug_valid = false;
 	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
@@ -40,8 +72,20 @@ void CommandBuffer::Begin() {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 
+void CommandBuffer::BeginGpuProfileZone(void* tracy_gpu_context) const {
+#if defined(TRACY_ENABLE)
+	if (tracy_gpu_context != nullptr && tracy::ProfilerAvailable()) {
+		m_gpu_profile_zone = std::make_unique<TracyGpuCommandBufferZone>(
+		    static_cast<TracyVkCtx>(tracy_gpu_context), static_cast<VkCommandBuffer>(Handle()));
+	}
+#else
+	(void)tracy_gpu_context;
+#endif
+}
+
 void CommandBuffer::End() const {
 	EndRendering();
+	m_gpu_profile_zone.reset();
 	auto buffer = Handle();
 
 	auto result = buffer.end();
@@ -58,6 +102,19 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg2      = arg2;
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
+	m_debug_shader_hash = 0;
+}
+
+void CommandBuffer::SetMeshFallbackDebugInfo(uint64_t submit_id, uint32_t groups_x,
+	                                         uint32_t groups_y, uint32_t index_count,
+	                                         uint32_t group_stride_dwords, uint64_t bytes) {
+	m_mesh_fallback_debug_valid   = true;
+	m_mesh_fallback_submit_id     = submit_id;
+	m_mesh_fallback_groups_x      = groups_x;
+	m_mesh_fallback_groups_y      = groups_y;
+	m_mesh_fallback_index_count   = index_count;
+	m_mesh_fallback_stride_dwords = group_stride_dwords;
+	m_mesh_fallback_bytes         = bytes;
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {

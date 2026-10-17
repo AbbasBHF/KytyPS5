@@ -296,7 +296,7 @@ void Send(const std::vector<PendingReport>& pending) {
 		if (SDL_hid_write(session.hid, report.data.data(), report.data.size()) !=
 		    static_cast<int>(report.data.size())) {
 			session.failed = true;
-			LOGF("DualSenseBluetooth: audio HID write failed: %s\n", SDL_GetError());
+			LOGE("DualSenseBluetooth: audio HID write failed: %s\n", SDL_GetError());
 		}
 	}
 }

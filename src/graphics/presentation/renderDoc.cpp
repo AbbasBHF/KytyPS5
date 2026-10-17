@@ -148,7 +148,7 @@ static void StartCapture() {
 	g_api->StartFrameCapture(nullptr, nullptr);
 	if (g_api->IsFrameCapturing() == 0) {
 		g_state.store(RenderDocState::Idle, std::memory_order_release);
-		LOGF("RenderDoc: capture failed to start\n");
+		LOGW("RenderDoc: capture failed to start\n");
 		return;
 	}
 	g_captured_flips = 0;
@@ -176,7 +176,11 @@ void RenderDocOnGuestFlip(RenderContext& renderer) {
 	} else {
 		const auto ok = g_api->EndFrameCapture(nullptr, nullptr);
 		g_state.store(RenderDocState::Idle, std::memory_order_release);
-		LOGF(ok != 0 ? "RenderDoc: capture finished\n" : "RenderDoc: capture failed\n");
+		if (ok != 0) {
+			LOGF("RenderDoc: capture finished\n");
+		} else {
+			LOGW("RenderDoc: capture failed\n");
+		}
 	}
 }
 

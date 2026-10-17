@@ -963,7 +963,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::S_MEMREALTIME: {
 			static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 			if (!warned.test_and_set(std::memory_order_relaxed)) {
-				Log::WriteToConsoleAndLog(
+				Log::WriteWarningToConsoleAndLog(
 				    "Warning: S_MEMREALTIME uses placeholder UINT64_MAX; real-time clock not implemented.\n");
 			}
 			for (uint32_t component = 0; component < 2; component++) {

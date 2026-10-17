@@ -75,6 +75,8 @@ static void PrintUsage() {
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
+	::printf("  --skip-bvh-intersections <true|false> Treat guest BVH ray queries as misses (diagnostic).\n");
+	::printf("  --skip-mesh-fallback-draws <true|false> Skip mesh draws emulated with compute (diagnostic).\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -249,6 +251,24 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--tessellation") {
 			options.config.tessellation_enabled = true;
+			continue;
+		}
+
+		if (arg == "--skip-bvh-intersections") {
+			if (!NextArg(argc, argv, i, value) ||
+			    !ParseBool(value, options.config.skip_bvh_intersections)) {
+				::printf("invalid boolean for %s\n", arg.c_str());
+				return false;
+			}
+			continue;
+		}
+
+		if (arg == "--skip-mesh-fallback-draws") {
+			if (!NextArg(argc, argv, i, value) ||
+			    !ParseBool(value, options.config.skip_mesh_fallback_draws)) {
+				::printf("invalid boolean for %s\n", arg.c_str());
+				return false;
+			}
 			continue;
 		}
 

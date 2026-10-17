@@ -259,6 +259,8 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (info.tessellation_enabled) {
 		args << "--tessellation";
 	}
+	args << "--skip-bvh-intersections" << BoolArg(info.skip_bvh_intersections);
+	args << "--skip-mesh-fallback-draws" << BoolArg(info.skip_mesh_fallback_draws);
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);

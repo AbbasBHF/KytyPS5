@@ -255,7 +255,7 @@ static void ps_check(const HW::PsStageRegisters& ps, const HW::ShaderRegisters& 
 	if (sh.db_shader_control.other_bits != 0x00000000) {
 		static std::atomic_uint log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
-			LOGF("\t temporary: ignoring unsupported DB_SHADER_CONTROL bits 0x%08" PRIx32 "\n",
+			LOGW("\t temporary: ignoring unsupported DB_SHADER_CONTROL bits 0x%08" PRIx32 "\n",
 			     sh.db_shader_control.other_bits);
 		}
 	}

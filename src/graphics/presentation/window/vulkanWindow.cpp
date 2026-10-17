@@ -216,14 +216,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		vk::PhysicalDeviceVulkan12Features features12 {};
 		vk::PhysicalDeviceVulkan11Features features11 {};
-#if defined(__APPLE__)
-		features12.pNext = &depth_clip_control;
-#else
-		vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR fragment_barycentric {};
-		fragment_barycentric.pNext = &depth_clip_control;
-		features12.pNext           = &fragment_barycentric;
-#endif
-		features11.pNext       = features12.pNext;
+		features11.pNext       = &depth_clip_control;
 		features12.pNext       = &features11;
 		features13.pNext       = &features12;
 		device_features2.pNext = &features13;
@@ -263,7 +256,6 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 #endif
 #if !defined(__APPLE__)
 		check_feature(device_features2.features.depthClamp, "depthClamp");
-		check_feature(fragment_barycentric.fragmentShaderBarycentric, "fragmentShaderBarycentric");
 #endif
 
 		check_feature(features12.samplerMirrorClampToEdge, "samplerMirrorClampToEdge",
@@ -444,6 +436,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	const bool workgroup_layout_extension =
 	    HasExtension(device_extensions, VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME);
+	const bool device_fault_extension = HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+	vk::PhysicalDeviceFaultFeaturesEXT supported_device_fault {};
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR supported_workgroup_layout {};
 	vk::PhysicalDeviceVulkan12Features supported_features12 {};
 	supported_features12.pNext = workgroup_layout_extension ? &supported_workgroup_layout : nullptr;
@@ -465,6 +459,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceFeatures2 supported_features2 {};
 	supported_features2.pNext = mesh_extension ? static_cast<void*>(&supported_mesh)
 	                                           : static_cast<void*>(&supported_features13);
+	if (device_fault_extension) {
+		supported_device_fault.pNext = supported_features2.pNext;
+		supported_features2.pNext = &supported_device_fault;
+	}
 	const bool feedback_extensions =
 	    HasExtension(device_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 	    HasExtension(device_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
@@ -496,8 +494,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = supported_features2.pNext;
 		supported_features2.pNext = &image_atomic_int64;
 	}
+	const bool fsb_extension = HasExtension(device_extensions, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR fragment_barycentric {};
+	if (fsb_extension) {
+		fragment_barycentric.pNext = supported_features2.pNext;
+		supported_features2.pNext = &fragment_barycentric;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+	graphics.device_fault_enabled = device_fault_extension && supported_device_fault.deviceFault;
+	graphics.device_fault_vendor_binary_enabled = graphics.device_fault_enabled &&
+	                                              supported_device_fault.deviceFaultVendorBinary;
+	LOGF("Vulkan device fault diagnostics: enabled=%s vendor_binary=%s\n",
+	     graphics.device_fault_enabled ? "true" : "false",
+	     graphics.device_fault_vendor_binary_enabled ? "true" : "false");
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
@@ -511,7 +521,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features11.pNext = features12.pNext;
 	features12.pNext = &features11;
 	if (!features12.shaderSharedInt64Atomics || !workgroup_layout.workgroupMemoryExplicitLayout) {
-		Log::WriteToConsoleAndLog(fmt::format(
+		Log::WriteWarningToConsoleAndLog(fmt::format(
 		    "WARNING: Native 64-bit LDS atomics are unavailable: shaderSharedInt64Atomics={}, "
 		    "workgroupMemoryExplicitLayout={}. Continuing with the selected Vulkan device.\n",
 		    features12.shaderSharedInt64Atomics != VK_FALSE,
@@ -550,6 +560,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
 	     graphics.SupportsComputeWave64() ? "true" : "false");
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
+	graphics.fsb_enabled = fsb_extension && fragment_barycentric.fragmentShaderBarycentric;
+	if (!graphics.fsb_enabled) {
+		Log::WriteWarningToConsoleAndLog("WARNING: fsb is unavailable\n");
+	}
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
@@ -603,14 +617,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	// }
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
-#if defined(__APPLE__)
 	robustness2.pNext = &features12;
-#else
-	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR fragment_barycentric {};
-	fragment_barycentric.pNext                     = &features12;
-	fragment_barycentric.fragmentShaderBarycentric = VK_TRUE;
-	robustness2.pNext                              = &fragment_barycentric;
-#endif
 	if (robustness2_ext_enabled) {
 		robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
@@ -618,13 +625,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 
 	auto features13 = WindowContext::RequiredVulkan13Features();
-#if defined(__APPLE__)
 	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
 	                                           : static_cast<void*>(&features12);
-#else
-	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
-	                                           : static_cast<void*>(&fragment_barycentric);
-#endif
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl =
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
@@ -652,9 +654,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
 	}
+	if (graphics.fsb_enabled) {
+		fragment_barycentric.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext          = &fragment_barycentric;
+	}
 	if (graphics.maintenance8_enabled) {
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
+	}
+	vk::PhysicalDeviceFaultFeaturesEXT device_fault_features {};
+	if (device_fault_extension) {
+		device_fault_features.deviceFault = graphics.device_fault_enabled;
+		device_fault_features.deviceFaultVendorBinary = graphics.device_fault_vendor_binary_enabled;
+		device_fault_features.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &device_fault_features;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -666,7 +679,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
 	if (result != vk::Result::eSuccess) {
-		LOGF("vkCreateDevice failed: %s\n", vk::to_string(result).c_str());
+		LOGE("vkCreateDevice failed: %s\n", vk::to_string(result).c_str());
 		return nullptr;
 	}
 
@@ -805,8 +818,13 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 	}
 
 	if (!skip) {
-		LOGF_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
-		           static_cast<uint32_t>(message_types), callback_data->pMessage);
+		if (message_severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning) {
+			LOGW_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
+			           static_cast<uint32_t>(message_types), callback_data->pMessage);
+		} else {
+			LOGF_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
+			           static_cast<uint32_t>(message_types), callback_data->pMessage);
+		}
 	}
 
 	if (debug_printf) {
@@ -971,7 +989,6 @@ void WindowContext::CreateVulkan() {
 #else
 	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
 	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
-	device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
 #endif
 
 #ifdef KYTY_ENABLE_DEBUG_PRINTF
@@ -1024,13 +1041,17 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
-		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
+		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
+									 VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

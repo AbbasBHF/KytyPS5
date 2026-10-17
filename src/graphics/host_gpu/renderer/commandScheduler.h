@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <array>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -34,6 +35,7 @@ public:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
+	void                      LogRecentSubmissionsForReadback(uint64_t target_tick) const;
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
@@ -82,6 +84,39 @@ private:
 		uint64_t                     tick = 0;
 	};
 
+	struct MeshFallbackSubmission {
+		bool     valid = false;
+		uint64_t tick = 0;
+		uint64_t submit_id = 0;
+		uint32_t groups_x = 0;
+		uint32_t groups_y = 0;
+		uint32_t index_count = 0;
+		uint32_t stride_dwords = 0;
+		uint64_t output_bytes = 0;
+	};
+
+	struct QueueSubmissionDebugInfo {
+		bool     valid = false;
+		bool     mesh_fallback = false;
+		uint64_t tick = 0;
+		uint64_t submit_id = 0;
+		uint64_t shader_hash = 0;
+		uint32_t op = 0;
+		uint32_t arg0 = 0;
+		uint32_t arg1 = 0;
+		uint32_t arg2 = 0;
+		uint32_t arg3 = 0;
+		uint64_t arg4 = 0;
+		uint64_t mesh_submit_id = 0;
+		uint32_t mesh_groups_x = 0;
+		uint32_t mesh_groups_y = 0;
+		uint32_t mesh_index_count = 0;
+		uint32_t mesh_stride_dwords = 0;
+		uint64_t mesh_output_bytes = 0;
+	};
+
+	static constexpr size_t RecentSubmissionCount = 32;
+
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
@@ -100,7 +135,13 @@ private:
 	std::jthread                 m_priority_thread;
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
+	MeshFallbackSubmission       m_last_mesh_fallback_submission;
+	std::array<QueueSubmissionDebugInfo, RecentSubmissionCount> m_recent_submissions {};
+	size_t                       m_recent_submission_next = 0;
+	size_t                       m_recent_submission_count = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	void*                        m_tracy_gpu_context    = nullptr;
+	bool                         m_tracy_gpu_profiling_checked = false;
 };
 
 } // namespace Libs::Graphics

@@ -226,7 +226,10 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_
 	EmitIndexSwitch(state, mip_lod, image.mip_count, 0, EmitWrite);
 }
 
-spv::ExecutionModel ExecutionModelForStage(ShaderType stage) {
+spv::ExecutionModel ExecutionModelForStage(ShaderType stage, bool mesh_shader_fallback) {
+	if (stage == ShaderType::Mesh && mesh_shader_fallback) {
+		return spv::ExecutionModelGLCompute;
+	}
 	switch (stage) {
 		case ShaderType::Local:
 		case ShaderType::Vertex: return spv::ExecutionModelVertex;

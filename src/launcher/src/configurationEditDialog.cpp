@@ -278,6 +278,8 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
 	m_ui->checkBox_sync_raw_image_buffers->setChecked(info.sync_raw_image_buffers);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
+	m_ui->checkBox_skip_bvh_intersections->setChecked(info.skip_bvh_intersections);
+	m_ui->checkBox_skip_mesh_fallback_draws->setChecked(info.skip_mesh_fallback_draws);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_network_connected->setChecked(info.network_connected);
 	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
@@ -441,6 +443,8 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
 	info.sync_raw_image_buffers    = ui.checkBox_sync_raw_image_buffers->isChecked();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
+	info.skip_bvh_intersections    = ui.checkBox_skip_bvh_intersections->isChecked();
+	info.skip_mesh_fallback_draws  = ui.checkBox_skip_mesh_fallback_draws->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.network_connected         = ui.checkBox_network_connected->isChecked();
 	info.trophy_enabled            = ui.checkBox_trophy_notifications->isChecked();

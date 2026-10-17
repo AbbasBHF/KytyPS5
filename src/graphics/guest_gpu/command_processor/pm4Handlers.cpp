@@ -84,7 +84,7 @@ uint32_t ReleaseMemCacheActionFromGcr(uint32_t gcr_cntl) {
 void LogUnknownReleaseMemGcr(uint32_t gcr_cntl) {
 	const uint32_t unknown = (gcr_cntl & ~GcrKnownMask);
 	if (unknown != 0) {
-		LOGF("\t warning: release_mem uses unknown GCR bits: 0x%04" PRIx32 "\n", unknown);
+		LOGW("\t warning: release_mem uses unknown GCR bits: 0x%04" PRIx32 "\n", unknown);
 	}
 }
 
@@ -3911,7 +3911,7 @@ void GraphicsInitJmpTablesUcIndirect() {
 	g_hw_uc_indirect_func[Pm4::GE_STEREO_CNTL] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1) < 16) {
-			LOGF("warning: ignoring indirect uc reg GE_STEREO_CNTL at 0x%" PRIx32
+			LOGW("warning: ignoring indirect uc reg GE_STEREO_CNTL at 0x%" PRIx32
 			     ", value = 0x%08" PRIx32 "\n",
 			     cmd_offset, value);
 		}
