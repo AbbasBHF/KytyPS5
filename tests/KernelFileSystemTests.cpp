@@ -2173,6 +2173,53 @@ void CheckSocketWakeup() {
         "write shutdown drains queued bytes, signals EOF, and preserves reverse traffic");
   Check(Net::SocketClose(shutdown_reader) == 0 && Net::SocketClose(shutdown_writer) == 0,
         "close half-shutdown sockets");
+  const int encrypted = Net::Socket(2, 6, 0);
+  int crypto = -1;
+  uint32_t crypto_size = sizeof(crypto);
+  Check(encrypted >= 0 &&
+            Net::Getsockopt(encrypted, 0xffff, 0x20000, &crypto, &crypto_size) == 0 &&
+            crypto == 0,
+        "UDPP2P encryption defaults to disabled");
+  for (const int setting : {7, 0}) {
+    Check(Net::Setsockopt(encrypted, 0xffff, 0x20000, &setting, sizeof(setting)) == 0 &&
+              Net::Getsockopt(encrypted, 0xffff, 0x20000, &crypto, &crypto_size) == 0 &&
+              crypto == (setting != 0),
+          "UDPP2P encryption configuration retains normalized enable and disable values");
+    Check(Net::Send(encrypted, "x", 1, 0) == -1 &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EOPNOTSUPP,
+          "UDPP2P configuration never exposes unframed plaintext transport");
+  }
+  std::array<uint8_t, 16> p2p_address {16, 2, 0x0e, 0x4a, 127, 0, 0, 1, 0x1e, 0x61};
+  Check(Net::Bind(encrypted, p2p_address.data(), p2p_address.size()) == 0,
+        "bind UDPP2P physical and virtual ports");
+  char untouched = '!';
+  auto source = p2p_address;
+  uint32_t source_size = source.size();
+  Check(Net::Recvfrom(encrypted, &untouched, 1, 0x80, source.data(), &source_size) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+        "per-call nonblocking UDPP2P receive reports an actually empty queue");
+  Check(Net::Setsockopt(encrypted, 0xffff, 0x1200, &enabled, sizeof(enabled)) == 0 &&
+            Net::Setsockopt(encrypted, 0xffff, 0x20000, &enabled, sizeof(enabled)) == 0 &&
+            Net::Recvfrom(encrypted, &untouched, 1, 0, source.data(), &source_size) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK &&
+            untouched == '!' && source == p2p_address && source_size == source.size(),
+        "empty encrypted nonblocking receive preserves all caller outputs");
+  const int raw_sender = Net::Socket(2, 2, 0);
+  Check(raw_sender >= 0 &&
+            Net::Sendto(raw_sender, "pending", 7, 0, p2p_address.data(), p2p_address.size()) == 7,
+        "queue a datagram requiring unsupported UDPP2P processing");
+  const auto pending_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (Net::Recv(encrypted, &untouched, 1, 0) == -1 &&
+         *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK &&
+         std::chrono::steady_clock::now() < pending_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  Check(*Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EOPNOTSUPP &&
+            Net::Recv(encrypted, &untouched, 1, 0) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EOPNOTSUPP && untouched == '!',
+        "queued packets remain queued and unsupported instead of masquerading as empty");
+  Check(Net::SocketClose(encrypted) == 0 && Net::SocketClose(raw_sender) == 0,
+        "close UDPP2P readiness fixtures");
   Check(Net::SocketClose(writer) == 0, "close wake writer");
   *net_errno = Libs::Posix::POSIX_EINVAL;
   Check(net_recv(reader, received.data(), received.size(), 0) == 0 &&
