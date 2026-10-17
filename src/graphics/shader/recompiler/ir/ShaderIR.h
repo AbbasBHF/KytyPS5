@@ -82,6 +82,11 @@ struct MemoryInfo {
 	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
 
+	[[nodiscard]] bool IsCoherentBufferPairLoad(ValueOpcode opcode) const {
+		return kind == ResourceKind::Buffer && opcode == ValueOpcode::LoadBufferU32x2 && coherent &&
+		       !typed && !formatted && data_bits == 32u;
+	}
+
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		if (typed) return false;
 		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;

@@ -344,6 +344,7 @@ void Visit(Program& program, bool fsb, ShaderStageInputInfo input_info, InputUsa
 			}
 			if (kind == ResourceKind::Buffer) {
 				info.coherent_buffers |= memory.coherent;
+				info.buffer_int64_atomics |= memory.IsCoherentBufferPairLoad(op);
 				if (memory.resource >= info.buffers.size()) {
 					return Fail("buffer operation has invalid resource metadata");
 				}
