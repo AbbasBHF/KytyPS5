@@ -7380,6 +7380,83 @@ void TestFiniteImagePhiCycle() {
   }
 }
 
+void TestPackedDescriptorWaterfall() {
+  for (const uint32_t variant : {0u, 1u, 2u}) {
+    Fixture f(ShaderType::Pixel);
+    const auto packed = f.Emit(ValueOpcode::GetInterpolationParameter,
+                               {Value(1u), Value(1u), Value(2u)});
+    const auto active = f.Emit(ValueOpcode::ULessThan32,
+                               {f.Emit(ValueOpcode::LaneId), Value(16u)});
+    const auto image_key = f.Emit(ValueOpcode::BitwiseAnd32, {packed, Value(65535u)});
+    const auto sampler_key = variant == 2u ? packed :
+        f.Emit(ValueOpcode::ShiftRightLogical32, {packed, Value(16u)});
+    auto selected_active = active;
+    const auto descriptor = [&](Value key, uint32_t first, uint32_t count, uint32_t shift) {
+      const auto selected = f.Emit(ValueOpcode::ReadFirstLane, {key, active});
+      selected_active = f.Emit(ValueOpcode::LogicalAnd, {selected_active,
+          f.Emit(ValueOpcode::IEqual32, {selected, key})});
+      const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {selected, Value(shift)});
+      const auto table = f.Buffer({f.UserData(first), f.UserData(first + 1u),
+                                   f.UserData(first + 2u), f.UserData(first + 3u)});
+      std::array<Value, 8> words;
+      for (uint32_t word = 0; word < count; ++word)
+        words[word] = f.Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+            f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = word * 4u}, 0x58u));
+      return words;
+    };
+    const auto image = f.Image(descriptor(image_key, 0u, 8u, 5u));
+    const auto sampler_words = descriptor(sampler_key, 4u, 4u, 4u);
+    const auto sampler = f.Sampler({sampler_words[0], sampler_words[1],
+                                   sampler_words[2], sampler_words[3]});
+    f.Emit(ValueOpcode::ImageSampleRaw,
+        {image, sampler, f.ImageAddress(), variant == 1u ? Value(true) : selected_active},
+        f.AddMemory({.kind = ResourceKind::Image,
+                     .image_dimension = Decoder::ImageDimension::Dim2D}, 0x6cu));
+    if (variant != 0u) {
+      CheckFatal([&] { f.PlanAndTrack(); }, "not a valid runtime value",
+                 "packed waterfall accepted widened EXEC or an unbounded sampler key");
+      continue;
+    }
+    f.PlanAndTrack();
+    const auto plan = ExtractResourcePlan(f.program);
+    for (const auto source : {plan.info.images[0].source, plan.info.samplers[0].source}) {
+      const auto& value = plan.descriptor_sources[source];
+      const auto& table = value.indirect_descriptor;
+      Check(table && !table->selector && table->table_scalar &&
+                table->table_stride == value.dword_count * 4u &&
+                (value.dword_count != 4u || table->table_maximum == 65535u),
+            "packed waterfall lost its static sampler bit bound or captured the varying key");
+    }
+    LinearTestMemory memory;
+    const std::array<uint32_t, 8> user_data{
+        uint32_t(memory.base) + 256u, 32u << 16u, 2u, 0x5204u,
+        uint32_t(memory.base) + 512u, 16u << 16u, 59u, 0x5204u};
+    for (uint32_t row = 0; row < 2u; ++row) {
+      const auto word = (256u + row * 32u) / 4u;
+      memory.words[word] = 0x1000u + row * 0x1000u;
+      memory.words[word + 1u] = uint32_t(Libs::Graphics::Prospero::BufferFormat::k32Float) << 20u;
+      memory.words[word + 3u] = Libs::Graphics::DstSel(4, 0, 0, 1) | (9u << 28u);
+    }
+    for (uint32_t row = 0; row < 59u; ++row) {
+      const auto word = (512u + row * 16u) / 4u;
+      memory.words[word] = row;
+      memory.words[word + 1u] = 0x00fff000u;
+      memory.words[word + 2u] = (row & 1u) ? 0x0a500000u : 0u;
+    }
+    const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+        .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 3u && snapshot.samplers.size() == 60u,
+          "packed waterfall ignored the two-image/59-sampler heap bounds or lost the null roots");
+    Check(std::ranges::all_of(snapshot.specialization_reads, [&](const auto& span) {
+      return (span.first >= memory.base + 256u && span.first + span.second <= memory.base + 320u) ||
+          (span.first >= memory.base + 512u && span.first + span.second <= memory.base + 512u + 59u * 16u);
+    }), "packed waterfall materialization read outside the descriptor heaps");
+  }
+}
+
 void TestFiniteImageWaterfall() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Variant { Valid, Staggered, Cycle, DifferentMask, MixedWord, DifferentSelect, WiderExec, BadLeaf };
@@ -8645,6 +8722,7 @@ int main() {
     Run("packed scalar buffer selection", TestPackedScalarBufferSelection);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
     Run("finite image phi cycle", TestFiniteImagePhiCycle);
+    Run("packed descriptor waterfall", TestPackedDescriptorWaterfall);
     Run("finite image waterfall", TestFiniteImageWaterfall);
     Run("finite inline sampler", TestFiniteInlineSampler);
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
