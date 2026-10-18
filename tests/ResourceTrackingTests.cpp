@@ -890,7 +890,7 @@ void TestNestedPointerImageTable() {
           "nested pointer descriptors lost their row geometry or captured the GPU selector payload");
   }
 
-  constexpr uint32_t table = 0x2000u, objects = 0x4000u, stride = 592u, count = 6u;
+  constexpr uint32_t table = 0x2000u, objects = 0x10000u, stride = 592u, count = 59u;
   LinearTestMemory memory;
   memory.words.resize((objects + count * 0x430u - memory.base) / 4u);
   memory.fail_address = 0x1800u; // The GPU selector's contents are unavailable to the CPU.
@@ -899,7 +899,8 @@ void TestNestedPointerImageTable() {
     const auto object = objects + row * 0x430u;
     *at(table + row * stride) = object;
     const std::array<uint32_t, 8> image{10u + row,
-        uint32_t(Libs::Graphics::Prospero::BufferFormat::k32Float) << 20u, 0u,
+        uint32_t(row == count - 1u ? Libs::Graphics::Prospero::BufferFormat::k32UInt
+                                  : Libs::Graphics::Prospero::BufferFormat::k32Float) << 20u, 0u,
         Libs::Graphics::DstSel(4, 0, 0, 1) | (9u << 28u), 0u, 0u, 0u, 0u};
     std::copy(image.begin(), image.end(), at(object + 0x3d0u));
     const std::array<uint32_t, 4> sampler{row, 0x00fff000u, 0u, 0u};
@@ -918,6 +919,21 @@ void TestNestedPointerImageTable() {
     Check(snapshot.images[row + 1u].dwords[0] == 10u + row &&
               snapshot.samplers[row + 1u].dwords[0] == row,
           "nested pointer table mixed rows or pointee members");
+  auto typed = make();
+  typed->PlanAndTrack();
+  ApplyResourceSpecialization(typed->program, specialization);
+  const auto& samplers = typed->program.info.samplers;
+  Check(samplers.size() == 2u * (count + 1u) && samplers[0].indirect_resources.size() == count + 1u &&
+            samplers[count + 1u].indirect_resources.size() == count + 1u &&
+            snapshot.samplers[0].dwords[1] == 0u,
+        "expanded sampler table lost its null root or numeric-class variants");
+  for (uint32_t index = 0; index <= count; ++index) {
+    const auto& integer = samplers[index + count + 1u];
+    Check(samplers[index].snapshot_index == index && !samplers[index].integer_border &&
+              integer.snapshot_index == index && integer.integer_border && integer.force_point_filtering &&
+              samplers[count + 1u].indirect_resources[index] == index + count + 1u,
+          "large sampler class mapping changed descriptor identity or integer filtering");
+  }
   const auto populated = specialization;
   auto equivalent = make(0u, Address::Equivalent);
   equivalent->PlanAndTrack();
@@ -940,11 +956,11 @@ void TestNestedPointerImageTable() {
             specialization == populated,
         "empty-to-positive pointer table refresh did not restore its specialization");
   *at(table) = objects + 0x430u;
-  *at(objects + 0x430u + 0x3d0u) = 42u;
-  *at(objects + 0x430u + 0x3f8u) = 7u;
+  *at(objects + 0x430u + 0x3d0u) = 10u + count;
+  *at(objects + 0x430u + 0x3f8u) = count;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == count && snapshot.samplers.size() == count &&
-            snapshot.images[1].dwords[0] == 42u && snapshot.samplers[1].dwords[0] == 7u,
+            snapshot.images[1].dwords[0] == 10u + count && snapshot.samplers[1].dwords[0] == count,
         "nested descriptor refresh retained stale pointers or failed to deduplicate new pointees");
   *at(table) = objects;
 

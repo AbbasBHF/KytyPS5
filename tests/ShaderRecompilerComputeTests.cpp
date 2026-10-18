@@ -39675,24 +39675,32 @@ void CheckPointerImageTable(VulkanHarness &vulkan) {
 
 void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
-  constexpr u32 list_address = 160, objects = 4096;
-  constexpr std::array keys{5u, 0u, 3u, 1u, 4u, 2u};
+  constexpr u32 list_address = 160;
+  constexpr std::array small_keys{5u, 0u, 3u, 1u, 4u, 2u};
+  constexpr std::array large_keys{58u, 0u, 33u, 31u, 34u, 32u, 59u, 65535u};
   constexpr std::array list{2u, 1u, 4u, 0u, 5u, 3u};
-  for (const auto [member, counted] : {std::pair{0u, false}, std::pair{0x98u, false},
-       std::pair{0x16cu, false}, std::pair{64u, false}, std::pair{64u, true}})
+  for (const auto [member_mode, counted] : {std::pair{0u, false}, std::pair{0x98u, false},
+       std::pair{0x16cu, false}, std::pair{64u, false}, std::pair{64u, true},
+       std::pair{UINT32_MAX, false}})
   for (const auto [wave, upper_only] : {std::pair{32u, false}, std::pair{64u, false},
                                       std::pair{64u, true}}) {
+    const bool large_samplers = member_mode == UINT32_MAX;
+    const u32 member = large_samplers ? 0u : member_mode;
     const bool child_table = member == 64u, compact = member != 0u && !child_table;
+    const std::span<const u32> keys = large_samplers ? std::span<const u32>(large_keys)
+                                                   : std::span<const u32>(small_keys);
+    const u32 objects = large_samplers ? 65536u : 4096u;
     if (upper_only && !child_table) continue;
     const u32 keys_address = child_table ? 1024u : 128u, table = child_table ? 2048u : 256u;
-    const u32 rows = child_table ? 4u : keys.size(), children = child_table ? 3u : 1u;
+    const u32 rows = large_samplers ? 59u : child_table ? 4u : keys.size(), children = child_table ? 3u : 1u;
     const u32 records_count = counted ? 2u : rows, count_address = 768u;
     const u32 stride = child_table ? 136u : compact ? 0x330u : 592u;
     const u32 object_stride = child_table ? 1536u : 0x430u;
     const u32 table_bytes = (rows - 1u) * stride + member + 16u;
     const u32 outputs = child_table ? wave * 2u : keys.size();
     TestCase test;
-    test.name = counted ? (upper_only ? "CountedPointerChildTableUpper64" : "CountedPointerChildTable")
+    test.name = large_samplers ? "LargeIndirectSamplerTable"
+              : counted ? (upper_only ? "CountedPointerChildTableUpper64" : "CountedPointerChildTable")
               : child_table ? (upper_only ? "IndexedPointerChildTableUpper64" : "IndexedPointerChildTable")
               : member == 0x16cu ? "CompactPairedImageSamplerTable"
               : compact ? "CompactRecordImageSamplerTable" : "NestedPointerImageSamplerTable";
@@ -39718,7 +39726,8 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
                     test.initial.begin() + (object + (child_table ? child * 368u + member
                                                              : compact ? member : 0x3d0u)) / 4u);
       }
-      const std::array sampler{0u, 0x00fff000u, (row & 1u) ? 0x0a500000u : 0u, 0u};
+      const std::array sampler{large_samplers ? row : 0u, 0x00fff000u,
+                              (row & 1u) ? 0x0a500000u : 0u, 0u};
       std::copy(sampler.begin(), sampler.end(), test.initial.begin() +
           (child_table ? table + row * stride + 80u : object + (compact ? 0x88u : 0x3f8u)) / 4u);
     }
@@ -39846,6 +39855,18 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
     } else if (!child_table) test.opcodes.insert(test.opcodes.end(),
         {O::S_BUFFER_LOAD_DWORDX2, O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX4});
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    if (large_samplers) {
+      spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+      std::string text;
+      const auto halves = wave > vulkan.SubgroupSize() ? 2u : 1u;
+      Require(test.name, "expanded sampler bindings and emitted size",
+              compiled.resources.samplers.size() == rows + 1u &&
+                  compiled.program.info.samplers.size() == rows + 1u &&
+                  tools.Disassemble(compiled.spirv, &text) &&
+                  CountText(text, "OpImageSampleExplicitLod") == halves &&
+                  compiled.spirv.size() <= 8192u * halves,
+              "59 sampler records hit the SGPR root limit or duplicated image sampling bodies");
+    }
     if (child_table) {
       std::vector<u32> candidates;
       for (const auto &image : compiled.resources.images)
@@ -39922,6 +39943,10 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
         if (upper_only && group < 32u) continue;
         test.expected[wave + group] = 0x76543210u;
         if (outer >= records_count || child >= children) continue;
+      }
+      if (!child_table && outer >= rows) {
+        test.expected[group] = 0u;
+        continue;
       }
       const u32 row = compact ? list[outer] : outer;
       test.expected[group] = std::bit_cast<u32>(float(10u + row * children + child) *
