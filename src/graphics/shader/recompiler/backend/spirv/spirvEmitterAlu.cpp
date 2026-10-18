@@ -160,19 +160,6 @@ uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	return sum;
 }
 
-uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
-	const auto min_ab   = EmitMinMaxF32Value(state, a, b, false);
-	const auto min3     = EmitMinMaxF32Value(state, min_ab, c, false);
-	const auto max_ab   = EmitMinMaxF32Value(state, a, b, true);
-	const auto high_min = EmitMinMaxF32Value(state, max_ab, c, false);
-	const auto median   = EmitMinMaxF32Value(state, min_ab, high_min, true);
-	const auto nan_ab   = Binary(state, spv::OpLogicalOr, TypeBool(state),
-	                             EmitClassifyF32(state, a).nan, EmitClassifyF32(state, b).nan);
-	const auto any_nan =
-	    Binary(state, spv::OpLogicalOr, TypeBool(state), nan_ab, EmitClassifyF32(state, c).nan);
-	return Select(state, TypeF32(state), any_nan, min3, median);
-}
-
 uint32_t EmitFindUMsb64(EmitterState& state, uint32_t value) {
 	// GLSL FindUMsb is restricted to 32-bit components.
 	const auto unpacked = Unary(state, spv::OpBitcast, TypeU32Vector(state, 2), value);

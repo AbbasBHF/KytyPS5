@@ -27720,29 +27720,60 @@ TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
            O::V_MAX3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
-TestCase VectorMed3F32NanUsesMin3Path() {
+TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
   using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  AppendVMovLiteral(&code, 0, 0x40000000u);
-  AppendVMovLiteral(&code, 1, 0x40400000u);
-  AppendVMovLiteral(&code, 2, 0x7fa00001u);
-  AppendVMovLiteral(&code, 3, 0x7fc00000u);
-
-  AppendVop3(&code, 0x157, 10, Vgpr(0), Vgpr(1), Vgpr(2));
-  AppendVop3(&code, 0x157, 11, Vgpr(0), Vgpr(1), Vgpr(3));
-  AppendVop3(&code, 0x157, 12, Vgpr(2), Vgpr(0), Vgpr(1));
-
-  AppendStoreVgpr(&code, 10, 0);
-  AppendStoreVgpr(&code, 11, 1);
-  AppendStoreVgpr(&code, 12, 2);
+  // Runtime inputs keep every MED3 in the emitted module; compare raw result bits.
+  constexpr u32 cases[][4] = {
+      {0x40000000u, 0x40400000u, 0x7fa00001u, 0x40000000u},
+      {0x40000000u, 0x40400000u, 0x7fc00000u, 0x40000000u},
+      {0x7fa00001u, 0x40000000u, 0x40400000u, 0x40000000u},
+      {0x40400000u, 0x7fc01234u, 0x40000000u, 0x40000000u},
+      {0x80000000u, 0x00000000u, 0x3f800000u, 0x00000000u},
+      {0x00000000u, 0x80000000u, 0xbf800000u, 0x80000000u},
+      {0x80000000u, 0x80000000u, 0x00000000u, 0x00000000u},
+      {0x00000000u, 0x00000000u, 0x80000000u, 0x00000000u},
+      {0x80000000u, 0x00000000u, 0x80000000u, 0x00000000u},
+      {0x00000000u, 0x80000000u, 0x80000000u, 0x80000000u},
+      {0xbf800000u, 0x80000000u, 0x00000000u, 0x00000000u},
+      {0xbf800000u, 0x00000000u, 0x80000000u, 0x80000000u},
+      {0x80000000u, 0xbf800000u, 0x00000000u, 0x00000000u},
+      {0x00000000u, 0xbf800000u, 0x80000000u, 0x80000000u},
+      {0x80000000u, 0x00000000u, 0xbf800000u, 0x00000000u},
+      {0x7fc01234u, 0x80000000u, 0x00000000u, 0x80000000u},
+      {0x3f800000u, 0x40400000u, 0x40000000u, 0x40000000u},
+      {0xc0400000u, 0xbf800000u, 0xc0000000u, 0xc0000000u},
+      {0xff800000u, 0x7f800000u, 0x3f800000u, 0x3f800000u},
+      {0x00000001u, 0x7f800000u, 0x7fc01234u, 0x00000001u},
+      {0x80000001u, 0x80000001u, 0x00000000u, 0x80000001u},
+      {0x7fc01234u, 0x7fa00001u, 0xffc05678u, 0xffc05678u},
+      {0x7fa00001u, 0xffc05678u, 0x40000000u, 0x40000000u}};
+  TestCase test;
+  test.name = "VectorMed3F32NanUsesMin3Path";
+  test.has_compute_info = true;
+  test.compute_info.wave_size = wave;
+  test.compute_info.float_mode = 0xf0; // Preserve FP32 input/output denormals.
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  for (const auto &values : cases)
+    test.initial.insert(test.initial.end(), values, values + 3);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 index = 0; index < std::size(cases); ++index) {
+    for (u32 operand = 0; operand < 3; ++operand) {
+      AppendVMovU32(&code, 30, (index * 3u + operand) * 4u);
+      AppendBufferLoadDword(&code, operand, 30);
+    }
+    AppendVop3(&code, 0x157, 10, Vgpr(0), Vgpr(1), Vgpr(2));
+    AppendStoreVgpr(&code, 10, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(cases[index][3]);
+  }
   AppendEnd(&code);
-
-  return {"VectorMed3F32NanUsesMin3Path",
-          code,
-          {},
-          {0x40000000u, 0x40000000u, 0x40000000u},
-          {O::V_MOV_B32, O::V_MED3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MED3_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.ir_counts = {{"FPMedTri32", std::size(cases)}};
+  // Measured 17,593/36,607 words; keep classification growth below a single MED3.
+  test.max_spirv_words = wave == 32u ? 17600u : 36620u;
+  return test;
 }
 
 TestCase VectorFloatConversionOps() {
@@ -42807,7 +42838,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorFloatControlContractPreservesInfNan);
   AddCase(VectorFloatArithmeticOps);
   AddCase(VectorMinMaxF32NanAndSignedZeroEdges);
-  AddCase(VectorMed3F32NanUsesMin3Path);
+  cases.push_back(VectorMed3F32NanUsesMin3Path(32));
+  cases.push_back(VectorMed3F32NanUsesMin3Path(64));
   AddCase(VectorFloatConversionOps);
   AddCase(VectorFrexpF32Edges);
   AddCase(CvtF32ToIntSaturatesNaNAndOutOfRange);
@@ -48691,8 +48723,10 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, VectorCompareF32DenormalModes(mode));
     }
     RunCase(&vulkan, VectorCompareClassF32());
-    for (const u32 wave : {32u, 64u})
+    for (const u32 wave : {32u, 64u}) {
       RunCase(&vulkan, VectorCompareClassF32ImmediateAndDynamicMasks(wave));
+      RunCase(&vulkan, VectorMed3F32NanUsesMin3Path(wave));
+    }
     RunCase(&vulkan, VectorCompareF16Ops());
     return 0;
   }
