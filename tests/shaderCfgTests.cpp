@@ -10837,8 +10837,8 @@ void TestMemoryFedScalarLeafCall() {
   IR::SrtRuntime runtime{.read_memory = read, .userdata = &memory, .read_specialization_memory = read};
   const auto options = MakeCompileOptions(ShaderType::Compute);
   auto source = PrepareShaderSource(shader, options);
-  Check(source.call && source.decoded.has_swap_pc &&
-            source.decoded.instructions[source.call->instruction].branch_target == UINT32_MAX,
+  Check(source.calls.size() == 1 && source.decoded.has_swap_pc &&
+            source.decoded.instructions[source.calls.front().instruction].branch_target == UINT32_MAX,
         "memory-fed SWAPPC did not retain an unresolved target");
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   ExpectFatal([&] { (void)TranslateProgram(source.decoded, options); },
@@ -10846,7 +10846,7 @@ void TestMemoryFedScalarLeafCall() {
 #endif
   const auto& linked = RefreshShaderSource(source, runtime);
   Check(linked.has_swap_pc && source.revision == 1 && linked.instructions.back().branch_target == 0x40 &&
-            linked.instructions[source.call->instruction].branch_target == 0x44 &&
+            linked.instructions[source.calls.front().instruction].branch_target == 0x44 &&
             source.reads.back() == std::pair<uint64_t, uint64_t>{base + 0x100, 12},
         "aliased call target, exact leaf range, or continuation was lost");
   const auto* storage = linked.instructions.data();
@@ -10931,14 +10931,14 @@ void TestMemoryFedScalarLeafCall() {
   memory.words[96] = EncodeSMovB32(14, 129);
   ExpectFatal([&] { (void)RefreshShaderSource(source, runtime); },
               "leaf clobbering its return pair was linked");
-  // AND_B64 writes the high half despite the decoder's generic scalar width.
+  // AND_B64 must replace the preceding high-half definition.
   const uint32_t high_writer[] = {
       EncodeSMovB32(15, 129), EncodeSop2(0x0f, 14, 128, 128),
       EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
   auto pair_source = PrepareShaderSource(high_writer, options);
   IR::SrtWalker pair_walker(pair_source.call_targets, runtime);
   uint32_t high = 1;
-  Check(pair_walker.Evaluate(pair_source.call->target[1], high) && high == 0,
+  Check(pair_walker.Evaluate(pair_source.calls.front().target[1], high) && high == 0,
         "scalar pair producer used a stale preceding high-half definition");
   const uint32_t joined[] = {
       EncodeSopp(0x04, 2), EncodeSMovB32(14, 129), EncodeSopp(0x02, 1),
@@ -10947,7 +10947,7 @@ void TestMemoryFedScalarLeafCall() {
               "ambiguous reaching definitions were accepted for a call target");
   const uint32_t multiple[] = {EncodeSop1(0x21, 14, 14), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
   ExpectFatal([&] { (void)PrepareShaderSource(multiple, options); },
-              "call metadata bypassed the multiple-call rejection");
+              "a native return pair was accepted as a later call target");
 #endif
 }
 
@@ -10994,7 +10994,7 @@ void TestFusedShaderHandoffPreservesRegisters() {
   for (const auto handoff: {EncodeSop1(0x20, 0, 6), 0xbefd2106u}) {
     front[2] = handoff; // SETPC or captured SWAPPC with NULL destination
     auto source = PrepareShaderSource(front, options);
-    Check(!source.decoded.has_swap_pc && !source.call,
+    Check(!source.decoded.has_swap_pc && source.calls.empty(),
           "fused SETPC handoff entered scalar call preparation");
     auto translated = TranslateProgram(source.decoded, options);
     uint32_t allocations = 0;

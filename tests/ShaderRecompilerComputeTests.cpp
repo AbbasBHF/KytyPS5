@@ -10734,6 +10734,143 @@ public:
                 LibKernel::Memory::TryReadBacking(output, &actual, sizeof(actual)) && actual == test.value,
                 "caller did not observe the leaf's scalar result after return");
       }
+
+      // Each helper reads through its context, masks EXEC, then restores all
+      // caller lanes. The MAD literal occupies a third instruction DWORD.
+      std::array<std::vector<u32>, 2> vector_leaves;
+      for (u32 i = 0; i < vector_leaves.size(); ++i) {
+        auto& helper = vector_leaves[i];
+        helper = {EncodeSop1(0x04, 18, 126), EncodeVopc(0xd4, 6, 0), 0,
+            EncodeSmem0(0x02, 20, 8), EncodeSmem1(0, 125), EncodeSopp(0x0c, 0),
+            EncodeMubuf0(0x0c), EncodeMubuf1(2, 5, 1), EncodeSopp(0x0c, 0),
+            EncodeVop2(0x03, 2, 7, 2)};
+        AppendVop3(&helper, 0x141, 6, 255, Vgpr(2), Vgpr(6));
+        helper.push_back(std::bit_cast<u32>(i == 0 ? 1.5f : 2.5f));
+        helper[2] = EncodeSopp(0x08, static_cast<u32>(helper.size()) - 3u);
+        helper.push_back(EncodeSop1(0x04, 126, 18));
+        helper.push_back(EncodeSop1(0x21, 125, 14));
+        const auto address = i == 0 ? first : second;
+        Require(name, "replace vector helper", context.InvalidateMemory(address, helper.size() * 4),
+                "vector helper escaped mapped memory");
+        LibKernel::Memory::WriteBacking(address, helper.data(), helper.size() * 4);
+      }
+      out.fields[3] |= 3u << 28u;
+      ShaderBufferResource data = out;
+      data.UpdateAddress48(base + 0x5000);
+      data.fields[2] = 64 * sizeof(float);
+      Require(name, "refresh helper context", context.InvalidateMemory(table, sizeof(data.fields)),
+              "helper context escaped mapped memory");
+      LibKernel::Memory::WriteBacking(table, data.fields, sizeof(data.fields));
+      std::array<float, 64> values;
+      for (u32 lane = 0; lane < values.size(); ++lane) values[lane] = float(lane + 1);
+      Require(name, "refresh vector input", context.InvalidateMemory(base + 0x5000, sizeof(values)),
+              "vector input escaped mapped memory");
+      LibKernel::Memory::WriteBacking(base + 0x5000, values.data(), sizeof(values));
+      for (const u32 wave_size : {32u, 64u}) {
+        for (const u32 call_count : {1u, 13u}) {
+          std::vector<u32> caller{EncodeVop2(0x1a, 1, InlineU32(2), 0)};
+          AppendVMovLiteral(&caller, 6, std::bit_cast<u32>(10.0f));
+          for (u32 call = 0; call < call_count; ++call) {
+            AppendSMovLiteral(&caller, 7, std::bit_cast<u32>(float(call + 1)));
+            caller.insert(caller.end(), {
+                EncodeSMovB32(14, call < 8 ? 8 : 12), EncodeSMovB32(15, call < 8 ? 9 : 13),
+                EncodeSMovB32(16, 4), EncodeSMovB32(17, 5), EncodeSop1(0x21, 14, 14)});
+          }
+          caller.insert(caller.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(6, 0, 1)});
+          AppendEnd(&caller);
+          ShaderMapUserData(reinterpret_cast<uint64_t>(caller.data()),
+              {.type = Prospero::ShaderBinaryType::kCs,
+               .code_size_bytes = static_cast<u32>(caller.size() * sizeof(u32))});
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(caller.data()),
+                               .num_thread_x = wave_size, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = static_cast<uint8_t>(wave_size), .user_sgpr = 14});
+          out.fields[2] = wave_size * sizeof(float);
+          std::array<u32, 16> user_data{};
+          std::copy_n(out.fields, 4, user_data.begin());
+          user_data[4] = static_cast<u32>(table);
+          user_data[5] = static_cast<u32>(table >> 32u);
+          user_data[8] = static_cast<u32>(first | 3u);
+          user_data[9] = static_cast<u32>(first >> 32u);
+          user_data[12] = static_cast<u32>(second | 3u);
+          user_data[13] = static_cast<u32>(second >> 32u);
+          uint64_t original_vector_id = 0;
+          for (u32 phase = 0; phase < (call_count == 1 ? 2u : 4u); ++phase) {
+            const u32 active_lanes = phase == 0 ? 0 : 16;
+            if (phase >= 2) {
+              std::swap(user_data[8], user_data[12]);
+              std::swap(user_data[9], user_data[13]);
+            }
+            user_data[6] = active_lanes;
+            for (u32 i = 0; i < user_data.size(); ++i)
+              shaders.SetCsUserSgpr(i, user_data[i], HW::UserSgprType::Unknown);
+            Require(name, "reset caller output", context.InvalidateMemory(output, wave_size * 4),
+                    "caller output escaped mapped memory");
+            std::array<float, 64> actual{};
+            LibKernel::Memory::WriteBacking(output, actual.data(), wave_size * 4);
+            ShaderComputeInputInfo input{};
+            const auto program = context.GetPipelineCache().GetComputeProgram(
+                shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+            if (phase == 1) original_vector_id = program.id;
+            if (phase >= 2)
+              Require(name, "ordered helper identity", (program.id == original_vector_id) == (phase == 3),
+                      "swapped helper targets reused stale code or restored targets recompiled");
+            const auto& reads = input.stage.resources->specialization_reads;
+            for (u32 i = 0; i < (call_count == 1 ? 1u : 2u); ++i)
+              Require(name, "unique helper code dependency", std::ranges::count(reads,
+                  std::pair<uint64_t, uint64_t>{i == 0 ? first : second,
+                      vector_leaves[i].size() * sizeof(u32)}) == 1,
+                  "repeated calls duplicated or omitted a helper code dependency");
+            if (phase == 1) {
+              ShaderRecompiler::CompileOptions options;
+              options.wave_size = wave_size;
+              options.dump_ir = false;
+              options.maintenance8_enabled = true;
+              input.host_subgroup_size = SubgroupSize();
+              options.input_info.compute = &input;
+              options.user_data = user_data;
+              const auto read = +[](void*, uint64_t address, std::span<u32> words) {
+                return LibKernel::Memory::TryReadBufferBacking(address, words.data(), words.size_bytes());
+              };
+              const ShaderRecompiler::IR::SrtRuntime runtime{
+                  .user_data = user_data, .shader_base = reinterpret_cast<uint64_t>(caller.data()),
+                  .read_memory = read, .read_specialization_memory = read};
+              auto source = ShaderRecompiler::PrepareShaderSource(caller, options);
+              auto translated = ShaderRecompiler::TranslateProgram(
+                  ShaderRecompiler::RefreshShaderSource(source, runtime), options);
+              auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+              ShaderRecompiler::IR::ResourceSnapshot snapshot;
+              ShaderRecompiler::IR::ResourceSpecialization specialization;
+              Require(name, "vector helper resources", ShaderRecompiler::IR::MaterializeResources(
+                  plan, runtime, snapshot, specialization), "helper V# could not be materialized");
+              auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+              ValidateSpirv(name, compiled.spirv);
+              CheckSpirvEmission({.name = name, .forbidden_spirv = {"OpLoopMerge"}}, compiled.spirv);
+              const u32 word_budget = wave_size == 32 ? 640 + 224 * (call_count - 1) :
+                                                       1024 + 416 * (call_count - 1);
+              Require(name, "linear call emission", compiled.spirv.size() <= word_budget,
+                      "acyclic calls exceeded their per-call SPIR-V budget");
+              std::printf("[gpu]     %-32s wave%u calls%u: %zu SPIR-V words\n",
+                          name, wave_size, call_count, compiled.spirv.size());
+            }
+            processor.DispatchDirect(1, 1, 1, 0x41u |
+                (wave_size == 32u ? 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT : 0u));
+            cache.ReadMemory(output, wave_size * 4);
+            Require(name, "read vector helper output", LibKernel::Memory::TryReadBacking(
+                output, actual.data(), wave_size * 4), "caller output was not readable");
+            for (u32 lane = 0; lane < wave_size; ++lane) {
+              float expected = 10.0f;
+              if (lane < active_lanes)
+                for (u32 call = 0; call < call_count; ++call)
+                  expected += ((call < 8) != (phase == 2) ? 1.5f : 2.5f) *
+                      (values[lane] + float(call + 1));
+              Require(name, "repeated vector calls and EXEC return", actual[lane] == expected,
+                      "wave" + std::to_string(wave_size) + " calls" + std::to_string(call_count) +
+                          " phase" + std::to_string(phase) + " lane" + std::to_string(lane) +
+                          " actual=" + std::to_string(actual[lane]) + " expected=" + std::to_string(expected));
+            }
+          }
+        }
+      }
       context.UnmapMemory(base, size);
       context.GetCommandScheduler().Finish();
     });
@@ -49008,6 +49145,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--gpu-tiler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuTilerCpuParity();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-leaf-call-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckScalarLeafCall();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {
