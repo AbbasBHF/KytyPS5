@@ -40392,12 +40392,13 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
         resource == 4u ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D, layers));
   }
   const auto native_sampler = vulkan.CreateSampler(test.name);
-  enum class Access { Sample, Gather, GatherHomogeneous, Fetch, Fetch1D };
+  enum class Access { Sample, Gather, GatherHomogeneous, GatherMips, Fetch, Fetch1D };
   auto *access = &sample;
   for (const auto mode : {Access::Sample, Access::Gather,
-                          Access::GatherHomogeneous, Access::Fetch, Access::Fetch1D}) {
+                          Access::GatherHomogeneous, Access::GatherMips, Access::Fetch, Access::Fetch1D}) {
     const bool fetch = mode == Access::Fetch || mode == Access::Fetch1D;
-    const bool gather = mode == Access::Gather || mode == Access::GatherHomogeneous;
+    const bool gather = mode == Access::Gather || mode == Access::GatherHomogeneous || mode == Access::GatherMips;
+    const bool mixed_mips = mode == Access::GatherMips;
     const bool homogeneous = mode == Access::GatherHomogeneous;
     if (mode == Access::Gather) {
       test.name = "IndirectImageGatherContiguousRuns";
@@ -40426,7 +40427,21 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
                                      : root.indirect_resources;
     if (homogeneous) test.name = "IndirectImageGatherHomogeneous";
     compiled.resources.flattened_srt[6] = homogeneous ? 4u : ordinals[5];
+    if (mixed_mips) {
+      test.name = "IndirectImageGatherMixedMips";
+      compiled.program.info.images[3].mip_mode = ImageMipMode::Dynamic;
+      compiled.program.info.images[3].mip_count = 2u;
+      compiled.program.memory_info[0].image_sample_flags = ShaderRecompiler::Decoder::ImageSampleFlagLod;
+      address.SetArg(0, Value(std::bit_cast<u32>(0.75f)));
+      address.SetArg(1, Value(std::bit_cast<u32>(0.25f)));
+      address.SetArg(2, Value(0u));
+      address.SetArg(3, Value(std::bit_cast<u32>(1.0f)));
+      access->SetArg(5, Value(0xfffu << 12u));
+      access->SetArg(6, Value(1u << 26u));
+    }
     if (fetch) {
+      compiled.program.info.images[3].mip_mode = ImageMipMode::None;
+      compiled.program.info.images[3].mip_count = 1u;
       test.name = "IndirectImageFetchContiguousRuns";
       const auto position = std::ranges::find_if(*block, [&](const Inst &inst) {
         return &inst == access;
@@ -40484,12 +40499,15 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
       const auto image_opcode = fetch ? "OpImageFetch" : gather ? "OpImageGather"
                                                           : "OpImageSampleExplicitLod";
       Require(test.name, "native array image runs", tools.Disassemble(compiled.spirv, &text) &&
-                  CountText(text, image_opcode) == (homogeneous ? 1u : 2u) * halves,
+                  CountText(text, image_opcode) == (homogeneous ? 1u : mixed_mips ? 4u : 2u) * halves,
               "mixed runs expanded into per-image accesses");
       if (homogeneous) {
         Require(test.name, "homogeneous gather array", text.find("OpSwitch") == std::string::npos,
                 "homogeneous gather emitted a descriptor switch");
       }
+      if (mixed_mips)
+        Require(test.name, "mixed mip emitted size", compiled.spirv.size() <= 8192u * halves,
+                "mixed mip selection exceeded its 32 KiB per-wave regression budget");
       if (fetch || gather) {
         std::vector<u32> decorated;
         std::vector<u32> image_operands;
@@ -40513,7 +40531,8 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
       test.expected.assign(wave_size, 0u);
       for (u32 lane = 0; lane < ordinals.size(); ++lane) {
         const auto resource = selected_resources[compiled.resources.flattened_srt[1u + lane]];
-        test.expected[lane] = std::bit_cast<u32>(float(resource + (fetch && resource != 0u ? 10u : 0u)));
+        test.expected[lane] = std::bit_cast<u32>(float(resource +
+            ((fetch && resource != 0u) || (mixed_mips && resource == 3u) ? 10u : 0u)));
       }
       auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
       vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr,
@@ -40521,7 +40540,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
       const auto actual = vulkan.ReadBuffer(test.name, buffer, test.expected.size());
       vulkan.DestroyBuffer(&buffer);
       CompareWords(test, "root, native slots, array runs and mapping bounds", test.expected, actual);
-      if (wave_size == 32u && !homogeneous) {
+      if (wave_size == 32u && !homogeneous && !mixed_mips) {
         // A single integer candidate must keep raw register bits across the
         // same descriptor runs used by samples, gathers, and image fetches.
         const auto coordinate_conversions = CountText(text, "OpConvertUToF");

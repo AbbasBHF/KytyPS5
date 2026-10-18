@@ -593,8 +593,9 @@ void TestExactUnfilteredImageCandidates() {
     second[3] |= 1u << 16u;
     fill();
     plan.info.images[0].mip_mode = ImageMipMode::Dynamic;
-    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
-          "mixed-dimension acceptance discarded mip-count compatibility");
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              specialization.images[0].mip_count == 1u && specialization.images[1].mip_count == 2u,
+          "mixed-dimension candidates lost their individual mip counts");
   }
   // The same image may be merged from several uses; one query keeps the guard strict.
   auto merged = MakeIndirectImageFixture(false, 32u, 0u, 0u, false, ValueOpcode::ImageRead, true);
@@ -3162,6 +3163,237 @@ void TestUniformizedMaterialImageKeys() {
                              Variant::PackedCyclicMerge})
     CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
                "packed selector accepted an unproved OR guard, offset domain, or field extraction");
+}
+
+void TestIndexedMaterialImageKeys() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  const auto make_plan = [](ShaderType stage = ShaderType::Compute, bool shared = false) {
+    Fixture f(stage);
+    auto *entry = f.block, *body = f.AddBlock();
+    auto *later = shared ? f.AddBlock() : nullptr;
+    auto *done = f.AddBlock();
+    entry->AddBranch(body);
+    entry->AddBranch(done);
+    body->AddBranch(shared ? later : done);
+    if (shared) later->AddBranch(done);
+    const auto lane = f.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    const auto active = f.Emit(ValueOpcode::INotEqual32, {lane, Value(UINT32_MAX)});
+    entry->condition = f.Emit(ValueOpcode::ConditionRef, {active}, CFG::BranchCondition::ExecNonZero);
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = body, .false_block = done};
+    body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = shared ? later : done};
+    if (shared) later->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = done};
+    done->terminator.kind = CFG::TerminatorKind::Return;
+    const auto material = f.Buffer({f.UserData(0), f.UserData(1), f.UserData(2), f.UserData(3)});
+    const auto heap = f.Buffer({f.UserData(4), f.UserData(5), f.UserData(6), f.UserData(7)});
+    const auto output = f.Buffer({f.UserData(8), f.UserData(9), f.UserData(10), f.UserData(11)});
+    const auto sampler = f.Sampler({Value(0u), Value(0u), Value(1u << 26u), Value(0u)});
+    const auto address = f.ImageAddress();
+    Value owner_key, shared_image;
+    for (uint32_t index = 0; index < (shared ? 3u : 2u); ++index) {
+      const uint32_t field = index == 1u ? 68u : 64u;
+      auto *use = index == 2u ? later : body;
+      auto key = owner_key;
+      if (index < 2u) {
+        MemoryInfo memory;
+        memory.kind = ResourceKind::Buffer;
+        memory.idxen = true;
+        memory.offset = field;
+        const auto loaded = f.Emit(ValueOpcode::LoadBufferU32,
+            {material, lane, Value(0u), Value(0u), active}, f.AddMemory(memory, field), entry);
+        const auto selected = f.Emit(ValueOpcode::SelectU32, {active, loaded, Value(0xdeadbeefu)}, 0, entry);
+        key = shared && index == 0u
+            ? f.Emit(ValueOpcode::ReadLane, {selected, Value(0u)}, 0, entry)
+            : f.Emit(ValueOpcode::ReadFirstLane, {selected, active}, 0, body);
+        if (shared && index == 0u) {
+          owner_key = key;
+          const auto equal = f.Emit(ValueOpcode::IEqual32, {key, selected}, 0, entry);
+          const auto guard = f.Emit(ValueOpcode::LogicalAnd, {active, equal}, 0, entry);
+          entry->condition = f.Emit(ValueOpcode::ConditionRef, {guard}, CFG::BranchCondition::ExecNonZero, entry);
+        }
+      }
+      const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}, 0, use);
+      std::array<Value, 8> words;
+      for (uint32_t word = 0; word < words.size(); ++word) {
+        MemoryInfo scalar;
+        scalar.kind = ResourceKind::ScalarBuffer;
+        scalar.offset = word * 4u;
+        words[word] = f.Emit(ValueOpcode::ReadConstBuffer, {heap, offset},
+                            f.AddMemory(scalar, 0x100u + field), use);
+      }
+      const auto image_handle = [&] {
+        return f.Emit(ValueOpcode::GetImageResource,
+            {words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]}, 0, use);
+      };
+      MemoryInfo gather;
+      gather.kind = ResourceKind::Image;
+      gather.image_dimension = Decoder::ImageDimension::Dim2D;
+      if (index == 0u)
+        f.Emit(ValueOpcode::ImageQueryDimensions, {image_handle(), address}, f.AddMemory(gather, 0x180u), body);
+      const auto image = image_handle();
+      if (index == 2u) shared_image = image;
+      gather.image_sample_flags = Decoder::ImageSampleFlagLod;
+      f.Emit(ValueOpcode::ImageGatherRaw,
+          {image, sampler, address, words[1], words[3], Value(0u), Value(1u << 26u), active},
+          f.AddMemory(gather, 0x200u + field), use);
+    }
+    MemoryInfo store;
+    store.kind = ResourceKind::Buffer;
+    f.Emit(ValueOpcode::StoreBufferU32,
+        {output, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+        f.AddMemory(store, 0x300u), done);
+    f.PlanAndTrack();
+    if (shared) {
+      owner_key.ResolveInstruction()->ReplaceUsesWith(Value(12994u));
+      uint32_t offset = 0u;
+      Check(SrtWalker(f.program, {}).Evaluate(shared_image.ResolveInstruction()->Arg(0), offset) &&
+                offset == 12994u * 32u,
+            "inherited indexed selector changed GPU byte offsets into raw material keys");
+    }
+    return ExtractResourcePlan(f.program);
+  };
+  auto plan = make_plan();
+  Check(plan.info.images.size() == 3u && plan.selector_keys.size() == 2u,
+        "indexed material fields did not share their query/gather selector domain");
+  for (const auto &image : plan.info.images) {
+    const auto &source = *plan.descriptor_sources[image.source].indirect_descriptor;
+    Check(source.table_scalar && source.selector && source.selector->stride == 0u &&
+              source.key_count.IsEmpty() && source.selector_first.IsEmpty(),
+          "indexed material field fell back to an unconditional heap scan");
+  }
+  constexpr uint32_t base = 0x1000u, heap = 0x2000u, records = 14517u;
+  struct Memory {
+    std::vector<uint32_t> words = std::vector<uint32_t>((heap - base + records * 32u) / 4u);
+    uint32_t selectors = 0, descriptors = 0;
+    bool narrow = true, unreadable = false;
+  } memory;
+  const auto put = [&](uint32_t key, uint32_t mips) {
+    auto *words = memory.words.data() + (heap - base + key * 32u) / 4u;
+    words[0] = 0x100u + key;
+    words[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k16UNorm) << 20u;
+    words[3] = (9u << 28u) | ((mips - 1u) << 16u) | Libs::Graphics::DstSel(4, 5, 6, 7);
+  };
+  for (uint32_t key = 0; key < 64u; ++key) put(key, 1u);
+  put(12994u, 8u);
+  put(12996u, 8u);
+  for (uint32_t row = 0; row < 10u; ++row) {
+    memory.words[(row * 96u + 64u) / 4u] = 12994u;
+    memory.words[(row * 96u + 68u) / 4u] = 12996u;
+  }
+  std::array<uint32_t, 12> user_data{base, 96u << 16u, 10u, 0x5204u,
+      heap, 32u << 16u, records, 0x5204u, 0x90000u, 4u << 16u, 16u, 0x5204u};
+  const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &m = *static_cast<Memory *>(data);
+    if (address < base || address - base + words.size_bytes() > m.words.size() * 4u) return false;
+    if (address < heap) {
+      ++m.selectors;
+      if (m.unreadable) return false;
+    } else {
+      ++m.descriptors;
+      const auto key = (address - heap) / 32u;
+      if (m.narrow && (words.size() != 8u || (key != 0u && key != 12994u && key != 12996u))) return false;
+    }
+    std::copy_n(m.words.begin() + (address - base) / 4u, words.size(), words.begin());
+    return true;
+  };
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                           .read_specialization_memory = read};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            memory.selectors == 2u && memory.descriptors == 6u && snapshot.images.size() == 9u,
+        "indexed selector scanned the broad heap or did not share its captured keys");
+  for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
+    const auto &image = specialization.images[root];
+    const auto offset = image.indirect_mapping_offset;
+    Check(snapshot.images[root].dwords[0] == 0u && image.indirect_search_iterations == 2u &&
+              snapshot.flattened_srt[offset] == 2u && snapshot.flattened_srt[offset + 1u] == 0u &&
+              snapshot.flattened_srt[offset + 3u] == (root == 2u ? 12996u : 12994u) * 32u,
+          "byte-key selector lost native OOB zero, sorted offsets, or the null default");
+  }
+  Check(std::ranges::count_if(specialization.images, [](const auto &image) {
+          return image.mip_count == 8u;
+        }) == 2u, "indirect gathers lost candidate-specific mip counts");
+  for (const uint32_t field : {64u, 68u})
+    Check(std::ranges::find(snapshot.specialization_reads,
+              std::pair<uint64_t, uint64_t>{base + field, 868u}) != snapshot.specialization_reads.end(),
+          "indexed selector batch escaped writable-alias tracking");
+  auto shared = make_plan(ShaderType::Compute, true);
+  Check(MaterializeResources(shared, runtime, snapshot, specialization) && snapshot.images.size() == 9u,
+        "inherited indexed selector lost its bounded material domain");
+  memory.words[64u / 4u] = 12996u;
+  memory.selectors = 0;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            memory.selectors == 2u && snapshot.images.size() == 11u,
+        "changed material rows reused stale selector keys");
+  memory.words[64u / 4u] = 12994u;
+  memory.unreadable = true;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "unreadable eligible selector silently fell back to the heap");
+  memory.narrow = false;
+  const auto original = user_data;
+  for (const uint32_t variant : {0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u}) {
+    user_data = original;
+    if (variant == 0u) user_data[1] |= 1u << 31u;
+    if (variant == 1u) user_data[3] |= 1u << 23u;
+    if (variant == 2u) user_data[3] |= 1u << 28u;
+    if (variant == 3u) user_data[0] += 1u;
+    if (variant == 4u) user_data[2] = MaxIndirectDescriptorProbes + 1u;
+    if (variant == 5u) user_data[8] = base + 68u;
+    if (variant == 6u) user_data[1] = 66u << 16u;
+    if (variant == 7u) user_data[0] = 0u;
+    memory.selectors = 0;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              memory.selectors == 0u && snapshot.images.size() > 100u,
+          "unsupported geometry or writable selector lost the original heap domain");
+  }
+  user_data = original;
+  auto graphics = make_plan(ShaderType::Pixel);
+  Check(MaterializeResources(graphics, runtime, snapshot, specialization) && memory.selectors == 0u,
+        "graphics material lookup acquired unproved selector read dependencies");
+  memory.unreadable = false;
+  for (uint32_t row = 0; row < 10u; ++row)
+    memory.words[(row * 96u + 64u) / 4u] = 0x08000000u; // U32 key*32 wraps to zero.
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+        "indexed selector lost wrapped scalar descriptor offsets");
+  for (auto &source : plan.descriptor_sources) {
+    if (!source.indirect_descriptor) continue;
+    source.indirect_descriptor->table_offset = 0xffffffe0u;
+    source.indirect_descriptor->table_immediate = 32u;
+  }
+  for (uint32_t row = 0; row < 10u; ++row) {
+    memory.words[(row * 96u + 64u) / 4u] = row == 0u ? 1u : 0u;
+    memory.words[(row * 96u + 68u) / 4u] = 0u;
+  }
+  memory.selectors = memory.descriptors = 0u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            memory.selectors == 2u && memory.descriptors == 2u && snapshot.images.size() == 5u,
+        "overflowed scalar immediate read a descriptor or lost valid wrapped keys");
+  for (uint32_t root = 0; root < 2u; ++root) {
+    const auto offset = specialization.images[root].indirect_mapping_offset;
+    Check(snapshot.images[root].dwords[0] == 0u && snapshot.flattened_srt[offset] == 2u &&
+              snapshot.flattened_srt[offset + 1u] == 32u && snapshot.flattened_srt[offset + 3u] == UINT32_MAX &&
+              snapshot.flattened_srt[offset + 4u] == 0u,
+          "invalid byte key selected a real texture instead of the null root");
+  }
+  for (auto &source : plan.descriptor_sources) {
+    if (!source.indirect_descriptor) continue;
+    source.indirect_descriptor->table_offset = source.indirect_descriptor->table_immediate = 0u;
+  }
+  memory.narrow = true;
+  memory.unreadable = true;
+  for (const uint32_t variant : {0u, 1u, 2u, 3u}) {
+    user_data = original;
+    if (variant == 0u) user_data[2] = 0u;
+    if (variant == 1u) user_data[1] = 0u;
+    if (variant == 2u) user_data[3] = 0u;
+    if (variant == 3u) user_data[1] = 64u << 16u;
+    memory.selectors = 0;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.selectors == 0u &&
+              snapshot.images.size() == 6u,
+          "native zero/OOB indexed load read its unavailable payload");
+  }
 }
 
 void TestImageDescriptorFields() {
@@ -8366,6 +8598,7 @@ int main() {
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
+    Run("indexed material image keys", TestIndexedMaterialImageKeys);
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("compact scalar image table", TestCompactScalarImageTable);
