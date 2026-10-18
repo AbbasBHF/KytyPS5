@@ -3167,7 +3167,7 @@ void TestUniformizedMaterialImageKeys() {
 
 void TestIndexedMaterialImageKeys() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  const auto make_plan = [](ShaderType stage = ShaderType::Compute, bool shared = false) {
+  const auto make_program = [](ShaderType stage = ShaderType::Compute, bool shared = false) {
     Fixture f(stage);
     auto *entry = f.block, *body = f.AddBlock();
     auto *later = shared ? f.AddBlock() : nullptr;
@@ -3251,9 +3251,10 @@ void TestIndexedMaterialImageKeys() {
                 offset == 12994u * 32u,
             "inherited indexed selector changed GPU byte offsets into raw material keys");
     }
-    return ExtractResourcePlan(f.program);
+    return std::move(f.program);
   };
-  auto plan = make_plan();
+  auto program = make_program();
+  auto plan = ExtractResourcePlan(program);
   Check(plan.info.images.size() == 3u && plan.selector_keys.size() == 2u,
         "indexed material fields did not share their query/gather selector domain");
   for (const auto &image : plan.info.images) {
@@ -3304,6 +3305,9 @@ void TestIndexedMaterialImageKeys() {
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             memory.selectors == 2u && memory.descriptors == 6u && snapshot.images.size() == 9u,
         "indexed selector scanned the broad heap or did not share its captured keys");
+  ApplyResourceSpecialization(program, specialization);
+  Check(program.info.images[0].indirect_resources.size() == 3u,
+        "indirect dimension query lost its specialized candidates");
   for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
     const auto &image = specialization.images[root];
     const auto offset = image.indirect_mapping_offset;
@@ -3319,7 +3323,8 @@ void TestIndexedMaterialImageKeys() {
     Check(std::ranges::find(snapshot.specialization_reads,
               std::pair<uint64_t, uint64_t>{base + field, 868u}) != snapshot.specialization_reads.end(),
           "indexed selector batch escaped writable-alias tracking");
-  auto shared = make_plan(ShaderType::Compute, true);
+  auto shared_program = make_program(ShaderType::Compute, true);
+  auto shared = ExtractResourcePlan(shared_program);
   Check(MaterializeResources(shared, runtime, snapshot, specialization) && snapshot.images.size() == 9u,
         "inherited indexed selector lost its bounded material domain");
   memory.words[64u / 4u] = 12996u;
@@ -3349,7 +3354,8 @@ void TestIndexedMaterialImageKeys() {
           "unsupported geometry or writable selector lost the original heap domain");
   }
   user_data = original;
-  auto graphics = make_plan(ShaderType::Pixel);
+  auto graphics_program = make_program(ShaderType::Pixel);
+  auto graphics = ExtractResourcePlan(graphics_program);
   Check(MaterializeResources(graphics, runtime, snapshot, specialization) && memory.selectors == 0u,
         "graphics material lookup acquired unproved selector read dependencies");
   memory.unreadable = false;

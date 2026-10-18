@@ -40583,13 +40583,92 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
     }
     std::printf("[compute] %-32s ok\n", test.name);
   }
+  test.name = "IndirectImageQueryDimensions";
+  const auto address_position = std::ranges::find_if(*block, [&](const Inst &inst) { return &inst == &address; });
+  auto &query_lod = *block->PrependNewInst(address_position, ValueOpcode::BitwiseAnd32,
+      {Value(&key), Value(1u)});
+  address.SetArg(0, Value(&query_lod));
+  const auto access_position = std::ranges::find_if(*block, [&](const Inst &inst) { return &inst == access; });
+  auto &query = *block->PrependNewInst(access_position, ValueOpcode::ImageQueryDimensions,
+      {Value(&image), Value(&address)}, memory_flag_bits);
+  access->ReplaceUsesWith(Value(&query), false);
+  store.Invalidate();
+  auto &query_offset = block->AppendNewInst(ValueOpcode::IMul32, {Value(&key), Value(16u)});
+  auto &query_store = block->AppendNewInst(ValueOpcode::StoreBufferU32x4,
+      {Value(&output), Value(0u), Value(&query_offset), Value(0u), Value(&query), Value(true)});
+  query_store.SetFlags(MemoryFlags{1u, 0u});
+  compiled.program.memory_info[1].data_dwords = 4u;
+  compiled.program.memory_info[0].image_address_components = 1u;
+  compiled.program.memory_info[0].image_has_mip = false;
+  compiled.program.info.images[3].numeric_class = Prospero::TextureNumericClass::Uint;
+  compiled.program.info.images[4].dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+  constexpr std::array<std::array<u32, 4>, 7> geometry{{
+      {2, 2, 0, 2}, {2, 2, 0, 2}, {4, 2, 0, 3}, {8, 0, 0, 4},
+      {2, 2, 6, 2}, {2, 2, 0, 2}, {2, 2, 0, 2}}};
+  for (const u32 resource : {2u, 3u, 4u}) {
+    const auto &size = geometry[resource];
+    const u32 height = std::max(size[1], 1u), layers = std::max(size[2], 1u);
+    std::vector<std::vector<u32>> mips;
+    for (u32 mip = 0; mip < size[3]; ++mip)
+      mips.emplace_back(std::max(size[0] >> mip, 1u) * std::max(height >> mip, 1u) * layers * 4u);
+    vulkan.DestroyImage(&textures[resource]);
+    textures[resource] = vulkan.CreateImageMips(test.name, size[0], height,
+        resource == 3u ? vk::Format::eR32G32B32A32Uint : vk::Format::eR32G32B32A32Sfloat,
+        vk::ImageUsageFlagBits::eSampled, mips, 4u, vk::ImageLayout::eShaderReadOnlyOptimal,
+        resource == 3u ? vk::ImageType::e1D : vk::ImageType::e2D,
+        resource == 3u ? vk::ImageViewType::e1D
+                      : resource == 4u ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D, layers);
+  }
+  compiled.program.shader_info_complete = false;
+  CollectShaderInfo(compiled.program, {.compute = &compute});
+  for (const u32 wave_size : {32u, 64u}) {
+    compute.wave_size = wave_size;
+    compute.threads_num[0] = wave_size;
+    compiled.program.wave_size = wave_size;
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
+    compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
+    ValidateSpirv(test.name, compiled.spirv);
+    const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
+    Require(test.name, "typed query body count", tools.Disassemble(compiled.spirv, &text) &&
+                CountText(text, "OpImageQuerySizeLod") == 3u * halves &&
+                CountText(text, "OpImageQueryLevels") == 3u * halves &&
+                compiled.spirv.size() <= 8192u * halves,
+            "indirect geometry queries exceeded their per-type body or emitted-size budget");
+    std::vector<u32> decorated, queried;
+    for (size_t offset = 5; offset < compiled.spirv.size();) {
+      const auto *words = compiled.spirv.data() + offset;
+      const auto op = static_cast<spv::Op>(words[0] & 0xffffu);
+      if (op == spv::OpDecorate && words[2] == spv::DecorationNonUniform) decorated.push_back(words[1]);
+      if (op == spv::OpImageQuerySizeLod) queried.push_back(words[3]);
+      offset += words[0] >> 16u;
+    }
+    Require(test.name, "nonuniform query image", std::ranges::count_if(queried, [&](u32 operand) {
+              return std::ranges::find(decorated, operand) != decorated.end();
+            }) == halves, "the dynamic query image lacks its nonuniform decoration");
+    test.initial.assign(wave_size * 4u, 0xdeadbeefu);
+    test.expected.clear();
+    for (u32 lane = 0; lane < wave_size; ++lane) {
+      const auto resource = lane < ordinals.size() ? root.indirect_resources[ordinals[lane]] : 0u;
+      auto size = geometry[resource];
+      size[0] = std::max(size[0] >> (lane & 1u), 1u);
+      if (size[1] != 0u) size[1] = std::max(size[1] >> (lane & 1u), 1u);
+      test.expected.insert(test.expected.end(), size.begin(), size.end());
+    }
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, {}, textures);
+    const auto actual = vulkan.ReadBuffer(test.name, buffer, test.expected.size());
+    vulkan.DestroyBuffer(&buffer);
+    CompareWords(test, "selected dimensions, mip levels and unmapped root", test.expected, actual);
+  }
+  std::printf("[compute] %-32s ok\n", test.name);
+  query_store.Invalidate();
+  compiled.program.info.images[3].numeric_class = Prospero::TextureNumericClass::Float;
   vulkan.Device().destroySampler(native_sampler);
   for (auto &texture : textures) vulkan.DestroyImage(&texture);
   textures.clear();
 
   // Reuse the GPU key map, including the separated root slot and unmapped suffix,
   // for storage writes. Every lane has a distinct texel address.
-  store.Invalidate();
   for (auto &inst : *block)
     if (inst.GetOpcode() == ValueOpcode::ReferenceU32) inst.Invalidate();
   compiled.program.info.buffers.clear();
