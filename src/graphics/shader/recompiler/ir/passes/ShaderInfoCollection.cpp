@@ -606,6 +606,15 @@ void CollectShaderInfo(Program& program, bool fsb, ShaderStageInputInfo input_in
 		case ShaderType::Mesh: break;
 		case ShaderType::Pixel:
 			CollectPixelInputs(input_info.pixel, info, inputs.per_vertex, inputs.components);
+			if (input_info.pixel->object_primitive_id) {
+				if (std::ranges::any_of(info.outputs, [](const StageOutput& output) {
+					    return output.kind == StageOutputKind::Mrt && output.location == 7u;
+				    })) {
+					return Fail("explicit MRT7 export overlaps automatic object/primitive ID");
+				}
+				AddBuiltinInput(info, StageInputKind::PrimitiveId, fsb);
+				AddOutput(info, StageOutputKind::ObjectPrimitiveId, 0, 7, "out_object_primitive_id");
+			}
 			break;
 		case ShaderType::Compute: CollectComputeInputs(input_info.compute, info); break;
 		default: return Fail("unsupported shader stage for info collection");

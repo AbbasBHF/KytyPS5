@@ -85,6 +85,14 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 
 void EmitReturn(ValueEmitContext& ctx) {
 	EmitKillIfPixelValidMaskInactive(ctx.state);
+	if (ctx.state.object_primitive_id_variable != 0) {
+		auto& state = ctx.state;
+		const auto primitive = EmitGetBuiltin(
+		    ctx, IR::Value {static_cast<uint32_t>(IR::StageInputKind::PrimitiveId)}, IR::Value {0u});
+		const auto object = EmitPushDataLoad(state, ConstantU32(state, 0));
+		state.builder.AddFunction(spv::OpStore, state.object_primitive_id_variable,
+		                          EmitAddU32(state, object, primitive));
+	}
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 

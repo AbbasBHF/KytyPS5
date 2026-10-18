@@ -1391,6 +1391,8 @@ struct GraphicsCase {
   u32 pixel_perspective_sample_vgpr = UINT32_MAX;
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
+  u32 width = 1;
+  std::vector<u32> object_ids;
 };
 
 struct CompiledShader {
@@ -1838,6 +1840,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   pixel_info.ps_perspective_sample_vgpr = test.pixel_perspective_sample_vgpr;
   pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
   pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
+  pixel_info.object_primitive_id = !test.object_ids.empty();
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
   }
@@ -1869,7 +1872,8 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
               resource_plan, runtime, resources, specialization),
           "translated resources could not be materialized");
   auto result = ShaderRecompiler::CompileProgram(
-      std::move(translated), options, specialization);
+      std::move(translated), options, specialization,
+      static_cast<u32>(pixel_info.object_primitive_id));
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
@@ -18282,12 +18286,13 @@ public:
 
   std::vector<u32> RenderFragment(const GraphicsCase &test,
                                   const CompiledShader &fragment) {
+    const bool object_id = !test.object_ids.empty();
     const auto vertex_spirv =
         TestSpv::MakePassthroughVertexSpirv(test.layers > 1, test.vertex_clip_w);
     ValidateSpirv(test.name, vertex_spirv);
 
     Image target =
-        CreateImageMips(test.name, 1, 1, vk::Format::eR32G32B32A32Sfloat,
+        CreateImageMips(test.name, test.width, 1, vk::Format::eR32G32B32A32Sfloat,
                       vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
                       vk::ImageLayout::eGeneral, vk::ImageType::e2D,
                       test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
@@ -18295,8 +18300,17 @@ public:
     Image resolved;
     if (test.samples != vk::SampleCountFlagBits::e1) {
       resolved = CreateImageMips(
-          test.name, 1, 1, target.format, vk::ImageUsageFlagBits::eColorAttachment,
+          test.name, test.width, 1, target.format, vk::ImageUsageFlagBits::eColorAttachment,
           {}, 4, vk::ImageLayout::eGeneral, vk::ImageType::e2D,
+          test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
+          test.layers);
+    }
+    Image primitive_target;
+    if (object_id) {
+      primitive_target = CreateImageMips(
+          test.name, test.width, 1, vk::Format::eR32Uint,
+          vk::ImageUsageFlagBits::eColorAttachment, {}, 1,
+          vk::ImageLayout::eGeneral, vk::ImageType::e2D,
           test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
           test.layers);
     }
@@ -18308,8 +18322,8 @@ public:
     };
     const auto &vertices =
         test.vertices.empty() ? default_vertices : test.vertices;
-    Require(test.name, "graphics", vertices.size() == 18u,
-            "graphics vertex buffer must contain three pos2/color4 vertices");
+    Require(test.name, "graphics", !vertices.empty() && vertices.size() % 18u == 0,
+            "graphics vertex buffer must contain pos2/color4 triangle lists");
     auto vertex_buffer =
         CreateHostBuffer(test.name, vertices.size() * sizeof(u32),
                          vk::BufferUsageFlagBits::eVertexBuffer, vertices);
@@ -18324,8 +18338,9 @@ public:
               test.push_constants.size() * sizeof(u32) ==
                   fragment_bind.ShaderDataDwords() * sizeof(u32),
               "fragment push constant data size does not match reflection");
+    }
+    if (fragment_bind.UsesPushData() || object_id) {
       push_constant_range.stageFlags = vk::ShaderStageFlagBits::eFragment;
-      push_constant_range.offset = 0;
       push_constant_range.size = ShaderRecompiler::IR::NativePushConstantSize;
     }
 
@@ -18379,12 +18394,12 @@ public:
     vk::Viewport viewport{};
     viewport.x = 0.0f;
     viewport.y = 0.0f;
-    viewport.width = 1.0f;
+    viewport.width = static_cast<float>(test.width);
     viewport.height = 1.0f;
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
     vk::Rect2D scissor{};
-    scissor.extent.width = 1;
+    scissor.extent.width = test.width;
     scissor.extent.height = 1;
     vk::PipelineViewportStateCreateInfo viewport_state{};
     viewport_state.sType = vk::StructureType::ePipelineViewportStateCreateInfo;
@@ -18410,21 +18425,25 @@ public:
     multisample.sType = vk::StructureType::ePipelineMultisampleStateCreateInfo;
     multisample.rasterizationSamples = test.samples;
 
-    vk::PipelineColorBlendAttachmentState color_attachment{};
-    color_attachment.colorWriteMask =
-        vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
-        vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+    std::array<vk::PipelineColorBlendAttachmentState, 8> color_attachments{};
+    for (auto &attachment : color_attachments) {
+      attachment.colorWriteMask =
+          vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+    }
     vk::PipelineColorBlendStateCreateInfo color_blend{};
     color_blend.sType = vk::StructureType::ePipelineColorBlendStateCreateInfo;
-    color_blend.attachmentCount = 1;
-    color_blend.pAttachments = &color_attachment;
+    color_blend.attachmentCount = object_id ? 8 : 1;
+    color_blend.pAttachments = color_attachments.data();
 
     vk::GraphicsPipelineCreateInfo pipeline_info{};
-    const vk::Format color_format = vk::Format::eR32G32B32A32Sfloat;
+    std::array<vk::Format, 8> color_formats{};
+    color_formats[0] = target.format;
+    color_formats[7] = primitive_target.format;
     vk::PipelineRenderingCreateInfo rendering_pipeline{};
     rendering_pipeline.sType = vk::StructureType::ePipelineRenderingCreateInfo;
-    rendering_pipeline.colorAttachmentCount = 1;
-    rendering_pipeline.pColorAttachmentFormats = &color_format;
+    rendering_pipeline.colorAttachmentCount = color_blend.attachmentCount;
+    rendering_pipeline.pColorAttachmentFormats = color_formats.data();
     pipeline_info.sType = vk::StructureType::eGraphicsPipelineCreateInfo;
     pipeline_info.pNext = &rendering_pipeline;
     pipeline_info.stageCount = 2;
@@ -18442,48 +18461,78 @@ public:
                                                nullptr, &pipeline),
               "vkCreateGraphicsPipelines");
 
-    vk::CommandBuffer cmd = BeginCommands(test.name, "graphics");
-    vk::RenderingAttachmentInfo color{};
-    color.sType = vk::StructureType::eRenderingAttachmentInfo;
-    color.imageView = target.view;
-    color.imageLayout = vk::ImageLayout::eGeneral;
-    color.loadOp = vk::AttachmentLoadOp::eClear;
-    color.storeOp = vk::AttachmentStoreOp::eStore;
+    std::array<vk::RenderingAttachmentInfo, 8> colors{};
+    colors[0].imageView = target.view;
+    colors[0].imageLayout = vk::ImageLayout::eGeneral;
+    colors[0].loadOp = vk::AttachmentLoadOp::eClear;
+    colors[0].storeOp = vk::AttachmentStoreOp::eStore;
     if (resolved.image != nullptr) {
-      color.resolveMode = vk::ResolveModeFlagBits::eAverage;
-      color.resolveImageView = resolved.view;
-      color.resolveImageLayout = vk::ImageLayout::eGeneral;
+      colors[0].resolveMode = vk::ResolveModeFlagBits::eAverage;
+      colors[0].resolveImageView = resolved.view;
+      colors[0].resolveImageLayout = vk::ImageLayout::eGeneral;
+    }
+    if (object_id) {
+      colors[7].imageView = primitive_target.view;
+      colors[7].imageLayout = vk::ImageLayout::eGeneral;
+      colors[7].loadOp = vk::AttachmentLoadOp::eClear;
+      colors[7].storeOp = vk::AttachmentStoreOp::eStore;
+      colors[7].clearValue.color.uint32[0] = 0xfeedfaceu;
     }
     vk::RenderingInfo rendering{};
     rendering.sType = vk::StructureType::eRenderingInfo;
-    rendering.renderArea.extent = {1, 1};
+    rendering.renderArea.extent = {test.width, 1};
     rendering.layerCount = test.layers;
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachments = &color;
-    cmd.beginRendering(rendering);
-    cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
-    if (push_constant_range.size != 0) {
-      ShaderRecompiler::IR::PushData push_data;
-      std::copy(test.push_constants.begin(), test.push_constants.end(),
-                push_data.dwords.begin() + fragment_bind.push_data_start_dword);
-      cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0,
-                        sizeof(push_data), push_data.dwords.data());
+    rendering.colorAttachmentCount = color_blend.attachmentCount;
+    rendering.pColorAttachments = colors.data();
+    std::vector<u32> pixel;
+    // Reuse the same shader and pipeline while changing only dynamic object ID.
+    for (size_t draw = 0; draw < std::max<size_t>(test.object_ids.size(), 1); ++draw) {
+      vk::CommandBuffer cmd = BeginCommands(test.name, "graphics");
+      for (auto *image : {&target, &primitive_target}) {
+        if (image->image != nullptr && image->layout != vk::ImageLayout::eGeneral) {
+          AddImageBarrier(cmd, image->image, image->layout,
+                          vk::ImageLayout::eGeneral,
+                          vk::PipelineStageFlagBits::eTransfer,
+                          vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                          vk::AccessFlagBits::eTransferRead,
+                          vk::AccessFlagBits::eColorAttachmentWrite,
+                          image->mip_levels, image->layers);
+          image->layout = vk::ImageLayout::eGeneral;
+        }
+      }
+      cmd.beginRendering(rendering);
+      cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+      if (push_constant_range.size != 0) {
+        ShaderRecompiler::IR::PushData push_data;
+        if (object_id) {
+          push_data.dwords[0] = test.object_ids[draw];
+        }
+        if (fragment_bind.UsesPushData()) {
+          std::copy(test.push_constants.begin(), test.push_constants.end(),
+                    push_data.dwords.begin() + fragment_bind.push_data_start_dword);
+        }
+        cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0,
+                          sizeof(push_data), push_data.dwords.data());
+      }
+      vk::DeviceSize offset = 0;
+      cmd.bindVertexBuffers(0, 1, &vertex_buffer.buffer, &offset);
+      cmd.draw(static_cast<u32>(vertices.size() / 6), test.layers, 0, 0);
+      cmd.endRendering();
+      EndSubmitAndFree(test.name, "graphics", cmd);
+      auto color_words = ReadImage(test.name, resolved.image != nullptr ? &resolved : &target);
+      pixel.insert(pixel.end(), color_words.begin(), color_words.end());
+      if (object_id) {
+        auto id_words = ReadImage(test.name, &primitive_target);
+        pixel.insert(pixel.end(), id_words.begin(), id_words.end());
+      }
     }
-    vk::DeviceSize offset = 0;
-    cmd.bindVertexBuffers(0, 1, &vertex_buffer.buffer, &offset);
-    cmd.draw(3, test.layers, 0, 0);
-    cmd.endRendering();
-    EndSubmitAndFree(test.name, "graphics", cmd);
-    target.layout = vk::ImageLayout::eGeneral;
-
-    auto pixel = ReadImage(test.name, resolved.image != nullptr ? &resolved : &target);
-    pixel.resize(4 * test.layers);
 
     m_device.destroyPipeline(pipeline, nullptr);
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
     m_device.destroyShaderModule(fragment_module, nullptr);
     m_device.destroyShaderModule(vertex_module, nullptr);
     DestroyBuffer(&vertex_buffer);
+    DestroyImage(&primitive_target);
     DestroyImage(&resolved);
     DestroyImage(&target);
     return pixel;
@@ -41460,6 +41509,38 @@ GraphicsCase GraphicsBranchPathFinalVmExportDiscardsInactiveExec() {
            O::S_CBRANCH_SCC1, O::S_MOV_B32, O::S_ENDPGM}};
 }
 
+GraphicsCase GraphicsObjectPrimitiveId(bool discard) {
+  auto test = discard ? GraphicsNullVmExportDiscardsInactiveExec()
+                      : GraphicsDirectSgprPushConstantExport();
+  test.name = discard ? "GraphicsObjectPrimitiveIdDiscard"
+                      : "GraphicsObjectPrimitiveId";
+  test.width = 2;
+  test.layers = 2;
+  test.object_ids = {0x0001ffffu, 0xffffffffu};
+  // Each triangle covers one pixel; the second instance renders the same pair
+  // into layer 1, making primitive progression and instance reset observable.
+  for (const auto &position : std::array<std::array<float, 2>, 6>{{
+           {-1.0f, -1.0f}, {0.0f, -1.0f}, {-0.5f, 1.0f},
+           {0.0f, -1.0f}, {1.0f, -1.0f}, {0.5f, 1.0f}}}) {
+    test.vertices.insert(test.vertices.end(),
+                         {std::bit_cast<u32>(position[0]),
+                          std::bit_cast<u32>(position[1]), 0, 0, 0, 0x3f800000u});
+  }
+  const auto color = test.expected_pixel;
+  test.expected_pixel.clear();
+  for (u32 object_id : test.object_ids) {
+    for (u32 pixel = 0; pixel < test.width * test.layers; ++pixel) {
+      test.expected_pixel.insert(test.expected_pixel.end(), color.begin(), color.end());
+    }
+    // RT7 is sparse and scalar uint, not a remapped or float PS export.
+    for (u32 layer = 0; layer < test.layers; ++layer) {
+      test.expected_pixel.push_back(discard ? 0xfeedfaceu : object_id);
+      test.expected_pixel.push_back(discard ? 0xfeedfaceu : object_id + 1u);
+    }
+  }
+  return test;
+}
+
 TestCase MultipleWorkitemsGlobalId() {
   using O = ShaderOpcode;
 
@@ -42106,6 +42187,8 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsMrt0OffVmExportDiscardsInactiveExec(),
       GraphicsFinalVmExportSupersedesEarlierVmMask(),
       GraphicsBranchPathFinalVmExportDiscardsInactiveExec(),
+      GraphicsObjectPrimitiveId(false),
+      GraphicsObjectPrimitiveId(true),
   };
 }
 
@@ -47844,6 +47927,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--position-w-only") == 0) {
     VulkanHarness vulkan;
     RunGraphicsCase(&vulkan, GraphicsPositionWExport());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--object-primitive-id-only") == 0) {
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, GraphicsObjectPrimitiveId(false));
+    RunGraphicsCase(&vulkan, GraphicsObjectPrimitiveId(true));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--centroid-only") == 0) {

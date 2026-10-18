@@ -13501,6 +13501,57 @@ void TestNewShaderRecompilerExpPixelOutputs() {
   CheckSpirvBinaryValidates(unorm16_ba_result.spirv);
 }
 
+void TestAutomaticObjectPrimitiveId() {
+  using namespace ShaderRecompiler::IR;
+  HW::Context context;
+  context.SetRenderTargetMask(0xf000000fu);
+  Check(!context.HasObjectPrimitiveIdOutput(), "disabled object ID enabled RT7");
+  context.SetDrawPayloadControl(9);
+  context.SetObjprimIdControl(2);
+  Check(context.HasObjectPrimitiveIdOutput(), "object ID propagation omitted RT7");
+  context.SetRenderTargetMask(0xf);
+  Check(!context.HasObjectPrimitiveIdOutput(), "masked RT7 remained an object ID output");
+
+  const uint32_t shader[] = {
+      EncodeVop1(0x01, 0, 0), EncodeExp0(0, 1), EncodeExp1(0, 0, 0, 0), 0xbf810000u};
+  const std::array<uint32_t, 1> user_data {0x3f800000u};
+  ShaderPixelInputInfo pixel;
+  pixel.target_shader_mask = 0xf;
+  pixel.target_output_mode[0] = 4;
+  const auto ordinary_key = MakeStageStaticKey(pixel);
+  pixel.object_primitive_id = true;
+  Check(MakeStageStaticKey(pixel) != ordinary_key,
+        "automatic object ID was omitted from the shader identity");
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  options.user_data = user_data;
+  const auto prefix = PushData::GraphicsDrawDwords(false, true);
+  Check(prefix == 1 && PushData::GraphicsDrawDwords(false, false) == 0 &&
+            PushData::GraphicsDrawDwords(true, false) == PushData::MeshDrawDwordCount,
+        "graphics draw data reserved an incorrect prefix");
+  for (const uint32_t start : {prefix, PushData::DwordCount}) {
+    const auto result = RecompileForTest(shader, options, nullptr, nullptr, start);
+    Check(result.program.bindings.UsesPushData() == (start == prefix),
+          "object ID changed shader-data push/spill selection");
+    Check(std::ranges::any_of(result.program.info.outputs, [](const StageOutput& output) {
+            return output.kind == StageOutputKind::Mrt && output.location == 0;
+          }) && std::ranges::any_of(result.program.info.outputs, [](const StageOutput& output) {
+            return output.kind == StageOutputKind::ObjectPrimitiveId && output.location == 7;
+          }), "automatic RT7 displaced or compacted the guest MRT0 export");
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(source.find("BuiltIn PrimitiveId") != std::string::npos &&
+              source.find("OpVariable %_ptr_Output_uint Output") != std::string::npos &&
+              source.find("OpIAdd %uint") != std::string::npos,
+          "automatic RT7 lost its integer primitive ID addition");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  pixel.target_shader_mask = 0xf0000000u;
+  ExpectFatal([&] { (void)RecompileForTest(shader, options, nullptr, nullptr, prefix); },
+              "automatic RT7 silently overlapped an explicit MRT7 export");
+#endif
+}
+
 void TestRenderTargetReverseExportMapping() {
   const auto format = TextureGetRenderTargetFormat(
       Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
@@ -16302,6 +16353,7 @@ int main() {
   TestNewShaderRecompilerPerInvocationMasksWithoutMirrors();
   TestNewShaderRecompilerPerInvocationU64Complement();
   TestNewShaderRecompilerExpPixelOutputs();
+  TestAutomaticObjectPrimitiveId();
   TestRenderTargetReverseExportMapping();
   TestBlendMappingClassification();
   TestLogicalAlphaBlendExport();

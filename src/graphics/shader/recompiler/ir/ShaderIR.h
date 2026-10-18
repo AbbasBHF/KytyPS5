@@ -245,6 +245,7 @@ enum class StageOutputKind {
 	Position,
 	Parameter,
 	Mrt,
+	ObjectPrimitiveId,
 	Depth,
 	SampleMask,
 	PointSize,
@@ -350,6 +351,10 @@ struct PushData {
 	static constexpr uint32_t MeshFallbackDrawDwordCount = 10;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
+
+	[[nodiscard]] static constexpr uint32_t GraphicsDrawDwords(bool mesh, bool object_id) {
+		return mesh ? MeshDrawDwordCount : static_cast<uint32_t>(object_id);
+	}
 
 	[[nodiscard]] static constexpr bool CanFit(uint32_t start, uint32_t size) {
 		return size != 0 && start <= DwordCount && size <= DwordCount - start;

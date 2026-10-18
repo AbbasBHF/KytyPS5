@@ -2,16 +2,17 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
+uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
+	                          pointer, state.push_constant_variable, ConstantU32(state, 0), index);
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
+}
+
 static uint32_t EmitShaderDataDwordLoadAt(EmitterState& state, uint32_t dword_index) {
-	if (state.program.bindings.UsesPushData()) {
-		const auto pointer = state.builder.AllocateId();
-		const auto value   = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
-		                          pointer, state.push_constant_variable, ConstantU32(state, 0),
-		                          dword_index);
-		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-		return value;
-	}
+	if (state.program.bindings.UsesPushData()) return EmitPushDataLoad(state, dword_index);
 	if (state.shader_data_storage_variable != 0) {
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
