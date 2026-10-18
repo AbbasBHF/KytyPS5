@@ -649,8 +649,8 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 	if (!initial_data.empty()) {
-		PipelineCacheLog("Vulkan pipeline cache: loaded {} bytes from {}", initial_data.size(),
-		                 path);
+		PipelineCacheLog("Vulkan pipeline cache: loaded {:.2f} MB from {}",
+		                 static_cast<double>(initial_data.size()) / 1'000'000.0, path);
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
@@ -691,8 +691,8 @@ void PipelineCache::Save() {
 	if (result != vk::Result::eSuccess || size == 0 ||
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLogAt(Log::Level::Error,
-		                   "Vulkan pipeline cache: save failed ({}, {} bytes)",
-		                   vk::to_string(result), size);
+		                   "Vulkan pipeline cache: save failed ({}, {:.2f} MB)",
+		                 vk::to_string(result), static_cast<double>(size) / 1'000'000.0);
 		return;
 	}
 	payload.resize(size);
@@ -725,7 +725,8 @@ void PipelineCache::Save() {
 		                 Common::PathToString(m_driver_cache_path));
 		return;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
+	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
+	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
 	m_driver_cache_dirty = false;
 }
