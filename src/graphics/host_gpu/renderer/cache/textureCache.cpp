@@ -1040,7 +1040,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
-		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
+		// Native color metadata must not retain a reused HTile clear flag.
 		m_surface_metas.erase(range.address);
 		if (range.size == 0 || desc.info.resources.levels != 1) {
 			return;
@@ -1418,11 +1418,8 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
-		if (inserted) {
-			metadata->second.type = MetaDataInfo::Type::HTile;
-			if (image.info.htile_initial_clear) {
-				metadata->second.clear_mask.set();
-			}
+		if (inserted && image.info.htile_initial_clear) {
+			metadata->second.clear_mask.set();
 		}
 	}
 	RefreshImage(id);
