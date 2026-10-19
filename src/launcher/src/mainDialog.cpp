@@ -12,6 +12,7 @@
 #include <QApplication>
 #include <QByteArray>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDialog>
 #include <QDir>
 #include <QFile>
@@ -26,6 +27,7 @@
 #include <QRegularExpression>
 #include <QSettings>
 #include <QStringList>
+#include <QStyleHints>
 #include <QTextStream>
 #include <QVariant>
 #include <QtCore>
@@ -61,7 +63,8 @@ constexpr DWORD CMD_Y_CHARS = 1000;
 #endif
 constexpr char SETTINGS_MAIN_DIALOG[]        = "MainDialog";
 constexpr char SETTINGS_MAIN_LAST_GEOMETRY[] = "geometry";
-constexpr char SETTINGS_CHECK_UPDATES[]       = "check_updates_on_startup";
+constexpr char SETTINGS_CHECK_UPDATES[]      = "check_updates_on_startup";
+constexpr char SETTINGS_THEME[]              = "theme";
 
 class MainDialogPrivate: public QObject {
 	Q_OBJECT
@@ -86,6 +89,17 @@ public:
 private:
 	static QByteArray g_last_geometry;
 	static bool       g_check_updates_on_startup;
+	static int        g_theme;
+
+	static void ApplyTheme(int theme) {
+		auto scheme = Qt::ColorScheme::Unknown;
+		switch (theme) {
+			case 1: scheme = Qt::ColorScheme::Dark; break;
+			case 2: scheme = Qt::ColorScheme::Light; break;
+			default: break;
+		}
+		QApplication::styleHints()->setColorScheme(scheme);
+	}
 
 	Ui::MainDialog* m_ui             = {nullptr};
 	MainDialog*     m_main_dialog    = nullptr;
@@ -101,6 +115,7 @@ private:
 
 QByteArray MainDialogPrivate::g_last_geometry;
 bool       MainDialogPrivate::g_check_updates_on_startup = true;
+int        MainDialogPrivate::g_theme                    = 0;
 
 MainDialog::MainDialog(QWidget* parent): QDialog(parent), m_p(new MainDialogPrivate(this)) {
 	m_p->Setup(this);
@@ -119,6 +134,8 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_main_dialog = main_dialog;
 	m_update_checker = new UpdateChecker(main_dialog);
 	m_ui->check_updates_on_startup->setChecked(g_check_updates_on_startup);
+	m_ui->theme_combo->setCurrentIndex(g_theme);
+	ApplyTheme(g_theme);
 	m_ui->check_updates_link->setVisible(UpdateChecker::IsSupported());
 	m_ui->check_updates_on_startup->setVisible(UpdateChecker::IsSupported());
 
@@ -147,6 +164,11 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	connect(m_update_checker, &UpdateChecker::InstallingChanged, this, &MainDialogPrivate::Update);
 	connect(m_ui->check_updates_on_startup, &QCheckBox::toggled, this, [this](bool checked) {
 		g_check_updates_on_startup = checked;
+		m_ui->widget->WriteSettings();
+	});
+	connect(m_ui->theme_combo, &QComboBox::currentIndexChanged, this, [this](int index) {
+		g_theme = index;
+		ApplyTheme(index);
 		m_ui->widget->WriteSettings();
 	});
 	connect(main_dialog, &MainDialog::Resize, [this]() {
@@ -518,6 +540,7 @@ void MainDialogPrivate::WriteSettings(QSettings& s) {
 		s.setValue(SETTINGS_MAIN_LAST_GEOMETRY, g_last_geometry);
 	}
 	s.setValue(SETTINGS_CHECK_UPDATES, g_check_updates_on_startup);
+	s.setValue(SETTINGS_THEME, g_theme);
 
 	s.endGroup();
 }
@@ -527,6 +550,10 @@ void MainDialogPrivate::ReadSettings(QSettings& s) {
 
 	g_last_geometry = s.value(SETTINGS_MAIN_LAST_GEOMETRY, g_last_geometry).toByteArray();
 	g_check_updates_on_startup = s.value(SETTINGS_CHECK_UPDATES, true).toBool();
+	g_theme                    = s.value(SETTINGS_THEME, 0).toInt();
+	if (g_theme < 0 || g_theme > 2) {
+		g_theme = 0;
+	}
 
 	s.endGroup();
 }
