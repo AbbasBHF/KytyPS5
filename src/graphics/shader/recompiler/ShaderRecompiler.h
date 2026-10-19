@@ -66,6 +66,7 @@ struct ShaderSource {
 	Decoder::Program decoded;
 	IR::ResourcePlan call_targets;
 	std::vector<Call> calls;
+	uint32_t unsupported_call_pc = UINT32_MAX;
 	std::optional<Linked> linked;
 	uint64_t revision = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;

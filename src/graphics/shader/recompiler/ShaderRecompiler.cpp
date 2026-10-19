@@ -564,7 +564,12 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 		                     call.src0.reg != call.dst.reg || call.dst.reg >= 105u);
 		for (uint32_t i = 0; i < 2u; ++i) {
 			const auto value = Register(site.instruction, call.src0.reg + i);
-			EXIT_IF(!ValidateRuntimeValue(query, value, RuntimeValueType::Integer));
+			if (!ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) {
+				EXIT_IF(value.Instruction()->GetOpcode() != ValueOpcode::ReadConstBuffer);
+				source.unsupported_call_pc = call.pc;
+				source.calls.clear();
+				return;
+			}
 			auto& root = query.value_storage.emplace_back(ValueOpcode::ReferenceU32);
 			root.SetArg(0, value);
 			site.target[i] = Value(&root);
@@ -610,6 +615,7 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 }
 
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime) {
+	EXIT_IF(source.unsupported_call_pc != UINT32_MAX);
 	auto& reads = source.reads;
 	reads.clear();
 	IR::SrtReadCapture capture(runtime, reads);
