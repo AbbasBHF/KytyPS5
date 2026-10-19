@@ -413,10 +413,10 @@ struct RenderExecutorTestAccess {
     return executor.TryConsumeComputeFill(input, command, x, y, z, mode);
   }
 
-  static void UpdateComputeMetaClears(RenderExecutor &executor,
-                                      const ShaderComputeInputInfo &input,
-                                      const CommandBuffer &buffer) {
-    executor.UpdateComputeMetaClears(input, buffer);
+  static bool TryConsumeComputeMetaClear(RenderExecutor &executor,
+                                         const ShaderComputeInputInfo &input,
+                                         const CommandBuffer &buffer) {
+    return executor.TryConsumeComputeMetaClear(input, buffer);
   }
 
   static TextureBinding
@@ -5126,34 +5126,16 @@ public:
 
   void CheckComputeMetaClearClassification() {
     constexpr const char *name = "ComputeMetaClearClassification";
-    constexpr uintptr_t base = 0x0000000204200000ull;
-    constexpr uint64_t allocation_size = 0x10000;
     constexpr uint64_t read_only_meta = 0x0000000204201f00ull;
     constexpr uint64_t read_write_meta = 0x0000000204202000ull;
     constexpr uint64_t write_only_meta = 0x0000000204202100ull;
     EnsureRuntimeContext();
-    int64_t direct_offset = -1;
-    Require(name, "scratch allocation",
-            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
-                allocation_size, allocation_size, 0, &direct_offset) == 0,
-            "metadata scratch allocation failed");
-    void *mapped = reinterpret_cast<void *>(base);
-    Require(name, "scratch mapping",
-            Libs::LibKernel::Memory::KernelMapDirectMemory(
-                &mapped, allocation_size, 0x3, 0x10, direct_offset,
-                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
-            "metadata scratch mapping failed");
-    std::memset(mapped, 0xa5, allocation_size);
     RenderContext context(m_runtime_context);
-    context.InitializeGpu(nullptr);
-    LibKernel::Memory::InstallGpuResources(&context);
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
-    context.MapMemory(base, allocation_size);
     auto &texture_cache = context.GetTextureCache();
     TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_only_meta);
     TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_write_meta);
@@ -5212,10 +5194,12 @@ public:
     const auto read_only_input =
         MakeInput(read_only_meta, true, false, read_only_program,
                   read_only_snapshot);
-    RenderExecutorTestAccess::UpdateComputeMetaClears(
-        executor, read_only_input, command);
-    Require(name, "read-only metadata preserved",
-            !texture_cache.IsMetaCleared(read_only_meta, 0),
+    const bool read_only_consumed =
+        RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+            executor, read_only_input, command);
+    Require(name, "read-only dispatch preserved",
+            !read_only_consumed &&
+                !texture_cache.IsMetaCleared(read_only_meta, 0),
             "a metadata read-only dispatch changed logical clear state");
 
     ShaderRecompiler::IR::CompiledShaderInfo read_write_program{};
@@ -5223,69 +5207,28 @@ public:
     const auto read_write_input =
         MakeInput(read_write_meta, true, true, read_write_program,
                   read_write_snapshot);
-    RenderExecutorTestAccess::UpdateComputeMetaClears(
-        executor, read_write_input, command);
-    Require(name, "read/write metadata preserved",
-            !texture_cache.IsMetaCleared(read_write_meta, 0),
-            "a metadata read/modify/write dispatch changed logical clear state");
+    const bool read_write_consumed =
+        RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+            executor, read_write_input, command);
+    Require(name, "read/write dispatch preserved",
+            !read_write_consumed &&
+                !texture_cache.IsMetaCleared(read_write_meta, 0),
+            "a metadata read/modify/write dispatch was replaced by a clear");
 
     ShaderRecompiler::IR::CompiledShaderInfo write_only_program{};
     ShaderRecompiler::IR::ResourceSnapshot write_only_snapshot;
     const auto write_only_input =
         MakeInput(write_only_meta, false, true, write_only_program,
                   write_only_snapshot);
-    RenderExecutorTestAccess::UpdateComputeMetaClears(
-        executor, write_only_input, command);
-    Require(name, "write-only metadata clear state",
-            texture_cache.IsMetaCleared(write_only_meta, 0),
-            "a metadata write-only dispatch did not update logical clear state");
-
-    context.GetGpu().SendCommandSync([&] {
-      // Scratch reuse retains an old HTile registration, but both native stores
-      // still have to execute without clearing the unwritten adjacent words.
-      TextureCacheTestAccess::RegisterHtileMeta(texture_cache, write_only_meta);
-      std::vector<u32> code;
-      AppendVMovU32(&code, 1, 0);
-      for (const auto offset : {0u, 8u}) {
-        code.push_back(EncodeMubuf0(0x1cu, offset, false, false));
-        code.push_back(EncodeMubuf1(1, 0, 0));
-      }
-      AppendEnd(&code);
-      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
-          {.type = Prospero::ShaderBinaryType::kCs,
-           .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
-      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
-                           .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
-                           .wave_size = 64, .user_sgpr = 4});
-      ShaderBufferResource descriptor{};
-      descriptor.UpdateAddress48(write_only_meta);
-      descriptor.fields[2] = 12;
-      descriptor.fields[3] = DstSel(4, 5, 6, 7) |
-          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
-      for (u32 i = 0; i < 4; i++) {
-        shaders.SetCsUserSgpr(i, descriptor.fields[i], HW::UserSgprType::Unknown);
-      }
-      executor.DispatchDirect(0, scheduler.Current(), 1, 1, 1, 0x41u, false);
-      std::array<u32, 4> actual{};
-      context.GetBufferCache().ReadMemory(write_only_meta, sizeof(actual));
-      Require(name, "metadata scratch stores and guards",
-              Libs::LibKernel::Memory::TryReadBacking(
-                  write_only_meta, actual.data(), sizeof(actual)) &&
-                  actual == std::array<u32, 4>{0, 0xa5a5a5a5u, 0, 0xa5a5a5a5u},
-              "metadata registration suppressed guest stores or erased adjacent data");
-      context.UnmapMemory(base, allocation_size);
-      scheduler.Finish();
-    });
-    LibKernel::Memory::InstallGpuResources(nullptr);
-    context.ShutdownGpu();
-    Require(name, "scratch unmap",
-            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
-            "metadata scratch unmap failed");
-    Require(name, "scratch release",
-            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
-                direct_offset, allocation_size) == 0,
-            "metadata scratch release failed");
-    std::printf("[gpu]     %-32s ok\n", name);
+    const bool write_only_consumed =
+        RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+            executor, write_only_input, command);
+    Require(name, "write-only fill consumed",
+            write_only_consumed &&
+                texture_cache.IsMetaCleared(write_only_meta, 0),
+            "a metadata write-only fill was not consumed as a clear");
+    scheduler.Finish();
+    std::printf("[host]    %-32s ok\n", name);
   }
 
   void CheckBdaSyncUploads() {
