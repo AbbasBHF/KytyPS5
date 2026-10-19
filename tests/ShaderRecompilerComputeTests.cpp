@@ -10855,6 +10855,131 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckOrderedDispatch() {
+    constexpr const char *name = "OrderedDispatch";
+    constexpr uintptr_t base = 0x0000000204a00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr u32 sentinel = 0xa5a5a5a5u;
+    constexpr u32 terminator = 0xc00c3f00u;
+    // Each wave appends one packet, except the empty second wave. The final
+    // wave's terminator must follow every packet, as in GPU-generated PM4.
+    std::vector<u32> code{EncodeSop2(0x26, 12, 9, 5),
+                          EncodeSop2(0x00, 12, 12, 8),
+                          EncodeSop2(0x26, 12, 12, 4),
+                          EncodeSop2(0x00, 12, 12, 7),
+                          EncodeSopc(0x06, 12, InlineU32(1)),
+                          EncodeSop2(0x0a, 13, InlineU32(0), InlineU32(1)),
+                          EncodeSMovB32(124, InlineU32(0)),
+                          EncodeSop1(0x04, 126, InlineU32(1)),
+                          EncodeVop1(0x01, 2, 13),
+                          EncodeDs0(0x3f, 0x300, true),
+                          EncodeDs1(3, 0, 2),
+                          EncodeSopp(0x0c, 0),
+                          EncodeSop2(0x1e, 14, 12, InlineU32(2)),
+                          EncodeVop1(0x01, 1, 14),
+                          EncodeMubuf0(0x1c),
+                          EncodeMubuf1(3, 0, 1),
+                          EncodeSop2(0x01, 14, 6, InlineU32(1)),
+                          EncodeSop2(0x00, 15, 12, InlineU32(1))};
+    AppendSMovLiteral(&code, 16, terminator);
+    code.insert(code.end(),
+                {EncodeSopc(0x06, 12, 14), EncodeSop2(0x0a, 15, 16, 15),
+                 EncodeVop1(0x01, 2, 15), EncodeVop2(0x1a, 1, InlineU32(2), 3),
+                 EncodeSopc(0x06, 13, InlineU32(0)),
+                 EncodeSop2(0x0b, 126, InlineU32(0), InlineU32(1)),
+                 EncodeMubuf0(0x1c, 16 * sizeof(u32)), EncodeMubuf1(2, 0, 1)});
+    AppendEnd(&code);
+    ShaderMapUserData(
+        reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size,
+                0, &physical) == 0,
+            "ordered dispatch allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10,
+                                                     physical, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "ordered dispatch mapping failed");
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      for (u32 wave_size : {32u, 64u}) {
+        for (const auto groups :
+             {std::array{3u, 1u, 1u}, std::array{2u, 2u, 2u}}) {
+          const u32 count = groups[0] * groups[1] * groups[2];
+          cache.FillBuffer(base, 64 * sizeof(u32), sentinel, false);
+          cache.FillBuffer(0, sizeof(u32), 0, true);
+          shaders.SetCsShader(
+              {.data_addr = reinterpret_cast<uint64_t>(code.data()),
+               .num_thread_x = wave_size,
+               .num_thread_y = 1,
+               .num_thread_z = 1,
+               .wave_size = static_cast<uint8_t>(wave_size),
+               .user_sgpr = 7,
+               .tgid_x_en = true,
+               .tgid_y_en = true,
+               .tgid_z_en = true});
+          ShaderBufferResource output{};
+          output.UpdateAddress48(base);
+          output.fields[2] = 64 * sizeof(u32);
+          output.fields[3] =
+              DstSel(4, 5, 6, 7) |
+              (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+          for (u32 i = 0; i < 4; ++i)
+            shaders.SetCsUserSgpr(i, output.fields[i],
+                                  HW::UserSgprType::Unknown);
+          for (u32 i = 0; i < 3; ++i)
+            shaders.SetCsUserSgpr(4 + i, i == 2 ? count : groups[i],
+                                  HW::UserSgprType::Unknown);
+          processor.DispatchDirect(groups[0], groups[1], groups[2],
+                                   wave_size == 32 ? 0x8049u : 0x49u);
+          cache.CopyBuffer(base + 63 * sizeof(u32), 0, sizeof(u32), false,
+                           true);
+          cache.ReadMemory(base, 64 * sizeof(u32));
+          std::array<u32, 64> actual{}, expected;
+          expected.fill(sentinel);
+          u32 prefix = 0;
+          for (u32 group = 0; group < count; ++group) {
+            expected[group] = prefix;
+            if (group != 1)
+              expected[16 + prefix++] =
+                  group + 1 == count ? terminator : group + 1;
+          }
+          expected[63] = prefix;
+          Require(name, "readback",
+                  LibKernel::Memory::TryReadBacking(base, actual.data(),
+                                                    sizeof(actual)),
+                  "ordered dispatch output could not be read back");
+          Require(name, "stable packet append", actual == expected,
+                  "ordered append changed packet order, workgroup IDs, "
+                  "empty-wave prefix or GDS count");
+        }
+      }
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, size) == 0,
+            "ordered dispatch unmap failed");
+    Require(name, "release",
+            LibKernel::Memory::KernelReleaseDirectMemory(physical, size) == 0,
+            "ordered dispatch release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckNativeIndirectDispatch() {
     constexpr const char *name = "NativeIndirectDispatch";
     constexpr uintptr_t base = 0x0000000204600000ull;
@@ -49416,6 +49541,11 @@ int main(int argc, char **argv) {
     vulkan.CheckNativeIndirectDispatch();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--ordered-dispatch-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckOrderedDispatch();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--layered-image-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedImageViewCache();
@@ -49668,6 +49798,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
+  vulkan.CheckOrderedDispatch();
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
