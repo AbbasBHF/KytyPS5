@@ -505,12 +505,6 @@
             <property name="text"><string>Accurate texture synchronization</string></property>
            </widget>
           </item>
-          <item>
-           <widget class="QCheckBox" name="checkBox_support_zmask">
-            <property name="toolTip"><string>Can restore missing geometry (High on Life 2).</string></property>
-            <property name="text"><string>Support ZMask</string></property>
-           </widget>
-          </item>
          </layout>
         </widget>
        </item>

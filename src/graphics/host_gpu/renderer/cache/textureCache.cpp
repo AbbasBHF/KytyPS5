@@ -263,6 +263,9 @@ void TextureCache::DeleteImage(ImageId id) {
 		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
 	}
 	m_download_images.erase(id);
+	if (image->info.metadata.kind == ImageMetadataKind::Htile) {
+		m_surface_metas.erase(image->info.metadata.range.address);
+	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
@@ -715,13 +718,6 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		LOGF_COLOR(Log::Color::BrightYellow,
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
-	}
-	if (info.IsDepth() && info.metadata.kind == ImageMetadataKind::Htile) {
-		// Copied depth supersedes pending clears from the previous native image.
-		const auto metadata = m_surface_metas.find(info.metadata.range.address);
-		if (metadata != m_surface_metas.end()) {
-			metadata->second.clear_mask.reset();
-		}
 	}
 	FreeImage(cached_id);
 	return replacement_id;
@@ -1880,7 +1876,6 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
 	std::scoped_lock lock {m_lock};
-	// HTILE belongs to guest memory, independently of native image replacements.
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {

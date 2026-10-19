@@ -127,7 +127,6 @@ public:
 	bool                   hide_cursor_enabled         = false;
 	bool                   readback_linear_images      = false;
 	bool                   sync_raw_image_buffers      = false;
-	bool                   support_zmask               = false;
 	bool                   tessellation_enabled        = false;
 	bool                   skip_bvh_intersections      = false;
 	bool                   skip_mesh_fallback_draws    = false;
@@ -169,7 +168,6 @@ public:
 		hide_cursor_enabled         = other.hide_cursor_enabled;
 		readback_linear_images      = other.readback_linear_images;
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
-		support_zmask               = other.support_zmask;
 		tessellation_enabled        = other.tessellation_enabled;
 		skip_bvh_intersections      = other.skip_bvh_intersections;
 		skip_mesh_fallback_draws    = other.skip_mesh_fallback_draws;

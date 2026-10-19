@@ -287,7 +287,6 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_hide_cursor->setChecked(info.hide_cursor_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
 	m_ui->checkBox_sync_raw_image_buffers->setChecked(info.sync_raw_image_buffers);
-	m_ui->checkBox_support_zmask->setChecked(info.support_zmask);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
 	m_ui->checkBox_skip_bvh_intersections->setChecked(info.skip_bvh_intersections);
 	m_ui->checkBox_skip_mesh_fallback_draws->setChecked(info.skip_mesh_fallback_draws);
@@ -483,7 +482,6 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.hide_cursor_enabled       = ui.checkBox_hide_cursor->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
 	info.sync_raw_image_buffers    = ui.checkBox_sync_raw_image_buffers->isChecked();
-	info.support_zmask             = ui.checkBox_support_zmask->isChecked();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
 	info.skip_bvh_intersections    = ui.checkBox_skip_bvh_intersections->isChecked();
 	info.skip_mesh_fallback_draws  = ui.checkBox_skip_mesh_fallback_draws->isChecked();
